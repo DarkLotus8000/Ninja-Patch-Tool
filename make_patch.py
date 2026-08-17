@@ -18,6 +18,7 @@ from common import (
     display_relative_path,
     format_duration,
     install_termination_handlers,
+    is_within,
     load_index,
     make_work_dir,
     parse_json,
@@ -215,6 +216,9 @@ def main() -> int:
         return 1
     if base == new:
         print("ERROR: Base and new directories are the same.", file=sys.stderr)
+        return 1
+    if is_within(output, base) or is_within(output, new):
+        print(f"ERROR: Patch output must not be inside the base or new installation:\n{output}", file=sys.stderr)
         return 1
     if output.exists():
         print(f"ERROR: Patch output already exists:\n{output}\nChoose a different output name or remove the existing patch first.\nNo patch was generated.", file=sys.stderr)
