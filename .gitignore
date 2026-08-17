@@ -1,0 +1,21 @@
+# Generated patches
+output/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Tool working directory
+temp/
+
+# Temporary files
+*.tmp
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# IDE settings
+.vscode/
+.idea/
