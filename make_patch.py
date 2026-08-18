@@ -199,7 +199,7 @@ def main() -> int:
     parser.add_argument("base", type=Path, help="Clean indexed Steam manifest base")
     parser.add_argument("new", type=Path, help="Newer installation")
     parser.add_argument("output", type=Path, help="Patch filename or output path; .patch is appended automatically. A bare filename is saved in the tool's output folder.")
-    parser.add_argument("-b", "--base-name", metavar="NAME", required=True, action=SingleUseStoreAction, help="Base name from index.json, for example U43.5.1")
+    parser.add_argument("base_name", help="Base name from index.json, for example U43.5.1")
     parser.add_argument("-c", "--compression", metavar="PRESET", choices=COMPRESSION_PRESETS, default="normal", action=SingleUseStoreAction, help="Compression preset (default: normal): normal, high, higher, maximum")
     parser.add_help_argument()
     args = parser.parse_args()

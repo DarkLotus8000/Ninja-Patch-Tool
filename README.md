@@ -2,7 +2,7 @@
 
 Ninja Patch Tool creates and applies self-contained Ninja Patches (Diff Patches) using HDiffPatch. Use Ninja Reverse Proxy (not published yet) instead when a normal Update Patch can be created; Ninja Patch Tool is intended as a fallback.
 
-A **base** is a clean, unmodified Warframe installation from a known Steam manifest. Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/depot/230411/manifests/).
+A ***base*** is a clean, unmodified Warframe installation from a known Steam manifest. Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/depot/230411/manifests/).
 
 ## Requirements
 
@@ -44,13 +44,13 @@ py verify_base.py path name
 Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.
 
 ```text
-py make_patch.py base new output -b NAME [-c PRESET]
+py make_patch.py base new output base_name [-c PRESET]
 ```
 
 - `base` - Clean indexed Steam manifest base
 - `new` - Newer installation
 - `output` - Patch filename or output path; `.patch` is appended automatically. A bare filename is saved in the tool's `output` folder.
-- `-b, --base-name NAME` - Base name from `index.json`, for example `U43.5.1`
+- `base_name` - Base name from `index.json`, for example `U43.5.1`
 - `-c, --compression PRESET` - Compression preset (default: `normal`): `normal`, `high`, `higher`, `maximum`
 
 Compression presets: normal is the default. High and higher trade more time and memory for potentially smaller patches. Maximum tries several matching strategies per modified file and can take much longer.
@@ -58,7 +58,7 @@ Compression presets: normal is the default. High and higher trade more time and 
 Example:
 
 ```bat
-py make_patch.py "D:\Warframe\U43.5.1" "D:\Warframe\U43.5.2" "U43.5.2.patch" -b U43.5.1
+py make_patch.py "D:\Warframe\U43.5.1" "D:\Warframe\U43.5.2" "U43.5.2.patch" U43.5.1
 ```
 
 An existing patch is never overwritten automatically.
