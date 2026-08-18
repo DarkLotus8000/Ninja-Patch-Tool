@@ -20,12 +20,12 @@ python add_base.py path name -m ID
 
 - `path` - Path to the clean Steam manifest base
 - `name` - Warframe version, for example `U43.5.1`
-- `-m, --manifest-id ID` - Numeric Steam manifest ID for the base
+- `-m, --manifest-id ID` - Steam manifest ID for the base
 
 Example:
 
 ```bat
-python add_base.py "D:\Warframe\U43.5.1" U43.5.1 -m STEAM_MANIFEST_ID
+python add_base.py "D:\Warframe\U43.5.1" U43.5.1 -m 4895911296145320793
 ```
 
 ## Verify a base
