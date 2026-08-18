@@ -435,7 +435,7 @@ def apply_and_verify(destination: Path, archive: zipfile.ZipFile, members: dict[
 
 def main() -> int:
     install_termination_handlers()
-    parser = ErrorArgumentParser(description="Apply a Ninja Patch (Diff Patch). By default, the base is left untouched and a separate installation named after the patch is created.")
+    parser = ErrorArgumentParser(description="Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate installation named after the patch is created.")
     parser.add_argument("base", type=Path, help="Base installation")
     parser.add_argument("patch", type=Path, help="Patch filename or path; .patch is appended automatically. A bare filename is looked up in the tool's output folder.")
     mode = parser.add_mutually_exclusive_group()

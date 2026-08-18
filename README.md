@@ -65,7 +65,7 @@ An existing patch is never overwritten automatically.
 
 ## Apply a Ninja Patch (Diff Patch)
 
-Apply a Ninja Patch (Diff Patch). By default, the base is left untouched and a separate installation named after the patch is created.
+Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate installation named after the patch is created.
 
 ```text
 py apply_patch.py base patch [-o OUTPUT | -i]
