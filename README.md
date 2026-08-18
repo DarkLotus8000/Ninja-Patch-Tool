@@ -1,6 +1,8 @@
 # Ninja Patch Tool
 
-Ninja Patch Tool creates and applies self-contained Ninja Patches (Diff Patches) using HDiffPatch.
+Ninja Patch Tool creates and applies self-contained Ninja Patches (Diff Patches) using HDiffPatch. Use Ninja Reverse Proxy (not published yet) instead when a normal Update Patch can be created; Ninja Patch Tool is intended as a fallback.
+
+A **base** is a clean, unmodified Warframe installation from a known Steam manifest. Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/depot/230411/manifests/).
 
 ## Requirements
 
@@ -10,41 +12,42 @@ No packages need to be installed.
 
 ## Add a base
 
-Add a clean, unmodified game base to `index.json`.
+Add a clean, unmodified Steam manifest base to `index.json`.
 
 ```text
-python add_base.py path name
+python add_base.py path name -m ID
 ```
 
-- `path` - Path to the clean base installation
-- `name` - Base name, for example `U43.5.1`
+- `path` - Path to the clean Steam manifest base
+- `name` - Warframe version, for example `U43.5.1`
+- `-m, --manifest-id ID` - Steam manifest ID for the base
 
 Example:
 
 ```bat
-python add_base.py "D:\Warframe\U43.5.1" U43.5.1
+python add_base.py "D:\Warframe\U43.5.1" U43.5.1 -m STEAM_MANIFEST_ID
 ```
 
 ## Verify a base
 
-Verify a game base against its entry in `index.json`. This is optional before creating a patch because `make_patch.py` verifies the selected base automatically.
+Verify a Steam manifest base against its entry in `index.json`. This is optional before creating a patch because `make_patch.py` verifies the selected base automatically.
 
 ```text
 python verify_base.py path name
 ```
 
-- `path` - Path to the base installation
-- `name` - Indexed base name, for example `U43.5.1`
+- `path` - Path to the Steam manifest base
+- `name` - Indexed Warframe version, for example `U43.5.1`
 
 ## Create a Ninja Patch (Diff Patch)
 
-Create one self-contained Ninja Patch (Diff Patch) from a clean indexed base.
+Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.
 
 ```text
 python make_patch.py base new output -b NAME [-c PRESET]
 ```
 
-- `base` - Clean indexed base installation
+- `base` - Clean indexed Steam manifest base
 - `new` - Newer installation
 - `output` - Patch filename or output path; `.patch` is appended automatically. A bare filename is saved in the tool's `output` folder.
 - `-b, --base-name NAME` - Base name from `index.json`, for example `U43.5.1`

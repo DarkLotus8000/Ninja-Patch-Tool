@@ -193,10 +193,10 @@ def create_patch_archive(work: Path, output: Path) -> None:
 def main() -> int:
     install_termination_handlers()
     parser = ErrorArgumentParser(
-        description="Create one self-contained Ninja Patch (Diff Patch) from a clean indexed base.",
+        description="Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.",
         epilog="Compression presets: normal is the default. High and higher trade more time and memory for potentially smaller patches. Maximum tries several matching strategies per modified file and can take much longer.",
     )
-    parser.add_argument("base", type=Path, help="Clean indexed base installation")
+    parser.add_argument("base", type=Path, help="Clean indexed Steam manifest base")
     parser.add_argument("new", type=Path, help="Newer installation")
     parser.add_argument("output", type=Path, help="Patch filename or output path; .patch is appended automatically. A bare filename is saved in the tool's output folder.")
     parser.add_argument("-b", "--base-name", metavar="NAME", required=True, action=SingleUseStoreAction, help="Base name from index.json, for example U43.5.1")
@@ -298,13 +298,16 @@ def main() -> int:
             operations.append({"type": "remove", "path": relative, "old_size": info["size"], "old_sha256": info["sha256"]})
             print(f"[Removed] {display_relative_path(relative)}")
 
-        manifest = {"version": PATCH_VERSION, "base": canonical_name, "old_root_sha256": old_root_hash, "new_root_sha256": new_root_hash, "old_file_count": len(old_files), "new_file_count": len(new_files), "operations": operations}
+        manifest = {
+            "version": PATCH_VERSION, "base": canonical_name, "base_steam_manifest_id": indexed_base["steam_manifest_id"], "old_root_sha256": old_root_hash, "new_root_sha256": new_root_hash,
+            "old_file_count": len(old_files), "new_file_count": len(new_files), "operations": operations,
+        }
         (work / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
         print(f"\nCreating single patch file:\n{output}")
         create_patch_archive(work, output)
         duration = format_duration(time.perf_counter() - started)
-        print(f"\n[Created] Patch completed successfully.\nBase: {canonical_name}\nDuration: {duration}\nPatch size: {output.stat().st_size:,} bytes")
+        print(f"\n[Created] Patch completed successfully.\nBase: {canonical_name}\nSteam manifest ID: {indexed_base['steam_manifest_id']}\nDuration: {duration}\nPatch size: {output.stat().st_size:,} bytes")
         return 0
 
     except KeyError:

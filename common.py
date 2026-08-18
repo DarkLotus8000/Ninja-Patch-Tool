@@ -73,12 +73,19 @@ def is_sha256(value: object) -> bool:
 def is_nonnegative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
+def is_steam_manifest_id(value: object) -> bool:
+    if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+        return False
+    number = int(value)
+    return value == str(number) and 0 < number <= 18446744073709551615
+
 def validate_index(index: dict[str, Any]) -> None:
     if not isinstance(index, dict):
         raise ValueError("index.json must contain a JSON object.")
 
     seen_names: dict[str, str] = {}
     seen_hashes: dict[str, str] = {}
+    seen_manifest_ids: dict[str, str] = {}
 
     for name, entry in index.items():
         if not isinstance(name, str) or not name.strip():
@@ -92,12 +99,19 @@ def validate_index(index: dict[str, Any]) -> None:
         if not isinstance(entry, dict):
             raise ValueError(f'Index entry "{name}" must be an object.')
 
+        manifest_id = entry.get("steam_manifest_id")
         digest = entry.get("sha256")
         file_count = entry.get("file_count")
+        if not is_steam_manifest_id(manifest_id):
+            raise ValueError(f'Index entry "{name}" has an invalid or missing steam_manifest_id.')
         if not is_sha256(digest):
             raise ValueError(f'Index entry "{name}" has an invalid SHA-256 value.')
         if not is_nonnegative_int(file_count):
             raise ValueError(f'Index entry "{name}" has an invalid file_count.')
+
+        if manifest_id in seen_manifest_ids:
+            raise ValueError(f'Bases "{seen_manifest_ids[manifest_id]}" and "{name}" have the same Steam manifest ID and appear to be duplicates.')
+        seen_manifest_ids[manifest_id] = name
 
         digest_lower = digest.lower()
         if digest_lower in seen_hashes:

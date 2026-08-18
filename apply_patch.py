@@ -22,6 +22,7 @@ from common import (
     install_termination_handlers,
     is_nonnegative_int,
     is_sha256,
+    is_steam_manifest_id,
     is_within,
     make_work_dir,
     parse_json,
@@ -57,12 +58,14 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
     if manifest.get("version") not in SUPPORTED_VERSIONS:
         raise RuntimeError(f"Unsupported patch version: {manifest.get('version')!r}")
 
-    required = {"base", "old_root_sha256", "new_root_sha256", "old_file_count", "new_file_count", "operations"}
+    required = {"base", "base_steam_manifest_id", "old_root_sha256", "new_root_sha256", "old_file_count", "new_file_count", "operations"}
     missing = required - set(manifest)
     if missing:
         raise RuntimeError("Patch manifest is missing: " + ", ".join(sorted(missing)))
     if not isinstance(manifest["base"], str) or not manifest["base"].strip():
         raise RuntimeError("Patch manifest has an invalid base name.")
+    if not is_steam_manifest_id(manifest["base_steam_manifest_id"]):
+        raise RuntimeError("Patch manifest has an invalid base Steam manifest ID.")
     if not is_sha256(manifest["old_root_sha256"]) or not is_sha256(manifest["new_root_sha256"]):
         raise RuntimeError("Patch manifest contains an invalid root SHA-256.")
     if not is_nonnegative_int(manifest["old_file_count"]) or not is_nonnegative_int(manifest["new_file_count"]):
@@ -484,7 +487,7 @@ def main() -> int:
         with zipfile.ZipFile(patch, "r") as archive:
             members = read_archive_members(archive)
             manifest = read_manifest(archive, members)
-            print(f"Patch base: {manifest['base']}\nVerifying current base installation...")
+            print(f"Patch base: {manifest['base']}\nSteam manifest ID: {manifest['base_steam_manifest_id']}\nVerifying current base installation...")
             base_files, base_hash = scan_tree(base)
 
             if base_hash.lower() != manifest["old_root_sha256"].lower() or len(base_files) != manifest["old_file_count"]:

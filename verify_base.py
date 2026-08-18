@@ -7,9 +7,9 @@ from pathlib import Path
 from common import ErrorArgumentParser, load_index, resolve_base_name, scan_tree
 
 def main() -> int:
-    parser = ErrorArgumentParser(description="Verify a game base against its entry in index.json.")
-    parser.add_argument("path", type=Path, help="Path to the base installation")
-    parser.add_argument("name", help="Indexed base name, for example U43.5.1")
+    parser = ErrorArgumentParser(description="Verify a Steam manifest base against its entry in index.json.")
+    parser.add_argument("path", type=Path, help="Path to the Steam manifest base")
+    parser.add_argument("name", help="Indexed Warframe version, for example U43.5.1")
     parser.add_help_argument()
     args = parser.parse_args()
 
@@ -32,7 +32,7 @@ def main() -> int:
             print(f"ERROR: Base verification failed.\n" f"Expected files: {expected['file_count']:,}\n" f"Actual files: {len(files):,}\n" f"Expected SHA-256: {expected['sha256']}\n" f"Actual SHA-256: {actual_hash}", file=sys.stderr)
             return 1
 
-        print(f'\n[Verified] Base "{canonical_name}" is valid and unmodified.\n' f"Files: {len(files):,}\n" f"SHA-256: {actual_hash}")
+        print(f'\n[Verified] Base "{canonical_name}" is valid and unmodified.\n' f"Steam manifest ID: {expected['steam_manifest_id']}\n" f"Files: {len(files):,}\n" f"SHA-256: {actual_hash}")
         return 0
 
     except KeyError:
