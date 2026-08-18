@@ -10,13 +10,13 @@ def main() -> int:
     parser = ErrorArgumentParser(description="Add a clean, unmodified Steam manifest base to index.json.")
     parser.add_argument("path", type=Path, help="Path to the clean Steam manifest base")
     parser.add_argument("name", help="Warframe version, for example U43.5.1")
-    parser.add_argument("-m", "--manifest-id", metavar="ID", required=True, action=SingleUseStoreAction, help="Steam manifest ID for the base")
+    parser.add_argument("-m", "--manifest-id", metavar="ID", type=int, required=True, action=SingleUseStoreAction, help="Steam manifest ID for the base")
     parser.add_help_argument()
     args = parser.parse_args()
 
     base = args.path.resolve()
     name = args.name.strip()
-    manifest_id = args.manifest_id.strip()
+    manifest_id = args.manifest_id
 
     if not base.is_dir():
         print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
@@ -26,7 +26,7 @@ def main() -> int:
         print("ERROR: Base name cannot be empty.", file=sys.stderr)
         return 1
     if not is_steam_manifest_id(manifest_id):
-        print("ERROR: Steam manifest ID must be a valid unsigned 64-bit decimal ID.", file=sys.stderr)
+        print("ERROR: Steam manifest ID must be a valid unsigned 64-bit integer.", file=sys.stderr)
         return 1
 
     try:

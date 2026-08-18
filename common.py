@@ -74,10 +74,7 @@ def is_nonnegative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 def is_steam_manifest_id(value: object) -> bool:
-    if not isinstance(value, str) or not value.isascii() or not value.isdigit():
-        return False
-    number = int(value)
-    return value == str(number) and 0 < number <= 18446744073709551615
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 18446744073709551615
 
 def validate_index(index: dict[str, Any]) -> None:
     if not isinstance(index, dict):

@@ -20,7 +20,7 @@ python add_base.py path name -m ID
 
 - `path` - Path to the clean Steam manifest base
 - `name` - Warframe version, for example `U43.5.1`
-- `-m, --manifest-id ID` - Steam manifest ID for the base
+- `-m, --manifest-id ID` - Numeric Steam manifest ID for the base
 
 Example:
 
