@@ -15,7 +15,7 @@ No packages need to be installed.
 Add a clean, unmodified Steam manifest base to `index.json`.
 
 ```text
-python add_base.py path name -m ID
+py add_base.py path name -m ID
 ```
 
 - `path` - Path to the clean Steam manifest base
@@ -25,7 +25,7 @@ python add_base.py path name -m ID
 Example:
 
 ```bat
-python add_base.py "D:\Warframe\U43.5.1" U43.5.1 -m 4895911296145320793
+py add_base.py "D:\Warframe\U43.5.1" U43.5.1 -m 4895911296145320793
 ```
 
 ## Verify a base
@@ -33,7 +33,7 @@ python add_base.py "D:\Warframe\U43.5.1" U43.5.1 -m 4895911296145320793
 Verify a Steam manifest base against its entry in `index.json`. This is optional before creating a patch because `make_patch.py` verifies the selected base automatically.
 
 ```text
-python verify_base.py path name
+py verify_base.py path name
 ```
 
 - `path` - Path to the Steam manifest base
@@ -44,7 +44,7 @@ python verify_base.py path name
 Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.
 
 ```text
-python make_patch.py base new output -b NAME [-c PRESET]
+py make_patch.py base new output -b NAME [-c PRESET]
 ```
 
 - `base` - Clean indexed Steam manifest base
@@ -58,7 +58,7 @@ Compression presets: normal is the default. High and higher trade more time and 
 Example:
 
 ```bat
-python make_patch.py "D:\Warframe\U43.5.1" "D:\Warframe\U43.5.2" "U43.5.2.patch" -b U43.5.1
+py make_patch.py "D:\Warframe\U43.5.1" "D:\Warframe\U43.5.2" "U43.5.2.patch" -b U43.5.1
 ```
 
 An existing patch is never overwritten automatically.
@@ -68,7 +68,7 @@ An existing patch is never overwritten automatically.
 Apply a Ninja Patch (Diff Patch). By default, the base is left untouched and a separate installation named after the patch is created.
 
 ```text
-python apply_patch.py base patch [-o OUTPUT | -i]
+py apply_patch.py base patch [-o OUTPUT | -i]
 ```
 
 - `base` - Base installation
@@ -79,7 +79,7 @@ python apply_patch.py base patch [-o OUTPUT | -i]
 Example:
 
 ```bat
-python apply_patch.py "D:\Warframe\U43.5.1" "U43.5.2.patch"
+py apply_patch.py "D:\Warframe\U43.5.1" "U43.5.2.patch"
 ```
 
 In-place mode creates a recovery backup before modifying the base. Interrupted operations are cleaned up or recovered automatically when possible.
