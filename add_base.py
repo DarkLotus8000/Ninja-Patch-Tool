@@ -4,13 +4,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from common import ErrorArgumentParser, SingleUseStoreAction, is_steam_manifest_id, load_index, resolve_base_name, scan_tree, write_index
+from common import ErrorArgumentParser, is_steam_manifest_id, load_index, resolve_base_name, scan_tree, write_index
 
 def main() -> int:
     parser = ErrorArgumentParser(description="Add a clean, unmodified Steam manifest base to index.json.")
     parser.add_argument("path", type=Path, help="Path to the clean Steam manifest base")
     parser.add_argument("name", help="Warframe version, for example U43.5.1")
-    parser.add_argument("-m", "--manifest-id", metavar="ID", type=int, required=True, action=SingleUseStoreAction, help="Steam manifest ID for the base")
+    parser.add_argument("manifest_id", type=int, help="Steam manifest ID of the base")
     parser.add_help_argument()
     args = parser.parse_args()
 
