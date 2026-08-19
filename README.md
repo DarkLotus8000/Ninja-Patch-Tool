@@ -25,7 +25,7 @@ py add_base.py path name manifest_id
 Example:
 
 ```bat
-py add_base.py "D:\Warframe\U43.5.1" U43.5.1 4895911296145320793
+py add_base.py "D:\WF\U43.5.1" U43.5.1 4895911296145320793
 ```
 
 ## Verify a base
@@ -58,7 +58,7 @@ Compression presets: normal is the default. High and higher trade more time and 
 Example:
 
 ```bat
-py make_patch.py "D:\Warframe\U43.5.1" "D:\Warframe\U43.5.2" "U43.5.2.patch" U43.5.1
+py make_patch.py "D:\WF\U43.5.1" "D:\WF\U43.5.2" "U43.5.2.patch" U43.5.1
 ```
 
 An existing patch is never overwritten automatically.
@@ -79,7 +79,7 @@ py apply_patch.py base patch [-o OUTPUT | -i]
 Example:
 
 ```bat
-py apply_patch.py "D:\Warframe\U43.5.1" "U43.5.2.patch"
+py apply_patch.py "D:\WF\U43.5.1" "U43.5.2.patch"
 ```
 
 In-place mode creates a recovery backup before modifying the base. Interrupted operations are cleaned up or recovered automatically when possible.
