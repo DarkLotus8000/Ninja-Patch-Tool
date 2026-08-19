@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from common import ErrorArgumentParser, is_steam_manifest_id, load_index, resolve_base_name, scan_tree, write_index
+from common import ErrorArgumentParser, is_steam_manifest_id, load_index, resolve_base_name, scan_tree, validate_warframe_installation, write_index
 
 def main() -> int:
     parser = ErrorArgumentParser(description="Add a clean, unmodified Steam manifest base to index.json.")
@@ -20,6 +20,8 @@ def main() -> int:
 
     if not base.is_dir():
         print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
+        return 1
+    if not validate_warframe_installation(base, "Base"):
         return 1
 
     if not name:

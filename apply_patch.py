@@ -33,6 +33,7 @@ from common import (
     safe_join,
     scan_tree,
     sha256_file,
+    validate_warframe_installation,
 )
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -449,6 +450,8 @@ def main() -> int:
 
     if not base.is_dir():
         print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
+        return 1
+    if not validate_warframe_installation(base, "Base"):
         return 1
     if not patch.is_file():
         print(f"ERROR: Patch file does not exist: {patch}", file=sys.stderr)

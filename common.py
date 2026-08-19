@@ -32,6 +32,15 @@ def sha256_file(path: Path) -> str:
 def is_ignored_file(path: Path) -> bool:
     return path.name.casefold() in IGNORED_FILENAMES
 
+def is_warframe_installation(path: Path) -> bool:
+    return (path / "Cache.Windows").is_dir() and (path / "Tools").is_dir() and (path / "Warframe.x64.exe").is_file()
+
+def validate_warframe_installation(path: Path, label: str) -> bool:
+    if is_warframe_installation(path):
+        return True
+    print(f"ERROR: {label} directory is not a Warframe installation root:\n{path}\nExpected at least Cache.Windows, Tools, and Warframe.x64.exe directly inside it.", file=sys.stderr)
+    return False
+
 def natural_sort_key(value: str):
     return tuple(int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", value) if part)
 

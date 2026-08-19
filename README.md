@@ -2,7 +2,7 @@
 
 Ninja Patch Tool creates and applies self-contained Ninja Patches (Diff Patches) using HDiffPatch. Use Ninja Reverse Proxy (not published yet) instead when a normal Update Patch can be created; Ninja Patch Tool is intended as a fallback.
 
-A ***base*** is a clean, unmodified Warframe installation from a known Steam manifest. Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/depot/230411/manifests/).
+A ***base*** is a clean, unmodified Warframe installation from a known Steam manifest. Select the Warframe installation root, where at least `Cache.Windows`, `Tools`, and `Warframe.x64.exe` are directly located. Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/depot/230411/manifests/).
 
 ## Requirements
 
@@ -42,6 +42,8 @@ py verify_base.py path name
 ## Create a Ninja Patch (Diff Patch)
 
 Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.
+
+Before using an installation as `new`, fully download all language files and both DirectX 11 and DirectX 12 files in the Warframe Launcher, then open the launcher settings, click **Optimize**, and let the process finish.
 
 ```text
 py make_patch.py base new output base_name [-c PRESET]

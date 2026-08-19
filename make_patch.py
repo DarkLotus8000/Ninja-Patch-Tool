@@ -27,6 +27,7 @@ from common import (
     resolve_patch_output,
     run_child,
     scan_tree,
+    validate_warframe_installation,
 )
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -213,6 +214,10 @@ def main() -> int:
         return 1
     if not new.is_dir():
         print(f"ERROR: New directory does not exist: {new}", file=sys.stderr)
+        return 1
+    if not validate_warframe_installation(base, "Base"):
+        return 1
+    if not validate_warframe_installation(new, "New"):
         return 1
     if base == new:
         print("ERROR: Base and new directories are the same.", file=sys.stderr)
