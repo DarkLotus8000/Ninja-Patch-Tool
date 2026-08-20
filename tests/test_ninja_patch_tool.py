@@ -153,6 +153,27 @@ class MakePatchTests(unittest.TestCase):
                 make_patch.create_patch_archive(work, output)
             self.assertEqual(partial.read_bytes(), b"keep")
 
+    def test_create_archive_never_overwrites_output_created_during_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            (work / "diffs").mkdir(parents=True)
+            (work / "files").mkdir()
+            (work / "manifest.json").write_text("{}", encoding="utf-8")
+            output = root / "test.patch"
+            original_publish = make_patch.publish_patch_archive
+
+            def race(temporary: Path, destination: Path) -> None:
+                destination.write_bytes(b"unrelated")
+                original_publish(temporary, destination)
+
+            with mock.patch.object(make_patch, "publish_patch_archive", side_effect=race):
+                with self.assertRaisesRegex(FileExistsError, "appeared while the patch was being created"):
+                    make_patch.create_patch_archive(work, output)
+
+            self.assertEqual(output.read_bytes(), b"unrelated")
+            self.assertFalse(make_patch.temporary_patch_path(output).exists())
+
     def test_maximum_continues_after_candidate_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

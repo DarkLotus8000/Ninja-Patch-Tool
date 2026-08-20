@@ -55,6 +55,18 @@ STREAM_MODE_THRESHOLD = 1024 * 1024 * 1024
 def temporary_patch_path(output: Path) -> Path:
     return output.with_name(output.name + ".tmp")
 
+def publish_patch_archive(temporary: Path, output: Path) -> None:
+    try:
+        if os.name == "nt":
+            # Unlike os.replace(), Windows os.rename() fails if the destination already exists, so another process cannot have its file overwritten during publication.
+            temporary.rename(output)
+        else:
+            # Keep the same no-overwrite guarantee when running the test suite on non-Windows systems, where os.rename() may replace an existing destination.
+            os.link(temporary, output)
+            temporary.unlink()
+    except FileExistsError:
+        raise FileExistsError(f"Patch output appeared while the patch was being created: {output}") from None
+
 def uses_stream(old: Path, new: Path, compression: str) -> bool:
     return compression != "normal" and max(old.stat().st_size, new.stat().st_size) >= STREAM_MODE_THRESHOLD
 
@@ -194,8 +206,8 @@ def create_patch_archive(work: Path, output: Path) -> None:
         if output.exists():
             raise FileExistsError(f"Patch output appeared while the patch was being created: {output}")
 
-        # Publish only after the complete archive is written; an interruption before this point can leave only the disposable .tmp file tied to session.json.
-        temporary.replace(output)
+        # Publish only after the complete archive is written. The publication itself must also refuse an output created after the check above, closing the final race without overwriting another process's file.
+        publish_patch_archive(temporary, output)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
