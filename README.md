@@ -6,6 +6,7 @@ A ***base*** is a clean, unmodified Warframe installation from a known Steam man
 
 ## Requirements
 
+- 64-bit Windows 8.1 or newer
 - Python 3.10 or newer
 
 No packages need to be installed.
