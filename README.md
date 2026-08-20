@@ -43,7 +43,7 @@ py verify_base.py path name
 
 Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.
 
-Before using an installation as `new`, fully download all language files and both DirectX 11 and DirectX 12 files in the Warframe Launcher, then open the launcher settings, click **Optimize**, and let the process finish.
+Before using an installation as `new`, fully download all language files and both DirectX 11 and DirectX 12 files in the Warframe Launcher, then open the launcher settings, click **Optimize**, and let the process finish. Close Warframe and the Warframe Launcher before creating the patch.
 
 ```text
 py make_patch.py base new output base_name [-c PRESET]

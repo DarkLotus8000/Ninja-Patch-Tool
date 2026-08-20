@@ -34,6 +34,7 @@ from common import (
     scan_tree,
     sha256_file,
     validate_warframe_installation,
+    warn_if_low_disk_space,
 )
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -92,7 +93,7 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
         except ValueError as exc:
             raise RuntimeError(f"Patch operation {index} has an unsafe path: {relative!r}") from exc
 
-        path_key = canonical.casefold() if os.name == "nt" else canonical
+        path_key = canonical.casefold()
         if path_key in seen_paths:
             raise RuntimeError(f"Patch contains more than one operation for: {relative}")
         seen_paths.add(path_key)
@@ -175,12 +176,12 @@ def temporary_output(target: Path) -> Path:
 
 def check_temporary_paths(destination: Path, operations: list[dict]) -> None:
     # .tmp files are written beside targets for atomic replacement. Refuse any pre-existing or manifest-target collision instead of deleting a possibly legitimate file.
-    targets = {os.path.normcase(str(safe_join(destination, operation["path"]).resolve())) for operation in operations}
+    targets = {str(safe_join(destination, operation["path"]).resolve()).casefold() for operation in operations}
     for operation in operations:
         if operation["type"] not in {"patch", "replace", "add"}:
             continue
         temporary = temporary_output(safe_join(destination, operation["path"]))
-        if os.path.normcase(str(temporary.resolve())) in targets:
+        if str(temporary.resolve()).casefold() in targets:
             raise RuntimeError(f"Temporary output path conflicts with a patch target: {temporary}")
         if temporary.exists():
             raise RuntimeError(f"Temporary output path already exists: {temporary}")
@@ -248,18 +249,26 @@ def backup_in_place(base: Path, backup: Path, operations: list[dict]) -> dict[st
         target = safe_join(base, relative)
         existed[relative] = target.is_file()
         if existed[relative]:
+            if "old_size" not in operation or "old_sha256" not in operation:
+                raise RuntimeError(f"Patch expects a new file, but an original file exists: {relative}")
             backup_path = safe_join(backup, relative)
             backup_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(target, backup_path)
+            verify_file(backup_path, operation["old_size"], operation["old_sha256"])
     return existed
 
 def rollback_in_place(base: Path, backup: Path, operations: list[dict], existed: dict[str, bool]) -> None:
-    # First remove files created by the patch, then restore every original file. This order also handles file <-> directory path changes.
+    # Remove every path created by the patch first, then restore original files. This ordering is required when a patch changes a path between file and directory topology.
     for operation in operations:
         relative = operation["path"]
+        if existed.get(relative):
+            continue
         target = safe_join(base, relative)
-        temporary_output(target).unlink(missing_ok=True)
-        if not existed.get(relative) and target.is_file():
+        try:
+            temporary_output(target).unlink(missing_ok=True)
+        except NotADirectoryError:
+            pass
+        if target.is_file():
             target.unlink()
             prune_empty_parents(target.parent, base)
 
@@ -268,6 +277,7 @@ def rollback_in_place(base: Path, backup: Path, operations: list[dict], existed:
         if not existed.get(relative):
             continue
         target = safe_join(base, relative)
+        temporary_output(target).unlink(missing_ok=True)
         if target.exists() and not target.is_file():
             try:
                 target.rmdir()
@@ -306,6 +316,9 @@ def make_recovery_state(mode: str, base: Path, destination: Path, patch: Path, m
         state["existed"] = existed or {}
     return state
 
+def recovery_matches_manifest(state: dict, manifest: dict) -> bool:
+    return all(state.get(key) == manifest.get(key) for key in ("old_root_sha256", "new_root_sha256", "old_file_count", "new_file_count"))
+
 def tree_matches(root: Path, expected_hash: str, expected_count: int) -> bool:
     files, root_hash = scan_tree(root)
     return root_hash.lower() == expected_hash.lower() and len(files) == expected_count
@@ -336,12 +349,12 @@ def remove_incomplete_output(destination: Path) -> bool:
         shutil.rmtree(destination, ignore_errors=True)
     return not destination.exists()
 
-def recover_interrupted_operations(base: Path, destination: Path) -> bool:
-    # Recovery records exist only when an apply operation may need cleanup. Verify whether it actually finished before restoring/removing anything.
+def recover_interrupted_operations(base: Path, destination: Path) -> dict | None:
+    # Recovery records exist only when an apply operation may need cleanup. Recovery runs before normal patch prerequisites so missing tools or a temporarily incomplete installation cannot block restoration.
     if not TEMP_ROOT.is_dir():
-        return False
+        return None
 
-    completed_output = False
+    completed_state: dict | None = None
     for work in sorted(TEMP_ROOT.glob("apply_patch_*")):
         recovery = work / RECOVERY_FILE
         if not recovery.is_file():
@@ -386,6 +399,9 @@ def recover_interrupted_operations(base: Path, destination: Path) -> bool:
             if tree_matches(base, new_hash, new_count):
                 print("[Recovery] The in-place patch had already completed successfully.")
                 cleanup_work_dir(work)
+                if completed_state is not None and not recovery_matches_manifest(completed_state, state):
+                    raise RuntimeError("More than one completed recovery state with different patch identities was found for this base.")
+                completed_state = state
                 continue
             if tree_matches(base, old_hash, old_count):
                 print("[Recovery] The original base is already intact.")
@@ -413,7 +429,9 @@ def recover_interrupted_operations(base: Path, destination: Path) -> bool:
             if tree_matches(recovery_destination, new_hash, new_count):
                 print("[Recovery] The previous output had already completed successfully.")
                 cleanup_work_dir(work)
-                completed_output = True
+                if completed_state is not None and not recovery_matches_manifest(completed_state, state):
+                    raise RuntimeError("More than one completed recovery state with different patch identities was found for this base/output.")
+                completed_state = state
                 continue
 
             print("Removing the incomplete output installation...")
@@ -425,7 +443,7 @@ def recover_interrupted_operations(base: Path, destination: Path) -> bool:
 
         raise RuntimeError(f"Interrupted patch recovery data contains an unknown mode: {mode!r}\nRecovery state: {recovery}")
 
-    return completed_output
+    return completed_state
 
 def apply_and_verify(destination: Path, archive: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo], scratch: Path, manifest: dict) -> None:
     print("\nApplying patch...")
@@ -451,14 +469,6 @@ def main() -> int:
     if not base.is_dir():
         print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
         return 1
-    if not validate_warframe_installation(base, "Base"):
-        return 1
-    if not patch.is_file():
-        print(f"ERROR: Patch file does not exist: {patch}", file=sys.stderr)
-        return 1
-    if not HPATCHZ.is_file():
-        print(f"ERROR: hpatchz.exe was not found in the tools folder:\n{HPATCHZ}", file=sys.stderr)
-        return 1
 
     destination = base if args.in_place else args.output.resolve() if args.output is not None else base.parent / patch.stem
     if not args.in_place and (destination == base or is_within(destination, base) or is_within(base, destination)):
@@ -466,7 +476,7 @@ def main() -> int:
         return 1
 
     try:
-        completed_output = recover_interrupted_operations(base, destination)
+        completed_state = recover_interrupted_operations(base, destination)
     except KeyboardInterrupt:
         print("\nPatch application cancelled.", file=sys.stderr)
         return 130
@@ -474,11 +484,33 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    if not args.in_place and completed_output and destination.exists():
-        print(f"\n[Patched] The previous patch application had already completed successfully.\nBase: {base}\nOutput: {destination}")
-        return 0
+    if not validate_warframe_installation(base, "Base"):
+        return 1
+    if not patch.is_file():
+        print(f"ERROR: Patch file does not exist: {patch}", file=sys.stderr)
+        return 1
+
+    if completed_state is not None:
+        try:
+            with zipfile.ZipFile(patch, "r") as archive:
+                members = read_archive_members(archive)
+                completed_manifest = read_manifest(archive, members)
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
+        if recovery_matches_manifest(completed_state, completed_manifest):
+            print(f"\n[Patched] The previous patch application had already completed successfully.\nBase: {base}\nOutput: {destination}")
+            return 0
+        if not args.in_place and destination.exists():
+            print(f"ERROR: Output path already exists and belongs to a previously completed different patch:\n{destination}", file=sys.stderr)
+            return 1
+
     if not args.in_place and destination.exists():
         print(f"ERROR: Output path already exists:\n{destination}", file=sys.stderr)
+        return 1
+    if not HPATCHZ.is_file():
+        print(f"ERROR: hpatchz.exe was not found in the tools folder:\n{HPATCHZ}", file=sys.stderr)
         return 1
 
     work = None
@@ -500,6 +532,17 @@ def main() -> int:
                 )
 
             print(f'[Verified] Base "{manifest["base"]}" is valid.')
+            largest_payload = max((members[operation["payload"]].file_size for operation in manifest["operations"] if "payload" in operation), default=0)
+            largest_temporary = max((operation.get("new_size", 0) for operation in manifest["operations"]), default=0)
+            if args.in_place:
+                backup_estimate = sum(operation.get("old_size", 0) for operation in manifest["operations"] if operation["type"] in {"patch", "replace", "remove"})
+                warn_if_low_disk_space(TEMP_ROOT, backup_estimate + largest_payload, "the in-place recovery backup and patch payload")
+                warn_if_low_disk_space(base, largest_temporary, "temporary in-place patch output")
+            else:
+                base_estimate = sum(info["size"] for info in base_files.values())
+                warn_if_low_disk_space(destination.parent, base_estimate + largest_temporary, "the separate patched installation")
+                warn_if_low_disk_space(TEMP_ROOT, largest_payload, "temporary patch payload data")
+
             work = make_work_dir("apply_patch")
             scratch = work / "payload"
             scratch.mkdir()
@@ -508,7 +551,7 @@ def main() -> int:
                 check_temporary_paths(base, manifest["operations"])
                 backup = work / "backup"
                 backup.mkdir()
-                print("\n--in-place was specified.\nCreating a temporary backup before modifying the base...")
+                print("\n--in-place was specified.\nCreating and verifying a temporary backup before modifying the base...")
 
                 # Write recovery before the potentially long backup. If the process is killed during backup the base is still unchanged, so the next run can safely discard the partial backup.
                 keep_work = True

@@ -45,17 +45,26 @@ def natural_sort_key(value: str):
     return tuple(int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", value) if part)
 
 def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
-    # The root hash fingerprints the complete relevant tree using each relative path, size, and file SHA-256. Sort paths before building it because filesystem enumeration order is not guaranteed; this does not move or modify any files.
+    # The root hash uses each relative path, size, and file SHA-256. Filesystem enumeration order is not guaranteed, so only the in-memory path list is sorted before hashing; no files are moved or modified.
     paths = sorted((path for path in root.rglob("*") if path.is_file() and not is_ignored_file(path)), key=lambda path: path.relative_to(root).as_posix())
+    relative_paths = [path.relative_to(root).as_posix() for path in paths]
     files: dict[str, dict[str, Any]] = {}
     root_hash = hashlib.sha256()
 
-    for path in paths:
-        relative = path.relative_to(root).as_posix()
-        size = path.stat().st_size
+    for path, relative in zip(paths, relative_paths):
+        before = path.stat()
         digest = sha256_file(path)
+        after = path.stat()
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            raise RuntimeError(f"Installation changed while it was being scanned:\n{path}\nClose Warframe and the Warframe Launcher and try again.")
+
+        size = after.st_size
         files[relative] = {"path": path, "size": size, "sha256": digest}
         root_hash.update(relative.encode("utf-8") + b"\0" + str(size).encode("ascii") + b"\0" + digest.encode("ascii") + b"\n")
+
+    current_paths = sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and not is_ignored_file(path))
+    if current_paths != relative_paths:
+        raise RuntimeError(f"Installation changed while it was being scanned:\n{root}\nClose Warframe and the Warframe Launcher and try again.")
 
     return files, root_hash.hexdigest()
 
@@ -71,13 +80,7 @@ def parse_json(data: str | bytes):
     return json.loads(data, object_pairs_hook=_no_duplicate_keys)
 
 def is_sha256(value: object) -> bool:
-    if not isinstance(value, str) or len(value) != 64:
-        return False
-    try:
-        int(value, 16)
-        return True
-    except ValueError:
-        return False
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
 
 def is_nonnegative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
@@ -91,7 +94,7 @@ def validate_index(index: dict[str, Any]) -> None:
 
     seen_names: dict[str, str] = {}
     seen_hashes: dict[str, str] = {}
-    seen_manifest_ids: dict[str, str] = {}
+    seen_manifest_ids: dict[int, str] = {}
 
     for name, entry in index.items():
         if not isinstance(name, str) or not name.strip():
@@ -224,8 +227,19 @@ def relative_path_parts(relative: str) -> tuple[str, ...]:
     windows = PureWindowsPath(relative)
     if not posix.parts or posix.is_absolute() or windows.is_absolute() or windows.drive or ".." in posix.parts:
         raise ValueError(f"Unsafe relative path: {relative!r}")
-    if os.name == "nt" and any(":" in part for part in posix.parts):
-        raise ValueError(f"Unsafe relative path: {relative!r}")
+
+    # Ninja Patches target Warframe on Windows. Reject names that Windows normalizes specially or interprets as devices/alternate data streams, even when validation runs on another OS.
+    for part in posix.parts:
+        stem = part.split(".", 1)[0].rstrip(" ").casefold()
+        if (
+            ":" in part
+            or any(character in part for character in '<>"|?*')
+            or any(ord(character) < 32 for character in part)
+            or part.endswith((" ", "."))
+            or stem in {"con", "prn", "aux", "nul", "conin$", "conout$"}
+            or re.fullmatch(r"(?:com|lpt)(?:[1-9]|[¹²³])", stem)
+        ):
+            raise ValueError(f"Unsafe relative path: {relative!r}")
     return posix.parts
 
 def safe_join(root: Path, relative: str) -> Path:
@@ -236,6 +250,27 @@ def safe_join(root: Path, relative: str) -> Path:
 
 def ensure_patch_extension(path: Path) -> Path:
     return path if path.name.lower().endswith(".patch") else path.with_name(path.name + ".patch")
+
+def format_bytes(size: int) -> str:
+    value = float(max(0, size))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+def warn_if_low_disk_space(path: Path, required_bytes: int, purpose: str) -> None:
+    if required_bytes <= 0:
+        return
+    probe = path.resolve()
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError:
+        return
+    if free < required_bytes:
+        print(f"WARNING: Disk space may be insufficient for {purpose}.\nAvailable: {format_bytes(free)}\nEstimated required: {format_bytes(required_bytes)}", file=sys.stderr)
 
 def format_duration(seconds: float) -> str:
     total_seconds = max(0, round(seconds))

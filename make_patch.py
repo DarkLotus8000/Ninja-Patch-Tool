@@ -28,6 +28,7 @@ from common import (
     run_child,
     scan_tree,
     validate_warframe_installation,
+    warn_if_low_disk_space,
 )
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -114,8 +115,7 @@ def cleanup_stale_make_patch_work(output: Path) -> None:
 
     partial = temporary_patch_path(output)
     if partial.exists():
-        print("Removing leftover temporary patch from an interrupted creation...")
-        partial.unlink()
+        raise RuntimeError(f"Temporary patch path already exists and was not removed because Ninja Patch Tool cannot prove that it owns the file:\n{partial}")
 
 def payload_id(relative: str) -> str:
     return hashlib.sha256(relative.encode("utf-8")).hexdigest()
@@ -134,19 +134,26 @@ def run_hdiff(old: Path, new: Path, output: Path, compression: str) -> None:
         run_hdiff_command(old, new, output, preset["stream" if stream else "memory"], preset["common"])
         return
 
-    # Maximum is a best-of search. Only the winning candidate remains in the patch, so this extra work affects creation time but not application time.
+    # Maximum is a best-of search. Individual strategies may fail because of memory or HDiffPatch limits; keep trying and fail only if every candidate fails.
     candidates = MAXIMUM_STREAM_CANDIDATES if stream else MAXIMUM_MEMORY_CANDIDATES
     best_path: Path | None = None
     best_size: int | None = None
     best_options: list[str] | None = None
+    failures: list[str] = []
 
     try:
         for index, mode_options in enumerate(candidates, start=1):
             candidate = output.with_name(f"{output.name}.candidate-{index}")
             candidate.unlink(missing_ok=True)
             print(f" [Maximum] Candidate {index}/{len(candidates)}: {' '.join(mode_options)}")
-            run_hdiff_command(old, new, candidate, mode_options, preset["common"])
-            candidate_size = candidate.stat().st_size
+            try:
+                run_hdiff_command(old, new, candidate, mode_options, preset["common"])
+                candidate_size = candidate.stat().st_size
+            except Exception as exc:
+                candidate.unlink(missing_ok=True)
+                failures.append(f"{' '.join(mode_options)}: {exc}")
+                print(f" [Maximum] Candidate failed: {exc}", file=sys.stderr)
+                continue
 
             if best_size is None or candidate_size < best_size:
                 if best_path is not None:
@@ -156,7 +163,8 @@ def run_hdiff(old: Path, new: Path, output: Path, compression: str) -> None:
                 candidate.unlink()
 
         if best_path is None or best_size is None or best_options is None:
-            raise RuntimeError(f"No maximum-compression candidate was created: {new}")
+            details = "\n".join(f"- {failure}" for failure in failures)
+            raise RuntimeError(f"All maximum-compression candidates failed for: {new}" + (f"\n{details}" if details else ""))
 
         best_path.replace(output)
         print(f" [Maximum] Selected: {' '.join(best_options)} ({best_size:,} bytes)")
@@ -171,7 +179,8 @@ def create_patch_archive(work: Path, output: Path) -> None:
         raise FileExistsError(f"Patch output already exists: {output}")
 
     temporary = temporary_patch_path(output)
-    temporary.unlink(missing_ok=True)
+    if temporary.exists():
+        raise FileExistsError(f"Temporary patch path already exists: {temporary}")
 
     try:
         # Only patch-format files belong in the archive. In particular, session.json is local recovery metadata and must never leak into a distributed patch.
@@ -185,7 +194,7 @@ def create_patch_archive(work: Path, output: Path) -> None:
         if output.exists():
             raise FileExistsError(f"Patch output appeared while the patch was being created: {output}")
 
-        # Publish only after the complete archive is written; an interruption before this point can leave only the disposable .tmp file.
+        # Publish only after the complete archive is written; an interruption before this point can leave only the disposable .tmp file tied to session.json.
         temporary.replace(output)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -225,17 +234,16 @@ def main() -> int:
     if is_within(output, base) or is_within(output, new):
         print(f"ERROR: Patch output must not be inside the base or new installation:\n{output}", file=sys.stderr)
         return 1
+    try:
+        cleanup_stale_make_patch_work(output)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     if output.exists():
         print(f"ERROR: Patch output already exists:\n{output}\nChoose a different output name or remove the existing patch first.\nNo patch was generated.", file=sys.stderr)
         return 1
     if not HDIFFZ.is_file():
         print(f"ERROR: hdiffz.exe was not found in the tools folder:\n{HDIFFZ}", file=sys.stderr)
-        return 1
-
-    try:
-        cleanup_stale_make_patch_work(output)
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     work = None
@@ -264,6 +272,12 @@ def main() -> int:
         modified = sorted(relative for relative in common_names if old_files[relative]["sha256"] != new_files[relative]["sha256"])
 
         print(f"\nUnchanged: {len(common_names) - len(modified):,}\nModified: {len(modified):,}\nAdded: {len(added):,}\nRemoved: {len(removed):,}\n\nCreating patch payload...")
+
+        payload_estimate = sum(new_files[relative]["size"] for relative in modified + added)
+        largest_modified = max((new_files[relative]["size"] for relative in modified), default=0)
+        candidate_overhead = largest_modified * (2 if args.compression == "maximum" else 1)
+        warn_if_low_disk_space(TEMP_ROOT, payload_estimate + candidate_overhead, "temporary patch creation data")
+        warn_if_low_disk_space(output.parent, payload_estimate, "the final patch archive")
 
         work = make_work_dir("make_patch")
         write_make_session(work, output)
