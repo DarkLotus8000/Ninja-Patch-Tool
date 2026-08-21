@@ -4,7 +4,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from common import ErrorArgumentParser, is_steam_manifest_id, load_index, resolve_base_name, scan_tree, validate_warframe_installation, write_index
+from common import (
+    ErrorArgumentParser,
+    is_steam_manifest_id,
+    load_index,
+    resolve_base_name,
+    scan_tree,
+    validate_warframe_installation,
+    write_index,
+)
 
 def main() -> int:
     parser = ErrorArgumentParser(description="Add a clean, unmodified Steam manifest base to index.json.")
@@ -45,7 +53,11 @@ def main() -> int:
 
         for existing_name, entry in index.items():
             if entry["steam_manifest_id"] == manifest_id:
-                print(f'ERROR: Steam manifest ID {manifest_id} is already indexed as "{existing_name}".\nNo changes were made.', file=sys.stderr)
+                print(
+                    f'ERROR: Steam manifest ID {manifest_id} is already indexed as "{existing_name}".\n'
+                    "No changes were made.",
+                    file=sys.stderr,
+                )
                 return 1
 
         print(f'Hashing base "{name}"...\n' "This may take a while for large installations.")
@@ -61,7 +73,13 @@ def main() -> int:
 
         write_index(index)
 
-        print(f'\n[Added] Base "{name}"\n' f"Steam manifest ID: {manifest_id}\n" f"Files: {len(files):,}\n" f"SHA-256: {root_hash}\n" f"Index: {Path(__file__).resolve().parent / 'index.json'}")
+        print(
+            f'\n[Added] Base "{name}"\n'
+            f"Steam manifest ID: {manifest_id}\n"
+            f"Files: {len(files):,}\n"
+            f"SHA-256: {root_hash}\n"
+            f"Index: {Path(__file__).resolve().parent / 'index.json'}"
+        )
         return 0
 
     except Exception as exc:

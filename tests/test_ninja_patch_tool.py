@@ -35,7 +35,10 @@ def tree_identity(root: Path) -> tuple[str, int]:
 
 def write_recovery(work: Path, state: dict) -> None:
     work.mkdir(parents=True, exist_ok=True)
-    (work / apply_patch.RECOVERY_FILE).write_text(json.dumps({"recovery_version": apply_patch.RECOVERY_VERSION, "pid": -1, **state}), encoding="utf-8")
+    (work / apply_patch.RECOVERY_FILE).write_text(
+        json.dumps({"recovery_version": apply_patch.RECOVERY_VERSION, "pid": -1, **state}),
+        encoding="utf-8",
+    )
 
 class CommonTests(unittest.TestCase):
     def test_duplicate_json_keys_are_rejected(self) -> None:
@@ -70,7 +73,11 @@ class CommonTests(unittest.TestCase):
             self.assertFalse(common.is_warframe_installation(root.parent))
 
     def test_windows_unsafe_paths_are_rejected_on_every_os(self) -> None:
-        for path in ("../x", "/x", "C:/x", "file:stream", "CON", "con.txt", "CON .txt", "COM1.bin", "COM¹.bin", "LPT9", "name. ", "name.", "bad?.txt"):
+        unsafe_paths = (
+            "../x", "/x", "C:/x", "file:stream", "CON", "con.txt", "CON .txt",
+            "COM1.bin", "COM¹.bin", "LPT9", "name. ", "name.", "bad?.txt",
+        )
+        for path in unsafe_paths:
             with self.subTest(path=path):
                 with self.assertRaises(ValueError):
                     common.relative_path_parts(path)
@@ -203,7 +210,11 @@ class MakePatchTests(unittest.TestCase):
             output = base / "bad.patch"
             stderr = io.StringIO()
             argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.1"]
-            with mock.patch.object(sys, "argv", argv), mock.patch.object(make_patch, "install_termination_handlers"), mock.patch("sys.stderr", stderr):
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(make_patch, "install_termination_handlers"),
+                mock.patch("sys.stderr", stderr),
+            ):
                 self.assertEqual(make_patch.main(), 1)
             self.assertIn("Patch output must not be inside", stderr.getvalue())
 
@@ -398,14 +409,29 @@ class ApplyPatchTests(unittest.TestCase):
             (new / "Cache.Windows" / "data.bin").write_bytes(new_data)
             base_files, base_hash = common.scan_tree(base)
             index_path = root / "index.json"
-            index_path.write_text(json.dumps({"U43.5.1": {"steam_manifest_id": 4895911296145320793, "sha256": base_hash, "file_count": len(base_files)}}), encoding="utf-8")
+            index_path.write_text(
+                json.dumps({
+                    "U43.5.1": {
+                        "steam_manifest_id": 4895911296145320793,
+                        "sha256": base_hash,
+                        "file_count": len(base_files),
+                    }
+                }),
+                encoding="utf-8",
+            )
             hdiffz, hpatchz = root / "hdiffz.exe", root / "hpatchz.exe"
             hdiffz.write_bytes(b"fake")
             hpatchz.write_bytes(b"fake")
             patch_path = root / "U43.5.2.patch"
             temp_root = root / "temp"
 
-            def fake_hdiff(old_path: Path, new_path: Path, output: Path, mode_options: list[str], common_options: list[str]) -> None:
+            def fake_hdiff(
+                old_path: Path,
+                new_path: Path,
+                output: Path,
+                mode_options: list[str],
+                common_options: list[str],
+            ) -> None:
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_bytes(b"d")
 

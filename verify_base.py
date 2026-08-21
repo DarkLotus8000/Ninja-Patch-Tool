@@ -4,7 +4,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from common import ErrorArgumentParser, load_index, resolve_base_name, scan_tree, validate_warframe_installation
+from common import (
+    ErrorArgumentParser,
+    load_index,
+    resolve_base_name,
+    scan_tree,
+    validate_warframe_installation,
+)
 
 def main() -> int:
     parser = ErrorArgumentParser(description="Verify a Steam manifest base against its entry in index.json.")
@@ -30,11 +36,23 @@ def main() -> int:
 
         files, actual_hash = scan_tree(base)
 
-        if (actual_hash.lower() != expected["sha256"].lower() or len(files) != expected["file_count"]):
-            print(f"ERROR: Base verification failed.\n" f"Expected files: {expected['file_count']:,}\n" f"Actual files: {len(files):,}\n" f"Expected SHA-256: {expected['sha256']}\n" f"Actual SHA-256: {actual_hash}", file=sys.stderr)
+        if actual_hash.lower() != expected["sha256"].lower() or len(files) != expected["file_count"]:
+            print(
+                "ERROR: Base verification failed.\n"
+                f"Expected files: {expected['file_count']:,}\n"
+                f"Actual files: {len(files):,}\n"
+                f"Expected SHA-256: {expected['sha256']}\n"
+                f"Actual SHA-256: {actual_hash}",
+                file=sys.stderr,
+            )
             return 1
 
-        print(f'\n[Verified] Base "{canonical_name}" is valid and unmodified.\n' f"Steam manifest ID: {expected['steam_manifest_id']}\n" f"Files: {len(files):,}\n" f"SHA-256: {actual_hash}")
+        print(
+            f'\n[Verified] Base "{canonical_name}" is valid and unmodified.\n'
+            f"Steam manifest ID: {expected['steam_manifest_id']}\n"
+            f"Files: {len(files):,}\n"
+            f"SHA-256: {actual_hash}"
+        )
         return 0
 
     except KeyError:

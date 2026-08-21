@@ -37,7 +37,8 @@ PATCH_VERSION = 1
 MAKE_SESSION_FILE = "session.json"
 MAKE_SESSION_GRACE_SECONDS = 10
 
-# The regular presets map to one HDiffPatch strategy. "maximum" uses the same common compression as "higher", but tries several matching strategies below and keeps the smallest delta.
+# The regular presets map to one HDiffPatch strategy. "maximum" uses the same common compression as "higher",
+# but tries several matching strategies below and keeps the smallest delta.
 COMPRESSION_PRESETS = {
     "normal": {"memory": ["-m-3"], "stream": ["-s-64k"], "common": ["-SD", "-d", "-f", "-p-1", "-c-lzma2-9-64m"]},
     "high": {"memory": ["-m-2", "-cache"], "stream": ["-s-16k"], "common": ["-SD", "-d", "-f", "-p-1", "-c-lzma2-9-256m"]},
@@ -45,11 +46,13 @@ COMPRESSION_PRESETS = {
     "maximum": {"memory": ["-m-1", "-cache", "-block-0"], "stream": ["-s-4k"], "common": ["-SD", "-d", "-f", "-p-1", "-c-lzma2-9-1024m"]},
 }
 
-# HDiffPatch matching has no single setting that always gives the smallest result. "maximum" therefore tries several candidates per modified file; the "higher" strategy is included as a known-good candidate.
+# HDiffPatch matching has no single setting that always gives the smallest result. "maximum" therefore tries several
+# candidates per modified file; the "higher" strategy is included as a known-good candidate.
 MAXIMUM_MEMORY_CANDIDATES = [["-m-0", "-cache", "-block-0"], ["-m-1", "-cache", "-block-0"]]
 MAXIMUM_STREAM_CANDIDATES = [["-s-1k"], ["-s-2k"], ["-s-4k"], ["-s-8k"], ["-s-16k"]]
 
-# Aggressive -m matching can require enormous allocations on large game files. High/higher/maximum switch to streaming at 1 GiB; normal intentionally keeps its proven -m-3 behavior.
+# Aggressive -m matching can require enormous allocations on large game files. High/higher/maximum switch to streaming
+# at 1 GiB; normal intentionally keeps its proven -m-3 behavior.
 STREAM_MODE_THRESHOLD = 1024 * 1024 * 1024
 
 def temporary_patch_path(output: Path) -> Path:
@@ -58,10 +61,12 @@ def temporary_patch_path(output: Path) -> Path:
 def publish_patch_archive(temporary: Path, output: Path) -> None:
     try:
         if os.name == "nt":
-            # Unlike os.replace(), Windows os.rename() fails if the destination already exists, so another process cannot have its file overwritten during publication.
+            # Unlike os.replace(), Windows os.rename() fails if the destination already exists, so another process
+            # cannot have its file overwritten during publication.
             temporary.rename(output)
         else:
-            # Keep the same no-overwrite guarantee when running the test suite on non-Windows systems, where os.rename() may replace an existing destination.
+            # Keep the same no-overwrite guarantee on non-Windows systems used by the test suite, where os.rename()
+            # may replace an existing destination.
             os.link(temporary, output)
             temporary.unlink()
     except FileExistsError:
@@ -71,7 +76,8 @@ def uses_stream(old: Path, new: Path, compression: str) -> bool:
     return compression != "normal" and max(old.stat().st_size, new.stat().st_size) >= STREAM_MODE_THRESHOLD
 
 def write_make_session(work: Path, output: Path) -> None:
-    # Creation is intentionally not resumable. This marker only lets a later run distinguish abandoned work from another make_patch process that is still active.
+    # Creation is intentionally not resumable. This marker only lets a later run distinguish abandoned work from
+    # another make_patch process that is still active.
     session = work / MAKE_SESSION_FILE
     temporary = session.with_name(session.name + ".tmp")
     data = {"pid": os.getpid(), "output": str(output)}
@@ -84,7 +90,8 @@ def write_make_session(work: Path, output: Path) -> None:
     os.replace(temporary, session)
 
 def cleanup_stale_make_patch_work(output: Path) -> None:
-    # Reusing old HDiff candidates would require proving every source hash and setting still matches, so interrupted creation data is discarded instead.
+    # Reusing old HDiff candidates would require proving every source hash and setting still matches, so interrupted
+    # creation data is discarded instead.
     active_for_output = False
 
     if TEMP_ROOT.is_dir():
@@ -130,7 +137,10 @@ def cleanup_stale_make_patch_work(output: Path) -> None:
 
     partial = temporary_patch_path(output)
     if partial.exists():
-        raise RuntimeError(f"Temporary patch path already exists and was not removed because Ninja Patch Tool cannot prove that it owns the file:\n{partial}")
+        raise RuntimeError(
+            "Temporary patch path already exists and was not removed because Ninja Patch Tool cannot prove that it owns the file:\n"
+            f"{partial}"
+        )
 
 def payload_id(relative: str) -> str:
     return hashlib.sha256(relative.encode("utf-8")).hexdigest()
@@ -153,7 +163,8 @@ def run_hdiff(old: Path, new: Path, output: Path, compression: str) -> None:
         run_hdiff_command(old, new, output, mode_options, preset["common"])
         return
 
-    # Maximum is a best-of search. Individual strategies may fail because of memory or HDiffPatch limits; keep trying and fail only if every candidate fails.
+    # Maximum is a best-of search. Individual strategies may fail because of memory or HDiffPatch limits; keep trying
+    # and fail only if every candidate fails.
     if stream:
         candidates = MAXIMUM_STREAM_CANDIDATES
     else:
@@ -208,7 +219,8 @@ def create_patch_archive(work: Path, output: Path) -> None:
         raise FileExistsError(f"Temporary patch path already exists: {temporary}")
 
     try:
-        # Only patch-format files belong in the archive. In particular, session.json is local recovery metadata and must never leak into a distributed patch.
+        # Only patch-format files belong in the archive. In particular, session.json is local recovery metadata and
+        # must never leak into a distributed patch.
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
             archive.write(work / "manifest.json", "manifest.json")
             for folder in ("diffs", "files"):
@@ -219,7 +231,8 @@ def create_patch_archive(work: Path, output: Path) -> None:
         if output.exists():
             raise FileExistsError(f"Patch output appeared while the patch was being created: {output}")
 
-        # Publish only after the complete archive is written. The publication itself must also refuse an output created after the check above, closing the final race without overwriting another process's file.
+        # Publish only after the complete archive is written. Publication itself must also refuse an output created
+        # after the check above, closing the final race without overwriting another process's file.
         publish_patch_archive(temporary, output)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -229,13 +242,28 @@ def main() -> int:
     install_termination_handlers()
     parser = ErrorArgumentParser(
         description="Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.",
-        epilog="Compression presets: normal is the default. High and higher trade more time and memory for potentially smaller patches. Maximum tries several matching strategies per modified file and can take much longer.",
+        epilog=(
+            "Compression presets: normal is the default. High and higher trade more time and memory for potentially "
+            "smaller patches. Maximum tries several matching strategies per modified file and can take much longer."
+        ),
     )
     parser.add_argument("base", type=Path, help="Clean indexed Steam manifest base")
     parser.add_argument("new", type=Path, help="Newer installation")
-    parser.add_argument("output", type=Path, help="Patch filename or output path; .patch is appended automatically. A bare filename is saved in the tool's output folder.")
+    parser.add_argument(
+        "output",
+        type=Path,
+        help="Patch filename or output path; .patch is appended automatically. A bare filename is saved in the tool's output folder.",
+    )
     parser.add_argument("base_name", help="Base name from index.json, for example U43.5.1")
-    parser.add_argument("-c", "--compression", metavar="PRESET", choices=COMPRESSION_PRESETS, default="normal", action=SingleUseStoreAction, help="Compression preset (default: normal): normal, high, higher, maximum")
+    parser.add_argument(
+        "-c",
+        "--compression",
+        metavar="PRESET",
+        choices=COMPRESSION_PRESETS,
+        default="normal",
+        action=SingleUseStoreAction,
+        help="Compression preset (default: normal): normal, high, higher, maximum",
+    )
     parser.add_help_argument()
     args = parser.parse_args()
 
@@ -265,7 +293,12 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     if output.exists():
-        print(f"ERROR: Patch output already exists:\n{output}\nChoose a different output name or remove the existing patch first.\nNo patch was generated.", file=sys.stderr)
+        print(
+            f"ERROR: Patch output already exists:\n{output}\n"
+            "Choose a different output name or remove the existing patch first.\n"
+            "No patch was generated.",
+            file=sys.stderr,
+        )
         return 1
     if not HDIFFZ.is_file():
         print(f"ERROR: hdiffz.exe was not found in the tools folder:\n{HDIFFZ}", file=sys.stderr)
@@ -294,9 +327,17 @@ def main() -> int:
         common_names = old_names & new_names
         added = sorted(new_names - old_names)
         removed = sorted(old_names - new_names)
-        modified = sorted(relative for relative in common_names if old_files[relative]["sha256"] != new_files[relative]["sha256"])
+        modified = sorted(
+            relative for relative in common_names if old_files[relative]["sha256"] != new_files[relative]["sha256"]
+        )
 
-        print(f"\nUnchanged: {len(common_names) - len(modified):,}\nModified: {len(modified):,}\nAdded: {len(added):,}\nRemoved: {len(removed):,}\n\nCreating patch payload...")
+        print(
+            f"\nUnchanged: {len(common_names) - len(modified):,}\n"
+            f"Modified: {len(modified):,}\n"
+            f"Added: {len(added):,}\n"
+            f"Removed: {len(removed):,}\n\n"
+            "Creating patch payload..."
+        )
 
         payload_estimate = sum(new_files[relative]["size"] for relative in modified + added)
         largest_modified = max((new_files[relative]["size"] for relative in modified), default=0)
@@ -329,34 +370,75 @@ def main() -> int:
                 diff_path.unlink()
                 payload_path = files_dir / f"{item_id}.bin"
                 shutil.copy2(new_info["path"], payload_path)
-                operations.append({"type": "replace", "path": relative, "payload": f"files/{payload_path.name}", "old_size": old_info["size"], "old_sha256": old_info["sha256"],
-                    "new_size": new_info["size"], "new_sha256": new_info["sha256"]})
+                operations.append({
+                    "type": "replace",
+                    "path": relative,
+                    "payload": f"files/{payload_path.name}",
+                    "old_size": old_info["size"],
+                    "old_sha256": old_info["sha256"],
+                    "new_size": new_info["size"],
+                    "new_sha256": new_info["sha256"],
+                })
                 print(f"[Stored full file] {display_relative_path(relative)}")
             else:
-                operations.append({"type": "patch", "path": relative, "payload": f"diffs/{diff_path.name}", "old_size": old_info["size"], "old_sha256": old_info["sha256"], "new_size": new_info["size"], "new_sha256": new_info["sha256"]})
+                operations.append({
+                    "type": "patch",
+                    "path": relative,
+                    "payload": f"diffs/{diff_path.name}",
+                    "old_size": old_info["size"],
+                    "old_sha256": old_info["sha256"],
+                    "new_size": new_info["size"],
+                    "new_sha256": new_info["sha256"],
+                })
 
         for relative in added:
             info = new_files[relative]
             payload_path = files_dir / f"{payload_id(relative)}.bin"
             shutil.copy2(info["path"], payload_path)
-            operations.append({"type": "add", "path": relative, "payload": f"files/{payload_path.name}", "new_size": info["size"], "new_sha256": info["sha256"]})
+            operations.append({
+                "type": "add",
+                "path": relative,
+                "payload": f"files/{payload_path.name}",
+                "new_size": info["size"],
+                "new_sha256": info["sha256"],
+            })
             print(f"[Added] {display_relative_path(relative)}")
 
         for relative in removed:
             info = old_files[relative]
-            operations.append({"type": "remove", "path": relative, "old_size": info["size"], "old_sha256": info["sha256"]})
+            operations.append({
+                "type": "remove",
+                "path": relative,
+                "old_size": info["size"],
+                "old_sha256": info["sha256"],
+            })
             print(f"[Removed] {display_relative_path(relative)}")
 
         manifest = {
-            "version": PATCH_VERSION, "base": canonical_name, "base_steam_manifest_id": indexed_base["steam_manifest_id"], "old_root_sha256": old_root_hash, "new_root_sha256": new_root_hash,
-            "old_file_count": len(old_files), "new_file_count": len(new_files), "operations": operations,
+            "version": PATCH_VERSION,
+            "base": canonical_name,
+            "base_steam_manifest_id": indexed_base["steam_manifest_id"],
+            "old_root_sha256": old_root_hash,
+            "new_root_sha256": new_root_hash,
+            "old_file_count": len(old_files),
+            "new_file_count": len(new_files),
+            "operations": operations,
         }
-        (work / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        (work / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
         print(f"\nCreating single patch file:\n{output}")
         create_patch_archive(work, output)
         duration = format_duration(time.perf_counter() - started)
-        print(f"\n[Created] Patch completed successfully.\nBase: {canonical_name}\nSteam manifest ID: {indexed_base['steam_manifest_id']}\nDuration: {duration}\nPatch size: {output.stat().st_size:,} bytes")
+        print(
+            "\n[Created] Patch completed successfully.\n"
+            f"Base: {canonical_name}\n"
+            f"Steam manifest ID: {indexed_base['steam_manifest_id']}\n"
+            f"Duration: {duration}\n"
+            f"Patch size: {output.stat().st_size:,} bytes"
+        )
         return 0
 
     except KeyError:

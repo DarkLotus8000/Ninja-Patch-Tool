@@ -38,15 +38,24 @@ def is_warframe_installation(path: Path) -> bool:
 def validate_warframe_installation(path: Path, label: str) -> bool:
     if is_warframe_installation(path):
         return True
-    print(f"ERROR: {label} directory is not a Warframe installation root:\n{path}\nExpected at least Cache.Windows, Tools, and Warframe.x64.exe directly inside it.", file=sys.stderr)
+    print(
+        f"ERROR: {label} directory is not a Warframe installation root:\n"
+        f"{path}\n"
+        "Expected at least Cache.Windows, Tools, and Warframe.x64.exe directly inside it.",
+        file=sys.stderr,
+    )
     return False
 
 def natural_sort_key(value: str):
     return tuple(int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", value) if part)
 
 def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
-    # The root hash uses each relative path, size, and file SHA-256. Filesystem enumeration order is not guaranteed, so only the in-memory path list is sorted before hashing; no files are moved or modified.
-    paths = sorted((path for path in root.rglob("*") if path.is_file() and not is_ignored_file(path)), key=lambda path: path.relative_to(root).as_posix())
+    # The root hash uses each relative path, size, and file SHA-256. Filesystem enumeration order is not guaranteed,
+    # so only the in-memory path list is sorted before hashing; no files are moved or modified.
+    paths = sorted(
+        (path for path in root.rglob("*") if path.is_file() and not is_ignored_file(path)),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
     relative_paths = [path.relative_to(root).as_posix() for path in paths]
     files: dict[str, dict[str, Any]] = {}
     root_hash = hashlib.sha256()
@@ -60,9 +69,13 @@ def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
 
         size = after.st_size
         files[relative] = {"path": path, "size": size, "sha256": digest}
-        root_hash.update(relative.encode("utf-8") + b"\0" + str(size).encode("ascii") + b"\0" + digest.encode("ascii") + b"\n")
+        root_hash.update(
+            relative.encode("utf-8") + b"\0" + str(size).encode("ascii") + b"\0" + digest.encode("ascii") + b"\n"
+        )
 
-    current_paths = sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and not is_ignored_file(path))
+    current_paths = sorted(
+        path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and not is_ignored_file(path)
+    )
     if current_paths != relative_paths:
         raise RuntimeError(f"Installation changed while it was being scanned:\n{root}\nClose Warframe and the Warframe Launcher and try again.")
 
@@ -165,7 +178,8 @@ def cleanup_work_dir(work: Path) -> None:
         pass
 
 def install_termination_handlers() -> None:
-    # Route SIGTERM through the same KeyboardInterrupt cleanup path where Python receives it normally. Forced Windows termination and console-window closure can bypass Python cleanup, so persistent/stale recovery still handles those cases.
+    # Route SIGTERM through the same KeyboardInterrupt cleanup path where Python receives it normally. Forced Windows
+    # termination and console-window closure can bypass Python cleanup, so persistent/stale recovery handles those cases.
     if hasattr(signal, "SIGTERM"):
         def handle_sigterm(signum, frame):
             raise KeyboardInterrupt
@@ -228,7 +242,8 @@ def relative_path_parts(relative: str) -> tuple[str, ...]:
     if not posix.parts or posix.is_absolute() or windows.is_absolute() or windows.drive or ".." in posix.parts:
         raise ValueError(f"Unsafe relative path: {relative!r}")
 
-    # Ninja Patches target Warframe on Windows. Reject names that Windows normalizes specially or interprets as devices/alternate data streams, even when validation runs on another OS.
+    # Ninja Patches target Warframe on Windows. Reject names that Windows normalizes specially or interprets as
+    # devices/alternate data streams, even when validation runs on another OS.
     for part in posix.parts:
         stem = part.split(".", 1)[0].rstrip(" ").casefold()
         if (
@@ -274,7 +289,12 @@ def warn_if_low_disk_space(path: Path, required_bytes: int, purpose: str) -> Non
     except OSError:
         return
     if free < required_bytes:
-        print(f"WARNING: Disk space may be insufficient for {purpose}.\nAvailable: {format_bytes(free)}\nEstimated required: {format_bytes(required_bytes)}", file=sys.stderr)
+        print(
+            f"WARNING: Disk space may be insufficient for {purpose}.\n"
+            f"Available: {format_bytes(free)}\n"
+            f"Estimated required: {format_bytes(required_bytes)}",
+            file=sys.stderr,
+        )
 
 def format_duration(seconds: float) -> str:
     total_seconds = max(0, round(seconds))

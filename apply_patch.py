@@ -60,7 +60,15 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
     if manifest.get("version") not in SUPPORTED_VERSIONS:
         raise RuntimeError(f"Unsupported patch version: {manifest.get('version')!r}")
 
-    required = {"base", "base_steam_manifest_id", "old_root_sha256", "new_root_sha256", "old_file_count", "new_file_count", "operations"}
+    required = {
+        "base",
+        "base_steam_manifest_id",
+        "old_root_sha256",
+        "new_root_sha256",
+        "old_file_count",
+        "new_file_count",
+        "operations",
+    }
     missing = required - set(manifest)
     if missing:
         raise RuntimeError("Patch manifest is missing: " + ", ".join(sorted(missing)))
@@ -77,35 +85,40 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
 
     seen_paths: set[str] = set()
     seen_payloads: set[str] = set()
-    added = removed = 0
+    added = 0
+    removed = 0
 
     for index, operation in enumerate(manifest["operations"], start=1):
         if not isinstance(operation, dict):
             raise RuntimeError(f"Patch operation {index} is invalid.")
 
-        kind = operation.get("type")
-        relative = operation.get("path")
-        if kind not in {"patch", "replace", "add", "remove"} or not isinstance(relative, str):
+        operation_type = operation.get("type")
+        relative_path = operation.get("path")
+        if operation_type not in {"patch", "replace", "add", "remove"} or not isinstance(relative_path, str):
             raise RuntimeError(f"Patch operation {index} has an invalid type or path.")
 
         try:
-            canonical = "/".join(relative_path_parts(relative))
+            canonical_path = "/".join(relative_path_parts(relative_path))
         except ValueError as exc:
-            raise RuntimeError(f"Patch operation {index} has an unsafe path: {relative!r}") from exc
+            raise RuntimeError(f"Patch operation {index} has an unsafe path: {relative_path!r}") from exc
 
-        path_key = canonical.casefold()
+        path_key = canonical_path.casefold()
         if path_key in seen_paths:
-            raise RuntimeError(f"Patch contains more than one operation for: {relative}")
+            raise RuntimeError(f"Patch contains more than one operation for: {relative_path}")
         seen_paths.add(path_key)
 
-        old_required = kind in {"patch", "replace", "remove"}
-        new_required = kind in {"patch", "replace", "add"}
-        if old_required and (not is_nonnegative_int(operation.get("old_size")) or not is_sha256(operation.get("old_sha256"))):
+        requires_old = operation_type in {"patch", "replace", "remove"}
+        requires_new = operation_type in {"patch", "replace", "add"}
+        if requires_old and (
+            not is_nonnegative_int(operation.get("old_size")) or not is_sha256(operation.get("old_sha256"))
+        ):
             raise RuntimeError(f"Patch operation {index} has invalid old-file metadata.")
-        if new_required and (not is_nonnegative_int(operation.get("new_size")) or not is_sha256(operation.get("new_sha256"))):
+        if requires_new and (
+            not is_nonnegative_int(operation.get("new_size")) or not is_sha256(operation.get("new_sha256"))
+        ):
             raise RuntimeError(f"Patch operation {index} has invalid new-file metadata.")
 
-        if new_required:
+        if requires_new:
             payload = operation.get("payload")
             if not isinstance(payload, str) or "\\" in payload:
                 raise RuntimeError(f"Patch operation {index} has an invalid payload path.")
@@ -117,7 +130,7 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
                 raise RuntimeError(f"Patch payload is referenced more than once: {payload}")
             seen_payloads.add(payload)
 
-            if kind == "patch":
+            if operation_type == "patch":
                 expected_prefix = "diffs/"
             else:
                 expected_prefix = "files/"
@@ -127,13 +140,13 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
             member = members.get(payload)
             if member is None:
                 raise RuntimeError(f"Patch payload is missing: {payload}")
-            if kind == "patch" and member.file_size >= operation["new_size"]:
-                raise RuntimeError(f"Patch delta is not smaller than its target file: {relative}")
-            if kind in {"replace", "add"} and member.file_size != operation["new_size"]:
-                raise RuntimeError(f"Patch payload size does not match the manifest: {relative}")
+            if operation_type == "patch" and member.file_size >= operation["new_size"]:
+                raise RuntimeError(f"Patch delta is not smaller than its target file: {relative_path}")
+            if operation_type in {"replace", "add"} and member.file_size != operation["new_size"]:
+                raise RuntimeError(f"Patch payload size does not match the manifest: {relative_path}")
 
-        added += kind == "add"
-        removed += kind == "remove"
+        added += operation_type == "add"
+        removed += operation_type == "remove"
 
     if manifest["old_file_count"] + added - removed != manifest["new_file_count"]:
         raise RuntimeError("Patch manifest file counts do not match its operations.")
@@ -178,8 +191,12 @@ def temporary_output(target: Path) -> Path:
     return target.with_name(target.name + ".tmp")
 
 def check_temporary_paths(destination: Path, operations: list[dict]) -> None:
-    # .tmp files are written beside targets for atomic replacement. Refuse any pre-existing or manifest-target collision instead of deleting a possibly legitimate file.
-    targets = {str(safe_join(destination, operation["path"]).resolve()).casefold() for operation in operations}
+    # .tmp files are written beside targets for atomic replacement. Refuse any pre-existing or manifest-target
+    # collision instead of deleting a possibly legitimate file.
+    targets = {
+        str(safe_join(destination, operation["path"]).resolve()).casefold()
+        for operation in operations
+    }
     for operation in operations:
         if operation["type"] not in {"patch", "replace", "add"}:
             continue
@@ -194,26 +211,32 @@ def ordered_operations(operations: list[dict]) -> list[dict]:
     order = {"remove": 0, "patch": 1, "replace": 1, "add": 2}
     return sorted(operations, key=lambda operation: order[operation["type"]])
 
-def apply_operations(destination: Path, archive: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo], scratch: Path, operations: list[dict]) -> None:
+def apply_operations(
+    destination: Path,
+    archive: zipfile.ZipFile,
+    members: dict[str, zipfile.ZipInfo],
+    scratch: Path,
+    operations: list[dict],
+) -> None:
     payload_file = scratch / "payload.hdiff"
 
     for operation in ordered_operations(operations):
-        kind = operation["type"]
-        relative = operation["path"]
-        target = safe_join(destination, relative)
+        operation_type = operation["type"]
+        relative_path = operation["path"]
+        target = safe_join(destination, relative_path)
 
-        if kind == "remove":
+        if operation_type == "remove":
             verify_file(target, operation["old_size"], operation["old_sha256"])
             target.unlink()
             prune_empty_parents(target.parent, destination)
-            print(f"[Removed] {display_relative_path(relative)}")
+            print(f"[Removed] {display_relative_path(relative_path)}")
             continue
 
         temporary = temporary_output(target)
         if temporary.exists():
             raise RuntimeError(f"Temporary output path unexpectedly exists: {temporary}")
 
-        if kind == "patch":
+        if operation_type == "patch":
             verify_file(target, operation["old_size"], operation["old_sha256"])
             payload_file.unlink(missing_ok=True)
             copy_archive_member(archive, members, operation["payload"], payload_file)
@@ -221,20 +244,20 @@ def apply_operations(destination: Path, archive: zipfile.ZipFile, members: dict[
             try:
                 result = run_child([str(HPATCHZ), str(target), str(payload_file), str(temporary)])
                 if result != 0:
-                    raise RuntimeError(f"hpatchz failed with exit code {result}: {relative}")
+                    raise RuntimeError(f"hpatchz failed with exit code {result}: {relative_path}")
                 verify_file(temporary, operation["new_size"], operation["new_sha256"])
                 os.replace(temporary, target)
             finally:
                 payload_file.unlink(missing_ok=True)
                 temporary.unlink(missing_ok=True)
 
-            print(f"[Patched] {display_relative_path(relative)}")
+            print(f"[Patched] {display_relative_path(relative_path)}")
             continue
 
-        if kind == "replace":
+        if operation_type == "replace":
             verify_file(target, operation["old_size"], operation["old_sha256"])
         elif target.exists():
-            raise RuntimeError(f"Patch expects a new file, but it already exists: {relative}")
+            raise RuntimeError(f"Patch expects a new file, but it already exists: {relative_path}")
 
         try:
             copy_archive_member(archive, members, operation["payload"], temporary)
@@ -243,11 +266,11 @@ def apply_operations(destination: Path, archive: zipfile.ZipFile, members: dict[
         finally:
             temporary.unlink(missing_ok=True)
 
-        if kind == "replace":
+        if operation_type == "replace":
             action = "Patched"
         else:
             action = "Added"
-        print(f"[{action}] {display_relative_path(relative)}")
+        print(f"[{action}] {display_relative_path(relative_path)}")
 
 def backup_in_place(base: Path, backup: Path, operations: list[dict]) -> dict[str, bool]:
     existed: dict[str, bool] = {}
@@ -265,7 +288,8 @@ def backup_in_place(base: Path, backup: Path, operations: list[dict]) -> dict[st
     return existed
 
 def rollback_in_place(base: Path, backup: Path, operations: list[dict], existed: dict[str, bool]) -> None:
-    # Remove every path created by the patch first, then restore original files. This ordering is required when a patch changes a path between file and directory topology.
+    # Remove every path created by the patch first, then restore original files. This ordering is required when a
+    # patch changes a path between file and directory topology.
     for operation in operations:
         relative = operation["path"]
         if existed.get(relative):
@@ -295,7 +319,8 @@ def rollback_in_place(base: Path, backup: Path, operations: list[dict], existed:
         shutil.copy2(source, target)
 
 def write_recovery_state(work: Path, state: dict) -> None:
-    # Apply recovery is persistent because user files may already have changed. The state is fsynced before atomic replacement so abrupt termination can be repaired on the next run.
+    # Apply recovery is persistent because user files may already have changed. The state is fsynced before atomic
+    # replacement so abrupt termination can be repaired on the next run.
     recovery = work / RECOVERY_FILE
     temporary = recovery.with_name(recovery.name + ".tmp")
     state = {"recovery_version": RECOVERY_VERSION, "pid": os.getpid(), **state}
@@ -307,7 +332,14 @@ def write_recovery_state(work: Path, state: dict) -> None:
         os.fsync(output.fileno())
     os.replace(temporary, recovery)
 
-def make_recovery_state(mode: str, base: Path, destination: Path, patch: Path, manifest: dict, existed: dict[str, bool] | None = None) -> dict:
+def make_recovery_state(
+    mode: str,
+    base: Path,
+    destination: Path,
+    patch: Path,
+    manifest: dict,
+    existed: dict[str, bool] | None = None,
+) -> dict:
     state = {
         "mode": mode,
         "base": str(base),
@@ -324,7 +356,10 @@ def make_recovery_state(mode: str, base: Path, destination: Path, patch: Path, m
     return state
 
 def recovery_matches_manifest(state: dict, manifest: dict) -> bool:
-    return all(state.get(key) == manifest.get(key) for key in ("old_root_sha256", "new_root_sha256", "old_file_count", "new_file_count"))
+    return all(
+        state.get(key) == manifest.get(key)
+        for key in ("old_root_sha256", "new_root_sha256", "old_file_count", "new_file_count")
+    )
 
 def tree_matches(root: Path, expected_hash: str, expected_count: int) -> bool:
     files, root_hash = scan_tree(root)
@@ -345,7 +380,14 @@ def protected_cleanup():
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 
-def restore_in_place(base: Path, backup: Path, operations: list[dict], existed: dict[str, bool], old_root_sha256: str, old_file_count: int) -> None:
+def restore_in_place(
+    base: Path,
+    backup: Path,
+    operations: list[dict],
+    existed: dict[str, bool],
+    old_root_sha256: str,
+    old_file_count: int,
+) -> None:
     with protected_cleanup():
         rollback_in_place(base, backup, operations, existed)
         if not tree_matches(base, old_root_sha256, old_file_count):
@@ -357,7 +399,8 @@ def remove_incomplete_output(destination: Path) -> bool:
     return not destination.exists()
 
 def recover_interrupted_operations(base: Path, destination: Path) -> dict | None:
-    # Recovery records exist only when an apply operation may need cleanup. Recovery runs before normal patch prerequisites so missing tools or a temporarily incomplete installation cannot block restoration.
+    # Recovery records exist only when an apply operation may need cleanup. Recovery runs before normal patch
+    # prerequisites so missing tools or a temporarily incomplete installation cannot block restoration.
     if not TEMP_ROOT.is_dir():
         return None
 
@@ -392,11 +435,19 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
 
         pid = state.get("pid")
         if isinstance(pid, int) and pid != os.getpid() and process_is_running(pid):
-            raise RuntimeError(f"Another apply_patch operation appears to still be running for this base/output.\nRecovery state: {recovery}")
+            raise RuntimeError(
+                "Another apply_patch operation appears to still be running for this base/output.\n"
+                f"Recovery state: {recovery}"
+            )
 
         old_hash, new_hash = state.get("old_root_sha256"), state.get("new_root_sha256")
         old_count, new_count = state.get("old_file_count"), state.get("new_file_count")
-        if not is_sha256(old_hash) or not is_sha256(new_hash) or not is_nonnegative_int(old_count) or not is_nonnegative_int(new_count):
+        if (
+            not is_sha256(old_hash)
+            or not is_sha256(new_hash)
+            or not is_nonnegative_int(old_count)
+            or not is_nonnegative_int(new_count)
+        ):
             raise RuntimeError(f"Interrupted patch recovery data is invalid.\nRecovery state: {recovery}")
 
         print("\n[Recovery] Interrupted patch application detected.")
@@ -418,7 +469,11 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
             operations, existed = state.get("operations"), state.get("existed")
             backup = work / "backup"
             if not isinstance(operations, list) or not isinstance(existed, dict) or not backup.is_dir():
-                raise RuntimeError(f"Interrupted in-place patch requires recovery, but its backup data is incomplete.\nRecovery folder: {work}\nDo not delete this folder.")
+                raise RuntimeError(
+                    "Interrupted in-place patch requires recovery, but its backup data is incomplete.\n"
+                    f"Recovery folder: {work}\n"
+                    "Do not delete this folder."
+                )
 
             print("Restoring the original base from the recovery backup...")
             restore_in_place(base, backup, operations, existed, old_hash, old_count)
@@ -443,7 +498,11 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
 
             print("Removing the incomplete output installation...")
             if not remove_incomplete_output(recovery_destination):
-                raise RuntimeError(f"Could not remove the incomplete output installation.\nOutput: {recovery_destination}\nRecovery folder: {work}")
+                raise RuntimeError(
+                    "Could not remove the incomplete output installation.\n"
+                    f"Output: {recovery_destination}\n"
+                    f"Recovery folder: {work}"
+                )
             print("[Recovery] Incomplete output removed successfully.")
             cleanup_work_dir(work)
             continue
@@ -452,7 +511,13 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
 
     return completed_state
 
-def apply_and_verify(destination: Path, archive: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo], scratch: Path, manifest: dict) -> None:
+def apply_and_verify(
+    destination: Path,
+    archive: zipfile.ZipFile,
+    members: dict[str, zipfile.ZipInfo],
+    scratch: Path,
+    manifest: dict,
+) -> None:
     print("\nApplying patch...")
     apply_operations(destination, archive, members, scratch, manifest["operations"])
     print("\nVerifying final installation...")
@@ -461,12 +526,32 @@ def apply_and_verify(destination: Path, archive: zipfile.ZipFile, members: dict[
 
 def main() -> int:
     install_termination_handlers()
-    parser = ErrorArgumentParser(description="Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate installation named after the patch is created.")
+    parser = ErrorArgumentParser(
+        description=(
+            "Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate "
+            "installation named after the patch is created."
+        )
+    )
     parser.add_argument("base", type=Path, help="Base installation")
-    parser.add_argument("patch", type=Path, help="Patch filename or path; .patch is appended automatically. A bare filename is looked up in the tool's output folder.")
+    parser.add_argument(
+        "patch",
+        type=Path,
+        help="Patch filename or path; .patch is appended automatically. A bare filename is looked up in the tool's output folder.",
+    )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("-o", "--output", type=Path, action=SingleUseStoreAction, help="Create a separate installation at OUTPUT; if omitted, defaults to the patch filename (cannot be used with --in-place)")
-    mode.add_argument("-i", "--in-place", action=SingleUseStoreTrueAction, help="Modify the base installation instead (cannot be used with --output)")
+    mode.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        action=SingleUseStoreAction,
+        help="Create a separate installation at OUTPUT; if omitted, defaults to the patch filename (cannot be used with --in-place)",
+    )
+    mode.add_argument(
+        "-i",
+        "--in-place",
+        action=SingleUseStoreTrueAction,
+        help="Modify the base installation instead (cannot be used with --output)",
+    )
     parser.add_help_argument()
     args = parser.parse_args()
 
@@ -484,7 +569,9 @@ def main() -> int:
     else:
         destination = base.parent / patch.stem
 
-    if not args.in_place and (destination == base or is_within(destination, base) or is_within(base, destination)):
+    if not args.in_place and (
+        destination == base or is_within(destination, base) or is_within(base, destination)
+    ):
         print("ERROR: Output and base directories must not overlap.", file=sys.stderr)
         return 1
 
@@ -535,20 +622,38 @@ def main() -> int:
         with zipfile.ZipFile(patch, "r") as archive:
             members = read_archive_members(archive)
             manifest = read_manifest(archive, members)
-            print(f"Patch base: {manifest['base']}\nSteam manifest ID: {manifest['base_steam_manifest_id']}\nVerifying current base installation...")
+            print(
+                f"Patch base: {manifest['base']}\n"
+                f"Steam manifest ID: {manifest['base_steam_manifest_id']}\n"
+                "Verifying current base installation..."
+            )
             base_files, base_hash = scan_tree(base)
 
             if base_hash.lower() != manifest["old_root_sha256"].lower() or len(base_files) != manifest["old_file_count"]:
                 raise RuntimeError(
-                    f"The supplied installation does not match the exact base required by this patch.\nExpected files: {manifest['old_file_count']:,}\nActual files:   {len(base_files):,}\n"
-                    f"Expected SHA-256: {manifest['old_root_sha256']}\nActual SHA-256:   {base_hash}\nNo files were changed."
+                    "The supplied installation does not match the exact base required by this patch.\n"
+                    f"Expected files: {manifest['old_file_count']:,}\n"
+                    f"Actual files:   {len(base_files):,}\n"
+                    f"Expected SHA-256: {manifest['old_root_sha256']}\n"
+                    f"Actual SHA-256:   {base_hash}\n"
+                    "No files were changed."
                 )
 
             print(f'[Verified] Base "{manifest["base"]}" is valid.')
-            largest_payload = max((members[operation["payload"]].file_size for operation in manifest["operations"] if "payload" in operation), default=0)
-            largest_temporary = max((operation.get("new_size", 0) for operation in manifest["operations"]), default=0)
+            largest_payload = max(
+                (members[operation["payload"]].file_size for operation in manifest["operations"] if "payload" in operation),
+                default=0,
+            )
+            largest_temporary = max(
+                (operation.get("new_size", 0) for operation in manifest["operations"]),
+                default=0,
+            )
             if args.in_place:
-                backup_estimate = sum(operation.get("old_size", 0) for operation in manifest["operations"] if operation["type"] in {"patch", "replace", "remove"})
+                backup_estimate = sum(
+                    operation.get("old_size", 0)
+                    for operation in manifest["operations"]
+                    if operation["type"] in {"patch", "replace", "remove"}
+                )
                 warn_if_low_disk_space(TEMP_ROOT, backup_estimate + largest_payload, "the in-place recovery backup and patch payload")
                 warn_if_low_disk_space(base, largest_temporary, "temporary in-place patch output")
             else:
@@ -566,7 +671,8 @@ def main() -> int:
                 backup.mkdir()
                 print("\n--in-place was specified.\nCreating and verifying a temporary backup before modifying the base...")
 
-                # Write recovery before the potentially long backup. If the process is killed during backup the base is still unchanged, so the next run can safely discard the partial backup.
+                # Write recovery before the potentially long backup. If the process is killed during backup the base
+                # is still unchanged, so the next run can safely discard the partial backup.
                 keep_work = True
                 write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest))
                 try:
@@ -586,9 +692,20 @@ def main() -> int:
                         message = f"\nERROR: {patch_error}\nRolling back changes..."
                     print(message, file=sys.stderr)
                     try:
-                        restore_in_place(base, backup, manifest["operations"], existed, manifest["old_root_sha256"], manifest["old_file_count"])
+                        restore_in_place(
+                            base,
+                            backup,
+                            manifest["operations"],
+                            existed,
+                            manifest["old_root_sha256"],
+                            manifest["old_file_count"],
+                        )
                     except BaseException as rollback_error:
-                        raise RuntimeError(f"Rollback could not be completed. The persistent recovery backup was kept at:\n{work}\nRun apply_patch.py again with the same base to retry recovery.") from rollback_error
+                        raise RuntimeError(
+                            "Rollback could not be completed. The persistent recovery backup was kept at:\n"
+                            f"{work}\n"
+                            "Run apply_patch.py again with the same base to retry recovery."
+                        ) from rollback_error
                     keep_work = False
                     print("Rollback completed successfully.\nThe original base installation has been restored.", file=sys.stderr)
                     raise
@@ -603,11 +720,19 @@ def main() -> int:
                     apply_and_verify(destination, archive, members, scratch, manifest)
                     keep_work = False
                 except BaseException:
-                    print("\nPatch interrupted or failed. Removing the incomplete output installation...\nThe original base was not modified.", file=sys.stderr)
+                    print(
+                        "\nPatch interrupted or failed. Removing the incomplete output installation...\n"
+                        "The original base was not modified.",
+                        file=sys.stderr,
+                    )
                     if remove_incomplete_output(destination):
                         keep_work = False
                     else:
-                        print(f"WARNING: The incomplete output could not be removed completely. Recovery data was kept at:\n{work}", file=sys.stderr)
+                        print(
+                            "WARNING: The incomplete output could not be removed completely. Recovery data was kept at:\n"
+                            f"{work}",
+                            file=sys.stderr,
+                        )
                     raise
 
             duration = format_duration(time.perf_counter() - started)
