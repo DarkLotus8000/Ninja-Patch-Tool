@@ -93,7 +93,7 @@ In-place mode creates a recovery backup before modifying the base. Interrupted o
 
 Set `VERSION` in `common.py`, then run:
 
-```text
+```bat
 py -3.14 -m pip install pyinstaller
 py -3.14 build_release.py
 ```
