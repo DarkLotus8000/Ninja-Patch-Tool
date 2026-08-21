@@ -249,13 +249,17 @@ def safe_join(root: Path, relative: str) -> Path:
     return result
 
 def ensure_patch_extension(path: Path) -> Path:
-    return path if path.name.lower().endswith(".patch") else path.with_name(path.name + ".patch")
+    if path.name.lower().endswith(".patch"):
+        return path
+    return path.with_name(path.name + ".patch")
 
 def format_bytes(size: int) -> str:
     value = float(max(0, size))
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if value < 1024 or unit == "TiB":
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+            if unit == "B":
+                return f"{value:.0f} {unit}"
+            return f"{value:.1f} {unit}"
         value /= 1024
     raise AssertionError("unreachable")
 
@@ -276,7 +280,9 @@ def format_duration(seconds: float) -> str:
     total_seconds = max(0, round(seconds))
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
 
 class CompactHelpFormatter(argparse.HelpFormatter):
     def __init__(self, prog: str) -> None:
@@ -329,12 +335,16 @@ class SingleUseStoreTrueAction(argparse.Action):
 def resolve_patch_output(path: Path) -> Path:
     """Resolve a patch output path without creating directories; bare filenames go to <tool>/output/."""
     path = ensure_patch_extension(path)
-    return TOOL_DIR / "output" / path.name if path.parent == Path(".") else path.resolve()
+    if path.parent == Path("."):
+        return TOOL_DIR / "output" / path.name
+    return path.resolve()
 
 def resolve_patch_input(path: Path) -> Path:
     """Resolve a patch input path; bare filenames are looked up in <tool>/output/."""
     path = ensure_patch_extension(path)
-    return TOOL_DIR / "output" / path.name if path.parent == Path(".") else path.resolve()
+    if path.parent == Path("."):
+        return TOOL_DIR / "output" / path.name
+    return path.resolve()
 
 def display_relative_path(relative: str) -> str:
     return relative.replace("/", os.sep)

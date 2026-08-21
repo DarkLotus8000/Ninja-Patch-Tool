@@ -96,8 +96,11 @@ def cleanup_stale_make_patch_work(output: Path) -> None:
             if session.is_file():
                 try:
                     state = parse_json(session.read_text(encoding="utf-8"))
-                    pid = state.get("pid") if isinstance(state, dict) else None
-                    raw_output = state.get("output") if isinstance(state, dict) else None
+                    if isinstance(state, dict):
+                        pid = state.get("pid")
+                        raw_output = state.get("output")
+                    else:
+                        raw_output = None
                     if isinstance(raw_output, str):
                         session_output = Path(raw_output).resolve()
                 except Exception:
@@ -143,11 +146,18 @@ def run_hdiff(old: Path, new: Path, output: Path, compression: str) -> None:
     stream = uses_stream(old, new, compression)
 
     if compression != "maximum":
-        run_hdiff_command(old, new, output, preset["stream" if stream else "memory"], preset["common"])
+        if stream:
+            mode_options = preset["stream"]
+        else:
+            mode_options = preset["memory"]
+        run_hdiff_command(old, new, output, mode_options, preset["common"])
         return
 
     # Maximum is a best-of search. Individual strategies may fail because of memory or HDiffPatch limits; keep trying and fail only if every candidate fails.
-    candidates = MAXIMUM_STREAM_CANDIDATES if stream else MAXIMUM_MEMORY_CANDIDATES
+    if stream:
+        candidates = MAXIMUM_STREAM_CANDIDATES
+    else:
+        candidates = MAXIMUM_MEMORY_CANDIDATES
     best_path: Path | None = None
     best_size: int | None = None
     best_options: list[str] | None = None
@@ -176,7 +186,10 @@ def run_hdiff(old: Path, new: Path, output: Path, compression: str) -> None:
 
         if best_path is None or best_size is None or best_options is None:
             details = "\n".join(f"- {failure}" for failure in failures)
-            raise RuntimeError(f"All maximum-compression candidates failed for: {new}" + (f"\n{details}" if details else ""))
+            message = f"All maximum-compression candidates failed for: {new}"
+            if details:
+                message += f"\n{details}"
+            raise RuntimeError(message)
 
         best_path.replace(output)
         print(f" [Maximum] Selected: {' '.join(best_options)} ({best_size:,} bytes)")
@@ -287,7 +300,9 @@ def main() -> int:
 
         payload_estimate = sum(new_files[relative]["size"] for relative in modified + added)
         largest_modified = max((new_files[relative]["size"] for relative in modified), default=0)
-        candidate_overhead = largest_modified * (2 if args.compression == "maximum" else 1)
+        candidate_overhead = largest_modified
+        if args.compression == "maximum":
+            candidate_overhead *= 2
         warn_if_low_disk_space(TEMP_ROOT, payload_estimate + candidate_overhead, "temporary patch creation data")
         warn_if_low_disk_space(output.parent, payload_estimate, "the final patch archive")
 
@@ -302,7 +317,10 @@ def main() -> int:
             old_info, new_info = old_files[relative], new_files[relative]
             item_id = payload_id(relative)
             diff_path = diffs_dir / f"{item_id}.hdiff"
-            mode = "stream" if uses_stream(old_info["path"], new_info["path"], args.compression) else "memory"
+            if uses_stream(old_info["path"], new_info["path"], args.compression):
+                mode = "stream"
+            else:
+                mode = "memory"
             print(f"[Diffing] {display_relative_path(relative)} ({mode} mode)")
             run_hdiff(old_info["path"], new_info["path"], diff_path, args.compression)
 

@@ -117,7 +117,10 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
                 raise RuntimeError(f"Patch payload is referenced more than once: {payload}")
             seen_payloads.add(payload)
 
-            expected_prefix = "diffs/" if kind == "patch" else "files/"
+            if kind == "patch":
+                expected_prefix = "diffs/"
+            else:
+                expected_prefix = "files/"
             if not payload.startswith(expected_prefix):
                 raise RuntimeError(f"Patch operation {index} has an unexpected payload location: {payload}")
 
@@ -240,7 +243,11 @@ def apply_operations(destination: Path, archive: zipfile.ZipFile, members: dict[
         finally:
             temporary.unlink(missing_ok=True)
 
-        print(f"[{'Patched' if kind == 'replace' else 'Added'}] {display_relative_path(relative)}")
+        if kind == "replace":
+            action = "Patched"
+        else:
+            action = "Added"
+        print(f"[{action}] {display_relative_path(relative)}")
 
 def backup_in_place(base: Path, backup: Path, operations: list[dict]) -> dict[str, bool]:
     existed: dict[str, bool] = {}
@@ -470,7 +477,13 @@ def main() -> int:
         print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
         return 1
 
-    destination = base if args.in_place else args.output.resolve() if args.output is not None else base.parent / patch.stem
+    if args.in_place:
+        destination = base
+    elif args.output is not None:
+        destination = args.output.resolve()
+    else:
+        destination = base.parent / patch.stem
+
     if not args.in_place and (destination == base or is_within(destination, base) or is_within(base, destination)):
         print("ERROR: Output and base directories must not overlap.", file=sys.stderr)
         return 1
@@ -567,7 +580,10 @@ def main() -> int:
                     apply_and_verify(base, archive, members, scratch, manifest)
                     keep_work = False
                 except BaseException as patch_error:
-                    message = "\nPatch application interrupted.\nRolling back changes..." if isinstance(patch_error, KeyboardInterrupt) else f"\nERROR: {patch_error}\nRolling back changes..."
+                    if isinstance(patch_error, KeyboardInterrupt):
+                        message = "\nPatch application interrupted.\nRolling back changes..."
+                    else:
+                        message = f"\nERROR: {patch_error}\nRolling back changes..."
                     print(message, file=sys.stderr)
                     try:
                         restore_in_place(base, backup, manifest["operations"], existed, manifest["old_root_sha256"], manifest["old_file_count"])
