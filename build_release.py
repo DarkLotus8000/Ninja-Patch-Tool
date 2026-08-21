@@ -21,6 +21,7 @@ RELEASE_DIR = ROOT / "release"
 RELEASE_TEMP_DIR = ROOT / "release_temp"
 DATA_DIR = ROOT / "data"
 FAVICON = DATA_DIR / "favicon.ico"
+PYTHON_LICENSE = DATA_DIR / "Python_LICENSE.txt"
 ENTRY_SCRIPTS = ("add_base.py", "verify_base.py", "make_patch.py", "apply_patch.py")
 FILE_DESCRIPTIONS = {
     "add_base.py": "Ninja Patch Tool - Base Indexer",
@@ -28,7 +29,7 @@ FILE_DESCRIPTIONS = {
     "make_patch.py": "Ninja Patch Tool - Patch Creator",
     "apply_patch.py": "Ninja Patch Tool - Patch Applier",
 }
-RELEASE_DATA_FILES = ("index.json", "hdiffz.exe", "hpatchz.exe")
+RELEASE_DATA_FILES = ("index.json", "hdiffz.exe", "hpatchz.exe", "Python_LICENSE.txt")
 MIN_PYINSTALLER_VERSION = (6, 15, 0)
 
 def clean_markdown_inline(text: str) -> str:
@@ -69,7 +70,7 @@ def create_release_readme(markdown: str) -> str:
             line = "    " + line
         lines.append(line)
 
-    return "\n".join(lines).rstrip() + "\n"
+    return "\n".join(lines).rstrip()
 
 def version_tuple() -> tuple[int, int, int, int]:
     parts = VERSION.split(".")
@@ -114,33 +115,15 @@ def find_project_licenses() -> list[Path]:
         licenses.update(path for path in ROOT.glob(pattern) if path.is_file())
     return sorted(licenses, key=lambda path: path.name.casefold())
 
-def find_data_licenses() -> list[Path]:
+def find_hdiffpatch_licenses() -> list[Path]:
     if not DATA_DIR.is_dir():
         return []
     licenses = [
         path
         for path in DATA_DIR.iterdir()
-        if path.is_file() and ("license" in path.name.casefold() or path.name.casefold().startswith("copying"))
+        if path.is_file() and path.name.casefold() != PYTHON_LICENSE.name.casefold() and ("license" in path.name.casefold() or path.name.casefold().startswith("copying"))
     ]
     return sorted(licenses, key=lambda path: path.name.casefold())
-
-def find_python_license() -> Path | None:
-    candidates = (
-        Path(sys.base_prefix) / "LICENSE.txt",
-        Path(sys.prefix) / "LICENSE.txt",
-        Path(sys.executable).resolve().parent / "LICENSE.txt",
-        Path(sys.base_prefix) / "LICENSE",
-        Path(sys.prefix) / "LICENSE",
-    )
-    seen: set[Path] = set()
-    for candidate in candidates:
-        candidate = candidate.resolve()
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        if candidate.is_file():
-            return candidate
-    return None
 
 def validate_pe_x64(path: Path) -> None:
     try:
@@ -210,13 +193,10 @@ def validate_build_environment() -> tuple[list[Path], list[Path], Path]:
     project_licenses = find_project_licenses()
     if not project_licenses:
         raise RuntimeError("No project license file was found. Add LICENSE, LICENSE.txt, COPYING, or a similarly named license file before building a release.")
-    data_licenses = find_data_licenses()
-    if not data_licenses:
+    hdiffpatch_licenses = find_hdiffpatch_licenses()
+    if not hdiffpatch_licenses:
         raise RuntimeError("No HDiffPatch license file was found in the data folder.")
-    python_license = find_python_license()
-    if python_license is None:
-        raise RuntimeError("The Python license file could not be found in the Python 3.14 installation.")
-    return project_licenses, data_licenses, python_license
+    return project_licenses, hdiffpatch_licenses
 
 def create_version_file(script: Path, destination: Path) -> Path:
     version = version_tuple()
@@ -313,7 +293,7 @@ def smoke_test_executables(dist: Path) -> None:
             details = result.stderr.strip() or result.stdout.strip() or "No output was produced."
             raise RuntimeError(f"Standalone executable smoke test failed for {executable.name}:\n{details}")
 
-def populate_release(stage: Path, dist: Path, project_licenses: list[Path], data_licenses: list[Path], python_license: Path) -> None:
+def populate_release(stage: Path, dist: Path, project_licenses: list[Path], hdiffpatch_licenses: list[Path]) -> None:
     stage.mkdir(parents=True)
     for script in ENTRY_SCRIPTS:
         executable = dist / f"{Path(script).stem}.exe"
@@ -323,11 +303,10 @@ def populate_release(stage: Path, dist: Path, project_licenses: list[Path], data
     release_data.mkdir()
     for name in RELEASE_DATA_FILES:
         shutil.copy2(DATA_DIR / name, release_data / name)
-    for license_file in data_licenses:
+    for license_file in hdiffpatch_licenses:
         shutil.copy2(license_file, release_data / license_file.name)
     for license_file in project_licenses:
         shutil.copy2(license_file, stage / license_file.name)
-    shutil.copy2(python_license, stage / "PYTHON_LICENSE.txt")
 
     readme = create_release_readme((ROOT / "README.md").read_text(encoding="utf-8"))
     (stage / "README.txt").write_text(readme, encoding="utf-8", newline="\r\n")
@@ -385,7 +364,7 @@ def create_release_outputs(stage: Path) -> tuple[Path, Path, str]:
 
 def main() -> int:
     try:
-        project_licenses, data_licenses, python_license = validate_build_environment()
+        project_licenses, hdiffpatch_licenses = validate_build_environment()
         archive = release_archive_path()
         with operation_lock("release", archive, "release build for this version"):
             validate_release_output_available()
@@ -405,7 +384,7 @@ def main() -> int:
                     for script in ENTRY_SCRIPTS:
                         build_executable(ROOT / script, dist, work, specs)
                     smoke_test_executables(dist)
-                    populate_release(stage, dist, project_licenses, data_licenses, python_license)
+                    populate_release(stage, dist, project_licenses, hdiffpatch_licenses)
                     archive, checksum, digest = create_release_outputs(stage)
             finally:
                 try:

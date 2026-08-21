@@ -190,6 +190,7 @@ This should not be included.
         self.assertNotIn("Build a release", readme)
         self.assertNotIn("PyInstaller", readme)
         self.assertNotIn("build_release.py", readme)
+        self.assertFalse(readme.endswith("\n"))
 
     def test_project_readme_uses_release_executable_commands(self) -> None:
         readme = (build_release.ROOT / "README.md").read_text(encoding="utf-8")
@@ -210,6 +211,7 @@ This should not be included.
         self.assertEqual(apply_patch.HPATCHZ, common.DATA_DIR / "hpatchz.exe")
         self.assertEqual(build_release.DATA_DIR, build_release.ROOT / "data")
         self.assertEqual(build_release.FAVICON, build_release.DATA_DIR / "favicon.ico")
+        self.assertEqual(build_release.PYTHON_LICENSE, build_release.DATA_DIR / "Python_LICENSE.txt")
 
     def test_release_temp_directory_is_separate_from_patch_temp(self) -> None:
         self.assertEqual(build_release.RELEASE_TEMP_DIR, build_release.ROOT / "release_temp")
@@ -239,29 +241,29 @@ This should not be included.
             (data / "favicon.ico").write_bytes(b"icon")
             (data / "hdiffz.exe").write_bytes(b"hdiff")
             (data / "hpatchz.exe").write_bytes(b"hpatch")
+            (data / "Python_LICENSE.txt").write_text("python license", encoding="utf-8")
             hdiff_license = data / "HDiffPatch_LICENSE.txt"
             hdiff_license.write_text("license", encoding="utf-8")
             (data / "notes.txt").write_text("do not ship", encoding="utf-8")
             (data / "README.md").write_text("source-only data notes", encoding="utf-8")
             (root / "README.md").write_text("# Ninja Patch Tool\n", encoding="utf-8")
-            python_license = root / "Python_LICENSE.txt"
-            python_license.write_text("python license", encoding="utf-8")
 
             with (
                 mock.patch.object(build_release, "ROOT", root),
                 mock.patch.object(build_release, "DATA_DIR", data),
                 mock.patch.object(build_release, "ENTRY_SCRIPTS", ()),
             ):
-                build_release.populate_release(stage, dist, [], [hdiff_license], python_license)
+                build_release.populate_release(stage, dist, [], [hdiff_license])
 
             self.assertTrue((stage / "data" / "index.json").is_file())
             self.assertTrue((stage / "data" / "hdiffz.exe").is_file())
             self.assertTrue((stage / "data" / "hpatchz.exe").is_file())
             self.assertTrue((stage / "data" / hdiff_license.name).is_file())
+            self.assertEqual((stage / "data" / "Python_LICENSE.txt").read_text(encoding="utf-8"), "python license")
+            self.assertFalse((stage / "PYTHON_LICENSE.txt").exists())
             self.assertFalse((stage / "data" / "favicon.ico").exists())
             self.assertFalse((stage / "data" / "notes.txt").exists())
             self.assertFalse((stage / "data" / "README.md").exists())
-            self.assertEqual((stage / "PYTHON_LICENSE.txt").read_text(encoding="utf-8"), "python license")
 
     def test_release_preflight_validates_x64_pe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -285,18 +287,6 @@ This should not be included.
             icon.write_bytes(b"not an icon")
             with self.assertRaisesRegex(RuntimeError, "Invalid ICO"):
                 build_release.validate_ico(icon)
-
-    def test_python_license_is_found_from_interpreter_root(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            license_file = root / "LICENSE.txt"
-            license_file.write_text("license", encoding="utf-8")
-            with (
-                mock.patch.object(build_release.sys, "base_prefix", str(root)),
-                mock.patch.object(build_release.sys, "prefix", str(root)),
-                mock.patch.object(build_release.sys, "executable", str(root / "python.exe")),
-            ):
-                self.assertEqual(build_release.find_python_license(), license_file.resolve())
 
     def test_release_checksum_is_generated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
