@@ -6,17 +6,19 @@ A ***base*** is a clean, unmodified Warframe installation from a known Steam man
 
 ## Requirements
 
-- Windows 8.1 (64-bit) or newer
-- Python 3.10 or newer
+- Windows 10 (64-bit) or newer
+- Python 3.14 (not required for release executables)
 
-No packages need to be installed.
+No packages need to be installed to run the tool from source. Building a release additionally requires PyInstaller.
+
+The commands below use the release executables. When running from source, use the corresponding `.py` script with Python 3.14 instead.
 
 ## Add a base
 
-Add a clean, unmodified Steam manifest base to `index.json`.
+Add a clean, unmodified Steam manifest base to `data/index.json`.
 
 ```text
-py add_base.py path name manifest_id
+add_base.exe path name manifest_id
 ```
 
 - `path` - Path to the clean Steam manifest base
@@ -26,15 +28,15 @@ py add_base.py path name manifest_id
 Example:
 
 ```bat
-py add_base.py "D:\WF\U43.5.1" U43.5.1 4895911296145320793
+add_base.exe "D:\WF\U43.5.1" U43.5.1 4895911296145320793
 ```
 
 ## Verify a base
 
-Verify a Steam manifest base against its entry in `index.json`. This is optional before creating a patch because `make_patch.py` verifies the selected base automatically.
+Verify a Steam manifest base against its entry in `data/index.json`. This is optional before creating a patch because `make_patch.exe` verifies the selected base automatically.
 
 ```text
-py verify_base.py path name
+verify_base.exe path name
 ```
 
 - `path` - Path to the Steam manifest base
@@ -47,13 +49,13 @@ Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam ma
 Before using an installation as `new`, fully download all language files and both DirectX 11 and DirectX 12 files in the Warframe Launcher, then open the launcher settings, click **Optimize**, and let the process finish. Close Warframe and the Warframe Launcher before creating the patch.
 
 ```text
-py make_patch.py base new output base_name [-c PRESET]
+make_patch.exe base new output base_name [-c PRESET]
 ```
 
 - `base` - Clean indexed Steam manifest base
 - `new` - Newer installation
 - `output` - Patch filename or output path; `.patch` is appended automatically. A bare filename is saved in the tool's `output` folder.
-- `base_name` - Base name from `index.json`, for example `U43.5.1`
+- `base_name` - Base name from `data/index.json`, for example `U43.5.1`
 - `-c, --compression PRESET` - Compression preset (default: `normal`): `normal`, `high`, `higher`, `maximum`
 
 Compression presets: normal is the default. High and higher trade more time and memory for potentially smaller patches. Maximum tries several matching strategies per modified file and can take much longer.
@@ -61,7 +63,7 @@ Compression presets: normal is the default. High and higher trade more time and 
 Example:
 
 ```bat
-py make_patch.py "D:\WF\U43.5.1" "D:\WF\U43.5.2" "U43.5.2.patch" U43.5.1
+make_patch.exe "D:\WF\U43.5.1" "D:\WF\U43.5.2" "U43.5.2.patch" U43.5.1
 ```
 
 An existing patch is never overwritten automatically.
@@ -71,7 +73,7 @@ An existing patch is never overwritten automatically.
 Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate installation named after the patch is created.
 
 ```text
-py apply_patch.py base patch [-o OUTPUT | -i]
+apply_patch.exe base patch [-o OUTPUT | -i]
 ```
 
 - `base` - Base installation
@@ -82,7 +84,16 @@ py apply_patch.py base patch [-o OUTPUT | -i]
 Example:
 
 ```bat
-py apply_patch.py "D:\WF\U43.5.1" "U43.5.2.patch"
+apply_patch.exe "D:\WF\U43.5.1" "U43.5.2.patch"
 ```
 
 In-place mode creates a recovery backup before modifying the base. Interrupted operations are cleaned up or recovered automatically when possible.
+
+## Build a release
+
+Set `VERSION` in `common.py`, then run:
+
+```text
+py -3.14 -m pip install pyinstaller
+py -3.14 build_release.py
+```

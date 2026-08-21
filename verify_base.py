@@ -7,15 +7,17 @@ from pathlib import Path
 from common import (
     ErrorArgumentParser,
     load_index,
+    operation_lock,
     resolve_base_name,
     scan_tree,
     validate_warframe_installation,
 )
 
 def main() -> int:
-    parser = ErrorArgumentParser(description="Verify a Steam manifest base against its entry in index.json.")
+    parser = ErrorArgumentParser(description="Verify a Steam manifest base against its entry in data/index.json.")
     parser.add_argument("path", type=Path, help="Path to the Steam manifest base")
     parser.add_argument("name", help="Indexed Warframe version, for example U43.5.1")
+    parser.add_version_argument()
     parser.add_help_argument()
     args = parser.parse_args()
 
@@ -34,7 +36,8 @@ def main() -> int:
 
         print(f'Verifying base "{canonical_name}"...\n' "Calculating installation SHA-256...")
 
-        files, actual_hash = scan_tree(base)
+        with operation_lock("installation", base, "operation using this installation"):
+            files, actual_hash = scan_tree(base)
 
         if actual_hash.lower() != expected["sha256"].lower() or len(files) != expected["file_count"]:
             print(
@@ -56,7 +59,7 @@ def main() -> int:
         return 0
 
     except KeyError:
-        print(f'ERROR: Base "{args.name}" is not present in index.json.', file=sys.stderr)
+        print(f'ERROR: Base "{args.name}" is not present in data/index.json.', file=sys.stderr)
         return 1
 
     except Exception as exc:

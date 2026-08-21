@@ -8,11 +8,13 @@ import shutil
 import sys
 import time
 import zipfile
+from contextlib import ExitStack
 from pathlib import Path
 
 from common import (
     ErrorArgumentParser,
     SingleUseStoreAction,
+    DATA_DIR,
     TEMP_ROOT,
     cleanup_work_dir,
     display_relative_path,
@@ -21,6 +23,7 @@ from common import (
     is_within,
     load_index,
     make_work_dir,
+    operation_lock,
     parse_json,
     process_is_running,
     resolve_base_name,
@@ -28,11 +31,12 @@ from common import (
     run_child,
     scan_tree,
     validate_warframe_installation,
+    verify_scanned_file,
+    verify_scanned_tree,
     warn_if_low_disk_space,
 )
 
-TOOL_DIR = Path(__file__).resolve().parent
-HDIFFZ = TOOL_DIR / "tools" / "hdiffz.exe"
+HDIFFZ = DATA_DIR / "hdiffz.exe"
 PATCH_VERSION = 1
 MAKE_SESSION_FILE = "session.json"
 MAKE_SESSION_GRACE_SECONDS = 10
@@ -254,7 +258,7 @@ def main() -> int:
         type=Path,
         help="Patch filename or output path; .patch is appended automatically. A bare filename is saved in the tool's output folder.",
     )
-    parser.add_argument("base_name", help="Base name from index.json, for example U43.5.1")
+    parser.add_argument("base_name", help="Base name from data/index.json, for example U43.5.1")
     parser.add_argument(
         "-c",
         "--compression",
@@ -264,6 +268,7 @@ def main() -> int:
         action=SingleUseStoreAction,
         help="Compression preset (default: normal): normal, high, higher, maximum",
     )
+    parser.add_version_argument()
     parser.add_help_argument()
     args = parser.parse_args()
 
@@ -287,27 +292,27 @@ def main() -> int:
     if is_within(output, base) or is_within(output, new):
         print(f"ERROR: Patch output must not be inside the base or new installation:\n{output}", file=sys.stderr)
         return 1
-    try:
-        cleanup_stale_make_patch_work(output)
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-    if output.exists():
-        print(
-            f"ERROR: Patch output already exists:\n{output}\n"
-            "Choose a different output name or remove the existing patch first.\n"
-            "No patch was generated.",
-            file=sys.stderr,
-        )
-        return 1
     if not HDIFFZ.is_file():
-        print(f"ERROR: hdiffz.exe was not found in the tools folder:\n{HDIFFZ}", file=sys.stderr)
+        print(f"ERROR: hdiffz.exe was not found in the data folder:\n{HDIFFZ}", file=sys.stderr)
         return 1
 
     work = None
+    locks = ExitStack()
     started = time.perf_counter()
 
     try:
+        locks.enter_context(operation_lock("patch_output", output, "patch creation using this output"))
+        for installation in sorted((base, new), key=lambda path: str(path).casefold()):
+            locks.enter_context(operation_lock("installation", installation, "operation using this installation"))
+
+        cleanup_stale_make_patch_work(output)
+        if output.exists():
+            raise FileExistsError(
+                f"Patch output already exists:\n{output}\n"
+                "Choose a different output name or remove the existing patch first.\n"
+                "No patch was generated."
+            )
+
         index = load_index()
         canonical_name = resolve_base_name(index, args.base_name)
         indexed_base = index[canonical_name]
@@ -363,13 +368,19 @@ def main() -> int:
             else:
                 mode = "memory"
             print(f"[Diffing] {display_relative_path(relative)} ({mode} mode)")
+            verify_scanned_file(old_info)
+            verify_scanned_file(new_info)
             run_hdiff(old_info["path"], new_info["path"], diff_path, args.compression)
+            verify_scanned_file(old_info)
+            verify_scanned_file(new_info)
 
             if diff_path.stat().st_size >= new_info["size"]:
                 # A delta that is no smaller than the new file is pointless; store the complete replacement instead.
                 diff_path.unlink()
                 payload_path = files_dir / f"{item_id}.bin"
+                verify_scanned_file(new_info)
                 shutil.copy2(new_info["path"], payload_path)
+                verify_scanned_file(new_info)
                 operations.append({
                     "type": "replace",
                     "path": relative,
@@ -394,7 +405,9 @@ def main() -> int:
         for relative in added:
             info = new_files[relative]
             payload_path = files_dir / f"{payload_id(relative)}.bin"
+            verify_scanned_file(info)
             shutil.copy2(info["path"], payload_path)
+            verify_scanned_file(info)
             operations.append({
                 "type": "add",
                 "path": relative,
@@ -414,6 +427,9 @@ def main() -> int:
             })
             print(f"[Removed] {display_relative_path(relative)}")
 
+        verify_scanned_tree(base, old_files)
+        verify_scanned_tree(new, new_files)
+
         manifest = {
             "version": PATCH_VERSION,
             "base": canonical_name,
@@ -431,6 +447,12 @@ def main() -> int:
 
         print(f"\nCreating single patch file:\n{output}")
         create_patch_archive(work, output)
+        try:
+            verify_scanned_tree(base, old_files)
+            verify_scanned_tree(new, new_files)
+        except BaseException:
+            output.unlink(missing_ok=True)
+            raise
         duration = format_duration(time.perf_counter() - started)
         print(
             "\n[Created] Patch completed successfully.\n"
@@ -442,7 +464,7 @@ def main() -> int:
         return 0
 
     except KeyError:
-        print(f'ERROR: Base "{args.base_name}" is not present in index.json.', file=sys.stderr)
+        print(f'ERROR: Base "{args.base_name}" is not present in data/index.json.', file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\nPatch creation cancelled.\nCleaning up temporary patch data...", file=sys.stderr)
@@ -453,6 +475,7 @@ def main() -> int:
     finally:
         if work is not None:
             cleanup_work_dir(work)
+        locks.close()
 
 if __name__ == "__main__":
     raise SystemExit(main())

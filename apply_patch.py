@@ -15,6 +15,7 @@ from common import (
     ErrorArgumentParser,
     SingleUseStoreAction,
     SingleUseStoreTrueAction,
+    DATA_DIR,
     TEMP_ROOT,
     cleanup_work_dir,
     display_relative_path,
@@ -25,6 +26,7 @@ from common import (
     is_steam_manifest_id,
     is_within,
     make_work_dir,
+    operation_lock,
     parse_json,
     process_is_running,
     relative_path_parts,
@@ -37,11 +39,12 @@ from common import (
     warn_if_low_disk_space,
 )
 
-TOOL_DIR = Path(__file__).resolve().parent
-HPATCHZ = TOOL_DIR / "tools" / "hpatchz.exe"
+HPATCHZ = DATA_DIR / "hpatchz.exe"
 SUPPORTED_VERSIONS = {1}
 RECOVERY_VERSION = 1
 RECOVERY_FILE = "recovery.json"
+MAX_MANIFEST_SIZE = 64 * 1024 * 1024
+SUPPORTED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 
 def read_archive_members(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
     # Duplicate ZIP names are ambiguous, so reject them before reading the manifest or any payload.
@@ -51,14 +54,17 @@ def read_archive_members(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]
             continue
         if member.filename in members:
             raise RuntimeError(f"Patch contains duplicate archive entry: {member.filename}")
+        if member.compress_type not in SUPPORTED_ZIP_COMPRESSION:
+            raise RuntimeError(f"Patch archive entry uses unsupported ZIP compression: {member.filename}")
         members[member.filename] = member
     return members
 
 def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> dict:
     if not isinstance(manifest, dict):
         raise RuntimeError("Invalid patch manifest.")
-    if manifest.get("version") not in SUPPORTED_VERSIONS:
-        raise RuntimeError(f"Unsupported patch version: {manifest.get('version')!r}")
+    version = manifest.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version not in SUPPORTED_VERSIONS:
+        raise RuntimeError(f"Unsupported patch version: {version!r}")
 
     required = {
         "base",
@@ -157,6 +163,8 @@ def read_manifest(archive: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo])
     info = members.get("manifest.json")
     if info is None:
         raise RuntimeError("Patch does not contain manifest.json.")
+    if info.file_size > MAX_MANIFEST_SIZE:
+        raise RuntimeError(f"Patch manifest is too large: {info.file_size:,} bytes (maximum {MAX_MANIFEST_SIZE:,} bytes).")
     with archive.open(info, "r") as source:
         return validate_manifest(parse_json(source.read()), members)
 
@@ -416,7 +424,8 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
             print(f"WARNING: Could not read recovery state:\n{recovery}\n{exc}\nThe folder was left untouched.", file=sys.stderr)
             continue
 
-        if not isinstance(state, dict) or state.get("recovery_version") != RECOVERY_VERSION:
+        recovery_version = state.get("recovery_version") if isinstance(state, dict) else None
+        if not isinstance(recovery_version, int) or isinstance(recovery_version, bool) or recovery_version != RECOVERY_VERSION:
             print(f"WARNING: Unsupported recovery state:\n{recovery}\nThe folder was left untouched.", file=sys.stderr)
             continue
 
@@ -524,57 +533,7 @@ def apply_and_verify(
     if not tree_matches(destination, manifest["new_root_sha256"], manifest["new_file_count"]):
         raise RuntimeError("Final installation verification failed.")
 
-def main() -> int:
-    install_termination_handlers()
-    parser = ErrorArgumentParser(
-        description=(
-            "Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate "
-            "installation named after the patch is created."
-        )
-    )
-    parser.add_argument("base", type=Path, help="Base installation")
-    parser.add_argument(
-        "patch",
-        type=Path,
-        help="Patch filename or path; .patch is appended automatically. A bare filename is looked up in the tool's output folder.",
-    )
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        action=SingleUseStoreAction,
-        help="Create a separate installation at OUTPUT; if omitted, defaults to the patch filename (cannot be used with --in-place)",
-    )
-    mode.add_argument(
-        "-i",
-        "--in-place",
-        action=SingleUseStoreTrueAction,
-        help="Modify the base installation instead (cannot be used with --output)",
-    )
-    parser.add_help_argument()
-    args = parser.parse_args()
-
-    base = args.base.resolve()
-    patch = resolve_patch_input(args.patch)
-
-    if not base.is_dir():
-        print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
-        return 1
-
-    if args.in_place:
-        destination = base
-    elif args.output is not None:
-        destination = args.output.resolve()
-    else:
-        destination = base.parent / patch.stem
-
-    if not args.in_place and (
-        destination == base or is_within(destination, base) or is_within(base, destination)
-    ):
-        print("ERROR: Output and base directories must not overlap.", file=sys.stderr)
-        return 1
-
+def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool) -> int:
     try:
         completed_state = recover_interrupted_operations(base, destination)
     except KeyboardInterrupt:
@@ -602,15 +561,15 @@ def main() -> int:
         if recovery_matches_manifest(completed_state, completed_manifest):
             print(f"\n[Patched] The previous patch application had already completed successfully.\nBase: {base}\nOutput: {destination}")
             return 0
-        if not args.in_place and destination.exists():
+        if not in_place and destination.exists():
             print(f"ERROR: Output path already exists and belongs to a previously completed different patch:\n{destination}", file=sys.stderr)
             return 1
 
-    if not args.in_place and destination.exists():
+    if not in_place and destination.exists():
         print(f"ERROR: Output path already exists:\n{destination}", file=sys.stderr)
         return 1
     if not HPATCHZ.is_file():
-        print(f"ERROR: hpatchz.exe was not found in the tools folder:\n{HPATCHZ}", file=sys.stderr)
+        print(f"ERROR: hpatchz.exe was not found in the data folder:\n{HPATCHZ}", file=sys.stderr)
         return 1
 
     work = None
@@ -648,7 +607,7 @@ def main() -> int:
                 (operation.get("new_size", 0) for operation in manifest["operations"]),
                 default=0,
             )
-            if args.in_place:
+            if in_place:
                 backup_estimate = sum(
                     operation.get("old_size", 0)
                     for operation in manifest["operations"]
@@ -665,7 +624,7 @@ def main() -> int:
             scratch = work / "payload"
             scratch.mkdir()
 
-            if args.in_place:
+            if in_place:
                 check_temporary_paths(base, manifest["operations"])
                 backup = work / "backup"
                 backup.mkdir()
@@ -748,6 +707,71 @@ def main() -> int:
     finally:
         if work is not None and not keep_work:
             cleanup_work_dir(work)
+
+def main() -> int:
+    install_termination_handlers()
+    parser = ErrorArgumentParser(
+        description=(
+            "Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate "
+            "installation named after the patch is created."
+        )
+    )
+    parser.add_argument("base", type=Path, help="Base installation")
+    parser.add_argument(
+        "patch",
+        type=Path,
+        help="Patch filename or path; .patch is appended automatically. A bare filename is looked up in the tool's output folder.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        action=SingleUseStoreAction,
+        help="Create a separate installation at OUTPUT; if omitted, defaults to the patch filename (cannot be used with --in-place)",
+    )
+    mode.add_argument(
+        "-i",
+        "--in-place",
+        action=SingleUseStoreTrueAction,
+        help="Modify the base installation instead (cannot be used with --output)",
+    )
+    parser.add_version_argument()
+    parser.add_help_argument()
+    args = parser.parse_args()
+
+    base = args.base.resolve()
+    patch = resolve_patch_input(args.patch)
+
+    if not base.is_dir():
+        print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
+        return 1
+
+    if args.in_place:
+        destination = base
+    elif args.output is not None:
+        destination = args.output.resolve()
+    else:
+        destination = base.parent / patch.stem
+
+    if not args.in_place and (
+        destination == base or is_within(destination, base) or is_within(base, destination)
+    ):
+        print("ERROR: Output and base directories must not overlap.", file=sys.stderr)
+        return 1
+
+    try:
+        with operation_lock("installation", base, "operation using this installation"):
+            if destination == base:
+                return run_locked_apply(base, patch, destination, args.in_place)
+            with operation_lock("installation", destination, "operation using this installation"):
+                return run_locked_apply(base, patch, destination, args.in_place)
+    except KeyboardInterrupt:
+        print("\nPatch application cancelled.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
 if __name__ == "__main__":
     raise SystemExit(main())

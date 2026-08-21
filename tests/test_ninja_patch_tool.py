@@ -17,7 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import add_base
 import apply_patch
+import build_release
 import common
 import make_patch
 
@@ -45,11 +47,44 @@ class CommonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
             common.parse_json('{"a": 1, "a": 2}')
 
+    def test_sha256_file_matches_hashlib(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data.bin"
+            data = b"Ninja Patch Tool\x00" * 4096
+            path.write_bytes(data)
+            self.assertEqual(common.sha256_file(path), hashlib.sha256(data).hexdigest())
+
     def test_sha256_validation_is_strict(self) -> None:
         self.assertTrue(common.is_sha256("a" * 64))
         self.assertTrue(common.is_sha256("ABCDEF0123456789" * 4))
         for value in ("+" + "a" * 63, "-" + "a" * 63, " " + "a" * 63, "g" * 64, "a" * 63, True, None):
             self.assertFalse(common.is_sha256(value))
+
+    def test_format_bytes_supports_pib(self) -> None:
+        self.assertEqual(common.format_bytes(0), "0 B")
+        self.assertEqual(common.format_bytes(1024**4), "1.0 TiB")
+        self.assertEqual(common.format_bytes(1024**5), "1.0 PiB")
+
+    def test_natural_sort_key_handles_mixed_base_name_shapes(self) -> None:
+        self.assertEqual(sorted(["U10", "43.5", "U2", "Alpha1"], key=common.natural_sort_key), ["43.5", "Alpha1", "U2", "U10"])
+
+    def test_version_has_single_source(self) -> None:
+        self.assertEqual(build_release.VERSION, common.VERSION)
+        self.assertEqual(common.VERSION, "1.0.0")
+
+    def test_argument_parser_uses_python_314_cli_improvements(self) -> None:
+        parser = common.ErrorArgumentParser()
+        self.assertTrue(parser.suggest_on_error)
+        self.assertFalse(parser.color)
+
+    def test_version_argument_includes_v_prefix(self) -> None:
+        parser = common.ErrorArgumentParser()
+        parser.add_version_argument()
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout), self.assertRaises(SystemExit) as raised:
+            parser.parse_args(["--version"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(stdout.getvalue().strip(), f"Ninja Patch Tool v{common.VERSION}")
 
     def test_steam_manifest_id_range(self) -> None:
         self.assertTrue(common.is_steam_manifest_id(1))
@@ -83,6 +118,342 @@ class CommonTests(unittest.TestCase):
                     common.relative_path_parts(path)
         self.assertEqual(common.relative_path_parts("Cache.Windows/B.Misc.cache"), ("Cache.Windows", "B.Misc.cache"))
 
+    def test_write_index_refuses_preexisting_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            index_file = Path(tmp) / "index.json"
+            temporary = index_file.with_name(index_file.name + ".tmp")
+            temporary.write_text("keep", encoding="utf-8")
+            with mock.patch.object(common, "INDEX_FILE", index_file):
+                with self.assertRaises(FileExistsError):
+                    common.write_index({})
+            self.assertEqual(temporary.read_text(encoding="utf-8"), "keep")
+            self.assertFalse(index_file.exists())
+
+    def test_add_base_keeps_installation_locked_until_index_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            base.mkdir()
+            active: list[str] = []
+
+            from contextlib import contextmanager
+            @contextmanager
+            def fake_lock(kind: str, target: Path, description: str):
+                active.append(kind)
+                try:
+                    yield
+                finally:
+                    active.remove(kind)
+
+            def write_index(index: dict) -> None:
+                self.assertIn("installation", active)
+                self.assertIn("index", active)
+
+            argv = ["add_base.py", str(base), "U43.5.1", "4895911296145320793"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(add_base, "operation_lock", side_effect=fake_lock),
+                mock.patch.object(add_base, "validate_warframe_installation", return_value=True),
+                mock.patch.object(add_base, "scan_tree", return_value=({}, "a" * 64)),
+                mock.patch.object(add_base, "load_index", return_value={}),
+                mock.patch.object(add_base, "write_index", side_effect=write_index),
+            ):
+                self.assertEqual(add_base.main(), 0)
+
+    def test_frozen_tool_dir_uses_executable_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "NinjaPatchTool" / "make_patch.exe"
+            with mock.patch.object(common.sys, "frozen", True, create=True), mock.patch.object(common.sys, "executable", str(executable)):
+                self.assertEqual(common.get_tool_dir(), executable.resolve().parent)
+
+    def test_release_readme_uses_executable_commands(self) -> None:
+        markdown = """# Ninja Patch Tool
+
+## Requirements
+
+- Python 3.14 (not required for release executables)
+
+## Add a base
+
+```text
+py add_base.py path name manifest_id
+```
+
+## Build a release
+
+This should not be included.
+"""
+        readme = build_release.create_release_readme(markdown)
+        self.assertIn(f"Version {build_release.VERSION}", readme)
+        self.assertIn("add_base.exe path name manifest_id", readme)
+        self.assertNotIn("py add_base.py", readme)
+        self.assertNotIn("Python installation", readme)
+        self.assertNotIn("Build a release", readme)
+        self.assertNotIn("PyInstaller", readme)
+        self.assertNotIn("build_release.py", readme)
+
+    def test_project_readme_uses_release_executable_commands(self) -> None:
+        readme = (build_release.ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("add_base.exe path name manifest_id", readme)
+        self.assertIn("verify_base.exe path name", readme)
+        self.assertIn("make_patch.exe base new output base_name [-c PRESET]", readme)
+        self.assertIn("apply_patch.exe base patch [-o OUTPUT | -i]", readme)
+        self.assertIn("When running from source, use the corresponding `.py` script with Python 3.14 instead.", readme)
+        self.assertNotIn("py add_base.py path name manifest_id", readme)
+        self.assertNotIn("py verify_base.py path name", readme)
+        self.assertNotIn("py make_patch.py base new output base_name [-c PRESET]", readme)
+        self.assertNotIn("py apply_patch.py base patch [-o OUTPUT | -i]", readme)
+
+    def test_runtime_data_paths_are_centralized(self) -> None:
+        self.assertEqual(common.DATA_DIR, common.TOOL_DIR / "data")
+        self.assertEqual(common.INDEX_FILE, common.DATA_DIR / "index.json")
+        self.assertEqual(make_patch.HDIFFZ, common.DATA_DIR / "hdiffz.exe")
+        self.assertEqual(apply_patch.HPATCHZ, common.DATA_DIR / "hpatchz.exe")
+        self.assertEqual(build_release.DATA_DIR, build_release.ROOT / "data")
+        self.assertEqual(build_release.FAVICON, build_release.DATA_DIR / "favicon.ico")
+
+    def test_release_temp_directory_is_separate_from_patch_temp(self) -> None:
+        self.assertEqual(build_release.RELEASE_TEMP_DIR, build_release.ROOT / "release_temp")
+        self.assertNotEqual(build_release.RELEASE_TEMP_DIR, common.TEMP_ROOT)
+
+    def test_release_temp_parent_cleanup_ignores_nonempty_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_temp = Path(tmp) / "release_temp"
+            release_temp.mkdir()
+            (release_temp / "keep").write_text("keep", encoding="utf-8")
+            with mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp):
+                try:
+                    build_release.RELEASE_TEMP_DIR.rmdir()
+                except OSError:
+                    pass
+            self.assertTrue(release_temp.is_dir())
+
+    def test_release_data_is_allowlisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "data"
+            stage = root / "stage"
+            dist = root / "dist"
+            data.mkdir()
+            dist.mkdir()
+            (data / "index.json").write_text("{}", encoding="utf-8")
+            (data / "favicon.ico").write_bytes(b"icon")
+            (data / "hdiffz.exe").write_bytes(b"hdiff")
+            (data / "hpatchz.exe").write_bytes(b"hpatch")
+            hdiff_license = data / "HDiffPatch_LICENSE.txt"
+            hdiff_license.write_text("license", encoding="utf-8")
+            (data / "notes.txt").write_text("do not ship", encoding="utf-8")
+            (data / "README.md").write_text("source-only data notes", encoding="utf-8")
+            (root / "README.md").write_text("# Ninja Patch Tool\n", encoding="utf-8")
+            python_license = root / "Python_LICENSE.txt"
+            python_license.write_text("python license", encoding="utf-8")
+
+            with (
+                mock.patch.object(build_release, "ROOT", root),
+                mock.patch.object(build_release, "DATA_DIR", data),
+                mock.patch.object(build_release, "ENTRY_SCRIPTS", ()),
+            ):
+                build_release.populate_release(stage, dist, [], [hdiff_license], python_license)
+
+            self.assertTrue((stage / "data" / "index.json").is_file())
+            self.assertTrue((stage / "data" / "hdiffz.exe").is_file())
+            self.assertTrue((stage / "data" / "hpatchz.exe").is_file())
+            self.assertTrue((stage / "data" / hdiff_license.name).is_file())
+            self.assertFalse((stage / "data" / "favicon.ico").exists())
+            self.assertFalse((stage / "data" / "notes.txt").exists())
+            self.assertFalse((stage / "data" / "README.md").exists())
+            self.assertEqual((stage / "PYTHON_LICENSE.txt").read_text(encoding="utf-8"), "python license")
+
+    def test_release_preflight_validates_x64_pe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "tool.exe"
+            data = bytearray(0x86)
+            data[:2] = b"MZ"
+            data[0x3C:0x40] = (0x80).to_bytes(4, "little")
+            data[0x80:0x84] = b"PE\0\0"
+            data[0x84:0x86] = (0x8664).to_bytes(2, "little")
+            executable.write_bytes(data)
+            build_release.validate_pe_x64(executable)
+            data[0x84:0x86] = (0x14C).to_bytes(2, "little")
+            executable.write_bytes(data)
+            with self.assertRaisesRegex(RuntimeError, "not an x86-64"):
+                build_release.validate_pe_x64(executable)
+
+    def test_release_preflight_validates_ico_structure(self) -> None:
+        build_release.validate_ico(build_release.FAVICON)
+        with tempfile.TemporaryDirectory() as tmp:
+            icon = Path(tmp) / "bad.ico"
+            icon.write_bytes(b"not an icon")
+            with self.assertRaisesRegex(RuntimeError, "Invalid ICO"):
+                build_release.validate_ico(icon)
+
+    def test_python_license_is_found_from_interpreter_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            license_file = root / "LICENSE.txt"
+            license_file.write_text("license", encoding="utf-8")
+            with (
+                mock.patch.object(build_release.sys, "base_prefix", str(root)),
+                mock.patch.object(build_release.sys, "prefix", str(root)),
+                mock.patch.object(build_release.sys, "executable", str(root / "python.exe")),
+            ):
+                self.assertEqual(build_release.find_python_license(), license_file.resolve())
+
+    def test_release_checksum_is_generated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_dir = Path(tmp)
+            with mock.patch.object(build_release, "RELEASE_DIR", release_dir):
+                archive = build_release.release_archive_path()
+                archive.write_bytes(b"release")
+                checksum, digest = build_release.create_release_checksum(archive)
+                self.assertEqual(digest, hashlib.sha256(b"release").hexdigest())
+                self.assertEqual(checksum.read_text(encoding="ascii"), f"{digest}  {archive.name}\n")
+
+    def test_release_output_archive_is_removed_if_checksum_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "release.zip"
+            archive.write_bytes(b"release")
+            with (
+                mock.patch.object(build_release, "create_release_archive", return_value=archive),
+                mock.patch.object(build_release, "create_release_checksum", side_effect=RuntimeError("checksum failed")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "checksum failed"):
+                    build_release.create_release_outputs(Path(tmp) / "stage")
+            self.assertFalse(archive.exists())
+
+    def test_pyinstaller_minimum_version_for_python_314(self) -> None:
+        build_release.validate_pyinstaller_version("6.15.0")
+        build_release.validate_pyinstaller_version("6.22.2")
+        with self.assertRaisesRegex(RuntimeError, "6.15.0 or newer"):
+            build_release.validate_pyinstaller_version("6.14.2")
+
+    def test_release_builder_requires_python_314(self) -> None:
+        for version in ((3, 13, 9), (3, 15, 0)):
+            with self.subTest(version=version):
+                with (
+                    mock.patch.object(build_release.sys, "platform", "win32"),
+                    mock.patch.object(build_release.struct, "calcsize", return_value=8),
+                    mock.patch.object(build_release.sys, "version_info", version),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "Python 3.14 is required to build releases"):
+                        build_release.validate_build_environment()
+
+    def test_release_executable_uses_icon_version_info_and_local_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "add_base.py"
+            dist = root / "dist"
+            work = root / "work"
+            specs = root / "spec"
+            script.write_text("print('test')", encoding="utf-8")
+            dist.mkdir()
+            work.mkdir()
+            specs.mkdir()
+            commands: list[list[str]] = []
+            environments: list[dict[str, str]] = []
+
+            def run(command, cwd, env):
+                commands.append(command)
+                environments.append(env)
+                (dist / "add_base.exe").write_bytes(b"exe")
+                return SimpleNamespace(returncode=0)
+
+            with mock.patch.object(build_release.subprocess, "run", side_effect=run):
+                build_release.build_executable(script, dist, work, specs)
+
+            self.assertEqual(len(commands), 1)
+            icon_index = commands[0].index("--icon")
+            version_index = commands[0].index("--version-file")
+            self.assertEqual(commands[0][icon_index + 1], str(build_release.FAVICON))
+            self.assertTrue(Path(commands[0][version_index + 1]).is_file())
+            self.assertNotIn("--clean", commands[0])
+            self.assertEqual(environments[0]["TEMP"], str(dist.parent))
+            self.assertEqual(environments[0]["TMP"], str(dist.parent))
+            self.assertEqual(environments[0]["PYINSTALLER_CONFIG_DIR"], str(dist.parent / "pyinstaller_config"))
+
+    def test_release_smoke_tests_all_executables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp) / "dist"
+            dist.mkdir()
+            for script in build_release.ENTRY_SCRIPTS:
+                (dist / f"{Path(script).stem}.exe").write_bytes(b"exe")
+
+            calls: list[list[str]] = []
+            def run(command, cwd, env, capture_output, text, timeout):
+                calls.append(command)
+                return SimpleNamespace(returncode=0, stdout="Shows this help message", stderr="")
+
+            with mock.patch.object(build_release.subprocess, "run", side_effect=run):
+                build_release.smoke_test_executables(dist)
+            self.assertEqual([Path(command[0]).name for command in calls], [f"{Path(script).stem}.exe" for script in build_release.ENTRY_SCRIPTS])
+            self.assertTrue(all(command[1:] == ["-h"] for command in calls))
+
+    def test_release_version_info_contains_explorer_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            version_file = build_release.create_version_file(Path("make_patch.py"), Path(tmp))
+            text = version_file.read_text(encoding="utf-8")
+            compile(text, str(version_file), "eval")
+            expected = {
+                "CompanyName": "DarkLotus",
+                "FileDescription": "Ninja Patch Tool - Patch Creator",
+                "FileVersion": build_release.VERSION,
+                "InternalName": "make_patch",
+                "LegalCopyright": "Copyright © DarkLotus",
+                "OriginalFilename": "make_patch.exe",
+                "ProductName": "Ninja Patch Tool",
+                "ProductVersion": build_release.VERSION,
+            }
+            for key, value in expected.items():
+                self.assertIn(f"StringStruct('{key}', '{value}')", text)
+            self.assertIn("VarStruct('Translation', [1033, 1200])", text)
+
+    def test_release_output_is_checked_before_building(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_dir = Path(tmp)
+            with mock.patch.object(build_release, "RELEASE_DIR", release_dir):
+                archive = build_release.release_archive_path()
+                archive.write_bytes(b"existing")
+                with self.assertRaisesRegex(FileExistsError, "already exists"):
+                    build_release.validate_release_output_available()
+                archive.unlink()
+                build_release.release_checksum_path().write_text("existing", encoding="ascii")
+                with self.assertRaisesRegex(FileExistsError, "already exists"):
+                    build_release.validate_release_output_available()
+
+    def test_operation_lock_rejects_same_target_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            with mock.patch.object(common, "TEMP_ROOT", root / "temp"):
+                with common.operation_lock("test", target, "test operation"):
+                    with self.assertRaisesRegex(RuntimeError, "Another test operation"):
+                        with common.operation_lock("test", target, "test operation"):
+                            pass
+
+    def test_apply_main_locks_base_and_separate_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base"
+            base.mkdir()
+            output = root / "out"
+            patch = root / "test.patch"
+            locks: list[tuple[str, Path]] = []
+
+            from contextlib import contextmanager
+            @contextmanager
+            def fake_lock(kind: str, target: Path, description: str):
+                locks.append((kind, target))
+                yield
+
+            argv = ["apply_patch.py", str(base), str(patch), "--output", str(output)]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(apply_patch, "operation_lock", side_effect=fake_lock),
+                mock.patch.object(apply_patch, "run_locked_apply", return_value=0),
+                mock.patch.object(apply_patch, "install_termination_handlers"),
+            ):
+                self.assertEqual(apply_patch.main(), 0)
+            self.assertEqual(locks, [("installation", base.resolve()), ("installation", output.resolve())])
+
     def test_scan_tree_detects_file_changes_during_hashing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -98,6 +469,25 @@ class CommonTests(unittest.TestCase):
             with mock.patch.object(common, "sha256_file", side_effect=changing_hash):
                 with self.assertRaisesRegex(RuntimeError, "Installation changed while it was being scanned"):
                     common.scan_tree(root)
+
+    def test_scanned_file_change_after_hashing_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "file.bin"
+            target.write_bytes(b"old")
+            files, _ = common.scan_tree(root)
+            target.write_bytes(b"changed and longer")
+            with self.assertRaisesRegex(RuntimeError, "Installation changed after it was scanned"):
+                common.verify_scanned_file(files["file.bin"])
+
+    def test_scanned_tree_structure_change_after_hashing_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "old.bin").write_bytes(b"old")
+            files, _ = common.scan_tree(root)
+            (root / "new.bin").write_bytes(b"new")
+            with self.assertRaisesRegex(RuntimeError, "Installation changed after it was scanned"):
+                common.verify_scanned_tree(root, files)
 
     def test_low_disk_space_is_only_a_warning(self) -> None:
         stderr = io.StringIO()
@@ -181,6 +571,38 @@ class MakePatchTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), b"unrelated")
             self.assertFalse(make_patch.temporary_patch_path(output).exists())
 
+    def test_make_main_locks_output_and_installations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, new = root / "base", root / "new"
+            make_warframe_root(base)
+            make_warframe_root(new)
+            output = root / "out.patch"
+            hdiffz = root / "hdiffz.exe"
+            hdiffz.write_bytes(b"fake")
+            locks: list[tuple[str, Path]] = []
+
+            from contextlib import contextmanager
+            @contextmanager
+            def fake_lock(kind: str, target: Path, description: str):
+                locks.append((kind, target))
+                yield
+
+            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.1"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(make_patch, "HDIFFZ", hdiffz),
+                mock.patch.object(make_patch, "operation_lock", side_effect=fake_lock),
+                mock.patch.object(make_patch, "cleanup_stale_make_patch_work"),
+                mock.patch.object(make_patch, "load_index", side_effect=RuntimeError("stop")),
+                mock.patch.object(make_patch, "install_termination_handlers"),
+            ):
+                self.assertEqual(make_patch.main(), 1)
+            expected_installations = sorted((base.resolve(), new.resolve()), key=lambda path: str(path).casefold())
+            expected_locks = [("patch_output", output.resolve())]
+            expected_locks.extend(("installation", path) for path in expected_installations)
+            self.assertEqual(locks, expected_locks)
+
     def test_maximum_continues_after_candidate_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -218,6 +640,50 @@ class MakePatchTests(unittest.TestCase):
                 self.assertEqual(make_patch.main(), 1)
             self.assertIn("Patch output must not be inside", stderr.getvalue())
 
+    def test_make_aborts_if_source_changes_after_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, new = root / "base", root / "new"
+            make_warframe_root(base)
+            shutil.copytree(base, new)
+            (base / "Cache.Windows" / "data.bin").write_bytes(b"old")
+            target = new / "Cache.Windows" / "data.bin"
+            target.write_bytes(b"new")
+            base_files, base_hash = common.scan_tree(base)
+            index_path = root / "index.json"
+            index_path.write_text(json.dumps({
+                "U43.5.1": {
+                    "steam_manifest_id": 4895911296145320793,
+                    "sha256": base_hash,
+                    "file_count": len(base_files),
+                }
+            }), encoding="utf-8")
+            hdiffz = root / "hdiffz.exe"
+            hdiffz.write_bytes(b"fake")
+            output = root / "out.patch"
+            temp_root = root / "temp"
+
+            def changing_hdiff(old_path: Path, new_path: Path, diff_path: Path, compression: str) -> None:
+                diff_path.parent.mkdir(parents=True, exist_ok=True)
+                diff_path.write_bytes(b"d")
+                target.write_bytes(b"changed after scan")
+
+            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.1"]
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(common, "INDEX_FILE", index_path),
+                mock.patch.object(common, "TEMP_ROOT", temp_root),
+                mock.patch.object(make_patch, "TEMP_ROOT", temp_root),
+                mock.patch.object(make_patch, "HDIFFZ", hdiffz),
+                mock.patch.object(make_patch, "run_hdiff", side_effect=changing_hdiff),
+                mock.patch.object(make_patch, "install_termination_handlers"),
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(make_patch.main(), 1)
+            self.assertIn("Installation changed after it was scanned", stderr.getvalue())
+            self.assertFalse(output.exists())
+
     def test_maximum_fails_only_when_every_candidate_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -241,6 +707,28 @@ class ApplyPatchTests(unittest.TestCase):
             "new_file_count": new_count,
             "operations": [operation],
         }
+
+    def test_manifest_rejects_boolean_patch_version(self) -> None:
+        operation = {"type": "remove", "path": "a.bin", "old_size": 1, "old_sha256": "a" * 64}
+        manifest = self.minimal_manifest(operation, old_count=1, new_count=0)
+        manifest["version"] = True
+        with self.assertRaisesRegex(RuntimeError, "Unsupported patch version"):
+            apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json")})
+
+    def test_patch_archive_accepts_deflated_members(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            patch = Path(tmp) / "compressed.patch"
+            with zipfile.ZipFile(patch, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", b"{}")
+            with zipfile.ZipFile(patch, "r") as archive:
+                members = apply_patch.read_archive_members(archive)
+                self.assertEqual(members["manifest.json"].compress_type, zipfile.ZIP_DEFLATED)
+
+    def test_manifest_size_is_limited_before_reading(self) -> None:
+        info = zipfile.ZipInfo("manifest.json")
+        info.file_size = apply_patch.MAX_MANIFEST_SIZE + 1
+        with self.assertRaisesRegex(RuntimeError, "Patch manifest is too large"):
+            apply_patch.read_manifest(None, {"manifest.json": info})
 
     def test_manifest_rejects_duplicate_operation_paths(self) -> None:
         operation = {"type": "remove", "path": "a.bin", "old_size": 1, "old_sha256": "a" * 64}
@@ -329,6 +817,23 @@ class ApplyPatchTests(unittest.TestCase):
             apply_patch.rollback_in_place(base, backup, operations, {"old.bin": True, "added.bin": False})
             self.assertEqual((base / "old.bin").read_bytes(), b"original")
             self.assertFalse((base / "added.bin").exists())
+
+    def test_recovery_rejects_boolean_recovery_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base"
+            base.mkdir()
+            work = root / "temp" / "apply_patch_test"
+            work.mkdir(parents=True)
+            (work / apply_patch.RECOVERY_FILE).write_text(json.dumps({"recovery_version": True}), encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"),
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertIsNone(apply_patch.recover_interrupted_operations(base, base))
+            self.assertIn("Unsupported recovery state", stderr.getvalue())
+            self.assertTrue(work.exists())
 
     def test_recovery_restores_broken_warframe_root_before_normal_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

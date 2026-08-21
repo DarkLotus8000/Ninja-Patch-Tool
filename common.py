@@ -11,23 +11,27 @@ import signal
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-TOOL_DIR = Path(__file__).resolve().parent
-INDEX_FILE = TOOL_DIR / "index.json"
-TEMP_ROOT = TOOL_DIR / "temp"
-HASH_CHUNK = 8 * 1024 * 1024
+VERSION = "1.0.0"
 
+def get_tool_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+TOOL_DIR = get_tool_dir()
+DATA_DIR = TOOL_DIR / "data"
+INDEX_FILE = DATA_DIR / "index.json"
+TEMP_ROOT = TOOL_DIR / "temp"
 # We don't need this garbage.
 IGNORED_FILENAMES = {"launcher.zip", "launcher.exe", "remotecrashsender.exe"}
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as file:
-        while chunk := file.read(HASH_CHUNK):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hashlib.file_digest(file, "sha256").hexdigest()
 
 def is_ignored_file(path: Path) -> bool:
     return path.name.casefold() in IGNORED_FILENAMES
@@ -47,7 +51,7 @@ def validate_warframe_installation(path: Path, label: str) -> bool:
     return False
 
 def natural_sort_key(value: str):
-    return tuple(int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", value) if part)
+    return tuple((0, int(part)) if part.isdigit() else (1, part.casefold()) for part in re.split(r"(\d+)", value) if part)
 
 def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
     # The root hash uses each relative path, size, and file SHA-256. Filesystem enumeration order is not guaranteed,
@@ -68,7 +72,7 @@ def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
             raise RuntimeError(f"Installation changed while it was being scanned:\n{path}\nClose Warframe and the Warframe Launcher and try again.")
 
         size = after.st_size
-        files[relative] = {"path": path, "size": size, "sha256": digest}
+        files[relative] = {"path": path, "size": size, "sha256": digest, "mtime_ns": after.st_mtime_ns}
         root_hash.update(
             relative.encode("utf-8") + b"\0" + str(size).encode("ascii") + b"\0" + digest.encode("ascii") + b"\n"
         )
@@ -80,6 +84,24 @@ def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
         raise RuntimeError(f"Installation changed while it was being scanned:\n{root}\nClose Warframe and the Warframe Launcher and try again.")
 
     return files, root_hash.hexdigest()
+
+def verify_scanned_file(info: dict[str, Any]) -> None:
+    path = info["path"]
+    try:
+        current = path.stat()
+    except OSError as exc:
+        raise RuntimeError(f"Installation changed after it was scanned:\n{path}\nClose Warframe and the Warframe Launcher and try again.") from exc
+    if current.st_size != info["size"] or current.st_mtime_ns != info["mtime_ns"]:
+        raise RuntimeError(f"Installation changed after it was scanned:\n{path}\nClose Warframe and the Warframe Launcher and try again.")
+
+def verify_scanned_tree(root: Path, files: dict[str, dict[str, Any]]) -> None:
+    current_paths = sorted(
+        path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and not is_ignored_file(path)
+    )
+    if current_paths != sorted(files):
+        raise RuntimeError(f"Installation changed after it was scanned:\n{root}\nClose Warframe and the Warframe Launcher and try again.")
+    for info in files.values():
+        verify_scanned_file(info)
 
 def _no_duplicate_keys(pairs):
     result = {}
@@ -151,10 +173,18 @@ def write_index(index: dict[str, Any]) -> None:
     validate_index(index)
     sorted_index = {name: index[name] for name in sorted(index, key=natural_sort_key)}
 
-    # Write beside the real index and replace it only after serialization succeeds, so an interrupted write does not leave a half-written index.
+    # Create the temporary index exclusively so an unexplained pre-existing .tmp file is never overwritten.
     temporary = INDEX_FILE.with_name(INDEX_FILE.name + ".tmp")
-    temporary.write_text(json.dumps(sorted_index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    temporary.replace(INDEX_FILE)
+    created = False
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as file:
+            created = True
+            file.write(json.dumps(sorted_index, indent=2, ensure_ascii=False) + "\n")
+        temporary.replace(INDEX_FILE)
+    except BaseException:
+        if created:
+            temporary.unlink(missing_ok=True)
+        raise
 
 def resolve_base_name(index: dict[str, Any], requested: str) -> str:
     requested_folded = requested.casefold()
@@ -226,12 +256,67 @@ def process_is_running(pid: int) -> bool:
         return True
     return True
 
-def is_within(path: Path, parent: Path) -> bool:
+@contextmanager
+def operation_lock(kind: str, target: Path, description: str):
+    resolved = str(target.resolve())
+    if os.name == "nt":
+        resolved = resolved.casefold()
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()
+    safe_kind = re.sub(r"[^0-9A-Za-z_.-]", "_", kind)
+
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+        kernel32.ReleaseMutex.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+
+        handle = kernel32.CreateMutexW(None, False, f"Local\\DarkLotus.NinjaPatchTool.{safe_kind}.{digest}")
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "Could not create the operation mutex.")
+        wait_result = kernel32.WaitForSingleObject(handle, 0)
+        if wait_result == 0x102:
+            kernel32.CloseHandle(handle)
+            raise RuntimeError(f"Another {description} is already running for:\n{target}")
+        if wait_result not in {0, 0x80}:
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(handle)
+            raise OSError(error, "Could not acquire the operation mutex.")
+        try:
+            yield
+        finally:
+            kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        return
+
+    # The project targets Windows, but keep the test/development path safe on POSIX too.
+    import fcntl
+    locks = TEMP_ROOT / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    lock_path = locks / f"{safe_kind}_{digest}.lock"
+    with lock_path.open("a+b") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(f"Another {description} is already running for:\n{target}") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    lock_path.unlink(missing_ok=True)
     try:
-        path.resolve().relative_to(parent.resolve())
-        return True
-    except ValueError:
-        return False
+        locks.rmdir()
+        TEMP_ROOT.rmdir()
+    except OSError:
+        pass
+
+def is_within(path: Path, parent: Path) -> bool:
+    return path.resolve().is_relative_to(parent.resolve())
 
 def relative_path_parts(relative: str) -> tuple[str, ...]:
     if not isinstance(relative, str) or not relative or "\0" in relative:
@@ -270,8 +355,8 @@ def ensure_patch_extension(path: Path) -> Path:
 
 def format_bytes(size: int) -> str:
     value = float(max(0, size))
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if value < 1024 or unit == "TiB":
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if value < 1024 or unit == "PiB":
             if unit == "B":
                 return f"{value:.0f} {unit}"
             return f"{value:.1f} {unit}"
@@ -321,6 +406,11 @@ class ErrorArgumentParser(argparse.ArgumentParser):
         kwargs["add_help"] = False
         kwargs.setdefault("formatter_class", CompactHelpFormatter)
         super().__init__(*args, **kwargs)
+        self.suggest_on_error = True
+        self.color = False
+
+    def add_version_argument(self) -> None:
+        self.add_argument("--version", action="version", version=f"Ninja Patch Tool v{VERSION}", help="Shows the Ninja Patch Tool version")
 
     def add_help_argument(self) -> None:
         self.add_argument("-h", "--help", action="help", help="Shows this help message")

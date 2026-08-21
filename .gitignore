@@ -1,12 +1,18 @@
 # Generated patches
 output/
 
+# Generated releases
+release/
+
 # Python cache
 __pycache__/
 *.py[cod]
 
 # Tool working directory
 temp/
+
+# Release build working directory
+release_temp/
 
 # Temporary files
 *.tmp
