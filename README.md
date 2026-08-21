@@ -18,7 +18,7 @@ The commands below use the release executables. When running from source, use th
 Add a clean, unmodified Steam manifest base to `data/index.json`.
 
 ```text
-add_base.exe path name manifest_id
+add_base path name manifest_id
 ```
 
 - `path` - Path to the clean Steam manifest base
@@ -28,15 +28,15 @@ add_base.exe path name manifest_id
 Example:
 
 ```bat
-add_base.exe "D:\WF\U43.5.1" U43.5.1 4895911296145320793
+add_base "D:\WF\U43.5.1" U43.5.1 4895911296145320793
 ```
 
 ## Verify a base
 
-Verify a Steam manifest base against its entry in `data/index.json`. This is optional before creating a patch because `make_patch.exe` verifies the selected base automatically.
+Verify a Steam manifest base against its entry in `data/index.json`. This is optional before creating a patch because `make_patch` verifies the selected base automatically.
 
 ```text
-verify_base.exe path name
+verify_base path name
 ```
 
 - `path` - Path to the Steam manifest base
@@ -49,7 +49,7 @@ Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam ma
 Before using an installation as `new`, fully download all language files and both DirectX 11 and DirectX 12 files in the Warframe Launcher, then open the launcher settings, click **Optimize**, and let the process finish. Close Warframe and the Warframe Launcher before creating the patch.
 
 ```text
-make_patch.exe base new output base_name [-c PRESET]
+make_patch base new output base_name [-c PRESET]
 ```
 
 - `base` - Clean indexed Steam manifest base
@@ -63,7 +63,7 @@ Compression presets: normal is the default. High and higher trade more time and 
 Example:
 
 ```bat
-make_patch.exe "D:\WF\U43.5.1" "D:\WF\U43.5.2" "U43.5.2.patch" U43.5.1
+make_patch "D:\WF\U43.5.1" "D:\WF\U43.5.2" "U43.5.2.patch" U43.5.1
 ```
 
 An existing patch is never overwritten automatically.
@@ -73,7 +73,7 @@ An existing patch is never overwritten automatically.
 Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate installation named after the patch is created.
 
 ```text
-apply_patch.exe base patch [-o OUTPUT | -i]
+apply_patch base patch [-o OUTPUT | -i]
 ```
 
 - `base` - Base installation
@@ -84,7 +84,7 @@ apply_patch.exe base patch [-o OUTPUT | -i]
 Example:
 
 ```bat
-apply_patch.exe "D:\WF\U43.5.1" "U43.5.2.patch"
+apply_patch "D:\WF\U43.5.1" "U43.5.2.patch"
 ```
 
 In-place mode creates a recovery backup before modifying the base. Interrupted operations are cleaned up or recovered automatically when possible.
