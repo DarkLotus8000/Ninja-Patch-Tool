@@ -70,7 +70,7 @@ An existing patch is never overwritten automatically.
 
 ## Apply a Ninja Patch (Diff Patch)
 
-Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate installation named after the patch is created.
+Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate installation is created next to the base, named after the patch.
 
 ```text
 apply_patch base patch [-o OUTPUT | -i]
@@ -78,7 +78,7 @@ apply_patch base patch [-o OUTPUT | -i]
 
 - `base` - Base installation
 - `patch` - Patch filename or path; `.patch` is appended automatically. A bare filename is looked up in the tool's `output` folder.
-- `-o, --output OUTPUT` - Create a separate installation at `OUTPUT`; if omitted, defaults to the patch filename (cannot be used with `--in-place`)
+- `-o, --output OUTPUT` - Create a separate installation at `OUTPUT`; if omitted, creates one next to the base named after the patch (cannot be used with `--in-place`)
 - `-i, --in-place` - Modify the base installation instead (cannot be used with `--output`)
 
 Example:
@@ -86,6 +86,8 @@ Example:
 ```bat
 apply_patch "D:\WF\U43.5.1" "U43.5.2.patch"
 ```
+
+Close Warframe and the Warframe Launcher before applying a patch, especially when using `--in-place`.
 
 In-place mode creates a recovery backup before modifying the base. Interrupted operations are cleaned up or recovered automatically when possible.
 

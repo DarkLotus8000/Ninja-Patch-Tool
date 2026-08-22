@@ -111,8 +111,11 @@ def _no_duplicate_keys(pairs):
         result[key] = value
     return result
 
+def _reject_nonfinite_json(value: str):
+    raise ValueError(f"Non-standard JSON constant is not allowed: {value}")
+
 def parse_json(data: str | bytes):
-    return json.loads(data, object_pairs_hook=_no_duplicate_keys)
+    return json.loads(data, object_pairs_hook=_no_duplicate_keys, parse_constant=_reject_nonfinite_json)
 
 def is_sha256(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
@@ -363,14 +366,17 @@ def format_bytes(size: int) -> str:
         value /= 1024
     raise AssertionError("unreachable")
 
-def warn_if_low_disk_space(path: Path, required_bytes: int, purpose: str) -> None:
-    if required_bytes <= 0:
-        return
+def disk_usage_probe(path: Path) -> Path:
     probe = path.resolve()
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
+    return probe
+
+def warn_if_low_disk_space(path: Path, required_bytes: int, purpose: str) -> None:
+    if required_bytes <= 0:
+        return
     try:
-        free = shutil.disk_usage(probe).free
+        free = shutil.disk_usage(disk_usage_probe(path)).free
     except OSError:
         return
     if free < required_bytes:
@@ -380,6 +386,32 @@ def warn_if_low_disk_space(path: Path, required_bytes: int, purpose: str) -> Non
             f"Estimated required: {format_bytes(required_bytes)}",
             file=sys.stderr,
         )
+
+def warn_if_low_disk_space_groups(requirements: list[tuple[Path, int, str]]) -> None:
+    grouped: dict[int, tuple[Path, int, list[str]]] = {}
+    for path, required_bytes, purpose in requirements:
+        if required_bytes <= 0:
+            continue
+        try:
+            key = disk_usage_probe(path).stat().st_dev
+        except OSError:
+            warn_if_low_disk_space(path, required_bytes, purpose)
+            continue
+
+        if key in grouped:
+            group_path, total, purposes = grouped[key]
+            if purpose not in purposes:
+                purposes.append(purpose)
+            grouped[key] = group_path, total + required_bytes, purposes
+        else:
+            grouped[key] = path, required_bytes, [purpose]
+
+    for path, required_bytes, purposes in grouped.values():
+        if len(purposes) == 1:
+            purpose = purposes[0]
+        else:
+            purpose = ", ".join(purposes[:-1]) + f" and {purposes[-1]}"
+        warn_if_low_disk_space(path, required_bytes, purpose)
 
 def format_duration(seconds: float) -> str:
     total_seconds = max(0, round(seconds))

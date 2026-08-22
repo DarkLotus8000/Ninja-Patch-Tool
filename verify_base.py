@@ -6,6 +6,7 @@ from pathlib import Path
 
 from common import (
     ErrorArgumentParser,
+    install_termination_handlers,
     load_index,
     operation_lock,
     resolve_base_name,
@@ -14,6 +15,7 @@ from common import (
 )
 
 def main() -> int:
+    install_termination_handlers()
     parser = ErrorArgumentParser(description="Verify a Steam manifest base against its entry in data/index.json.")
     parser.add_argument("path", type=Path, help="Path to the Steam manifest base")
     parser.add_argument("name", help="Indexed Warframe version, for example U43.5.1")
@@ -34,8 +36,7 @@ def main() -> int:
         canonical_name = resolve_base_name(index, args.name)
         expected = index[canonical_name]
 
-        print(f'Verifying base "{canonical_name}"...\n' "Calculating installation SHA-256...")
-
+        print(f'Verifying base "{canonical_name}"...\nCalculating installation SHA-256...')
         with operation_lock("installation", base, "operation using this installation"):
             files, actual_hash = scan_tree(base)
 
@@ -57,11 +58,12 @@ def main() -> int:
             f"SHA-256: {actual_hash}"
         )
         return 0
-
     except KeyError:
         print(f'ERROR: Base "{args.name}" is not present in data/index.json.', file=sys.stderr)
         return 1
-
+    except KeyboardInterrupt:
+        print("\nBase verification cancelled.", file=sys.stderr)
+        return 130
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

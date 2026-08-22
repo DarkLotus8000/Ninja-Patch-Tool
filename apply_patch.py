@@ -36,7 +36,8 @@ from common import (
     scan_tree,
     sha256_file,
     validate_warframe_installation,
-    warn_if_low_disk_space,
+    verify_scanned_tree,
+    warn_if_low_disk_space_groups,
 )
 
 HPATCHZ = DATA_DIR / "hpatchz.exe"
@@ -58,6 +59,12 @@ def read_archive_members(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]
             raise RuntimeError(f"Patch archive entry uses unsupported ZIP compression: {member.filename}")
         members[member.filename] = member
     return members
+
+def normalized_relative_path(relative_path: str) -> str:
+    return "/".join(relative_path_parts(relative_path))
+
+def casefold_relative_path(relative_path: str) -> str:
+    return normalized_relative_path(relative_path).casefold()
 
 def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> dict:
     if not isinstance(manifest, dict):
@@ -89,7 +96,7 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
     if not isinstance(manifest["operations"], list):
         raise RuntimeError("Patch manifest operations must be a list.")
 
-    seen_paths: set[str] = set()
+    seen_paths: dict[str, list[tuple[str, str]]] = {}
     seen_payloads: set[str] = set()
     added = 0
     removed = 0
@@ -104,14 +111,19 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
             raise RuntimeError(f"Patch operation {index} has an invalid type or path.")
 
         try:
-            canonical_path = "/".join(relative_path_parts(relative_path))
+            canonical_path = normalized_relative_path(relative_path)
         except ValueError as exc:
             raise RuntimeError(f"Patch operation {index} has an unsafe path: {relative_path!r}") from exc
 
         path_key = canonical_path.casefold()
-        if path_key in seen_paths:
-            raise RuntimeError(f"Patch contains more than one operation for: {relative_path}")
-        seen_paths.add(path_key)
+        path_group = seen_paths.setdefault(path_key, [])
+        if path_group:
+            candidate_group = path_group + [(operation_type, canonical_path)]
+            candidate_types = {kind for kind, _ in candidate_group}
+            candidate_paths = {path for _, path in candidate_group}
+            if len(candidate_group) != 2 or candidate_types != {"remove", "add"} or len(candidate_paths) != 2:
+                raise RuntimeError(f"Patch contains more than one operation for: {relative_path}")
+        path_group.append((operation_type, canonical_path))
 
         requires_old = operation_type in {"patch", "replace", "remove"}
         requires_new = operation_type in {"patch", "replace", "add"}
@@ -280,13 +292,35 @@ def apply_operations(
             action = "Added"
         print(f"[{action}] {display_relative_path(relative_path)}")
 
+def case_only_additions(operations: list[dict]) -> set[str]:
+    removed = {}
+    for operation in operations:
+        if operation["type"] != "remove":
+            continue
+        removed.setdefault(casefold_relative_path(operation["path"]), set()).add(operation["path"])
+
+    additions: set[str] = set()
+    for operation in operations:
+        if operation["type"] != "add":
+            continue
+        for removed_path in removed.get(casefold_relative_path(operation["path"]), set()):
+            if removed_path != operation["path"]:
+                additions.add(operation["path"])
+                break
+    return additions
+
 def backup_in_place(base: Path, backup: Path, operations: list[dict]) -> dict[str, bool]:
     existed: dict[str, bool] = {}
+    rename_additions = case_only_additions(operations)
     for operation in operations:
         relative = operation["path"]
         target = safe_join(base, relative)
-        existed[relative] = target.is_file()
-        if existed[relative]:
+        existed_now = target.is_file()
+        if operation["type"] == "add" and relative in rename_additions:
+            existed[relative] = False
+            continue
+        existed[relative] = existed_now
+        if existed_now:
             if "old_size" not in operation or "old_sha256" not in operation:
                 raise RuntimeError(f"Patch expects a new file, but an original file exists: {relative}")
             backup_path = safe_join(backup, relative)
@@ -613,12 +647,16 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
                     for operation in manifest["operations"]
                     if operation["type"] in {"patch", "replace", "remove"}
                 )
-                warn_if_low_disk_space(TEMP_ROOT, backup_estimate + largest_payload, "the in-place recovery backup and patch payload")
-                warn_if_low_disk_space(base, largest_temporary, "temporary in-place patch output")
+                warn_if_low_disk_space_groups([
+                    (TEMP_ROOT, backup_estimate + largest_payload, "the in-place recovery backup and patch payload"),
+                    (base, largest_temporary, "temporary in-place patch output"),
+                ])
             else:
                 base_estimate = sum(info["size"] for info in base_files.values())
-                warn_if_low_disk_space(destination.parent, base_estimate + largest_temporary, "the separate patched installation")
-                warn_if_low_disk_space(TEMP_ROOT, largest_payload, "temporary patch payload data")
+                warn_if_low_disk_space_groups([
+                    (destination.parent, base_estimate + largest_temporary, "the separate patched installation"),
+                    (TEMP_ROOT, largest_payload, "temporary patch payload data"),
+                ])
 
             work = make_work_dir("apply_patch")
             scratch = work / "payload"
@@ -637,6 +675,7 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
                 try:
                     existed = backup_in_place(base, backup, manifest["operations"])
                     write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, existed))
+                    verify_scanned_tree(base, base_files)
                 except BaseException:
                     keep_work = False
                     raise
@@ -663,7 +702,7 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
                         raise RuntimeError(
                             "Rollback could not be completed. The persistent recovery backup was kept at:\n"
                             f"{work}\n"
-                            "Run apply_patch.py again with the same base to retry recovery."
+                            "Run Apply Patch again with the same base to retry recovery."
                         ) from rollback_error
                     keep_work = False
                     print("Rollback completed successfully.\nThe original base installation has been restored.", file=sys.stderr)
@@ -713,7 +752,7 @@ def main() -> int:
     parser = ErrorArgumentParser(
         description=(
             "Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate "
-            "installation named after the patch is created."
+            "installation is created next to the base, named after the patch."
         )
     )
     parser.add_argument("base", type=Path, help="Base installation")
@@ -728,7 +767,7 @@ def main() -> int:
         "--output",
         type=Path,
         action=SingleUseStoreAction,
-        help="Create a separate installation at OUTPUT; if omitted, defaults to the patch filename (cannot be used with --in-place)",
+        help="Create a separate installation at OUTPUT; if omitted, creates one next to the base named after the patch (cannot be used with --in-place)",
     )
     mode.add_argument(
         "-i",

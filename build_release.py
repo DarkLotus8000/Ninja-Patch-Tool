@@ -60,8 +60,8 @@ def create_release_readme(markdown: str) -> str:
 
         line = clean_markdown_inline(line)
         for script in ENTRY_SCRIPTS:
-            executable = f"{Path(script).stem}.exe"
-            line = line.replace(f"py {script}", executable).replace(script, executable)
+            command = Path(script).stem
+            line = line.replace(f"py {script}", command).replace(script, command)
         if line == "- Python 3.14 (not required for release executables)":
             continue
         if line == "No packages need to be installed to run the tool from source. Building a release additionally requires PyInstaller.":
@@ -159,7 +159,7 @@ def validate_ico(path: Path) -> None:
         if size == 0 or offset < directory_end or offset + size > len(data):
             raise RuntimeError(f"Invalid ICO file: {path}")
 
-def validate_build_environment() -> tuple[list[Path], list[Path], Path]:
+def validate_build_environment() -> tuple[list[Path], list[Path]]:
     if sys.platform != "win32":
         raise RuntimeError("Releases must be built on Windows.")
     if struct.calcsize("P") != 8:
@@ -284,12 +284,30 @@ def smoke_test_executables(dist: Path) -> None:
     for script in ENTRY_SCRIPTS:
         executable = dist / f"{Path(script).stem}.exe"
         try:
-            result = subprocess.run([str(executable), "-h"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30)
+            help_result = subprocess.run(
+                [str(executable), "-h"],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            version_result = subprocess.run(
+                [str(executable), "--version"],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"Standalone executable smoke test timed out: {executable.name}") from exc
-        if result.returncode != 0 or "Shows this help message" not in result.stdout:
-            details = result.stderr.strip() or result.stdout.strip() or "No output was produced."
+        if help_result.returncode != 0 or "Shows this help message" not in help_result.stdout:
+            details = help_result.stderr.strip() or help_result.stdout.strip() or "No output was produced."
             raise RuntimeError(f"Standalone executable smoke test failed for {executable.name}:\n{details}")
+        if version_result.returncode != 0 or version_result.stdout.strip() != f"Ninja Patch Tool v{VERSION}":
+            details = version_result.stderr.strip() or version_result.stdout.strip() or "No output was produced."
+            raise RuntimeError(f"Standalone executable version test failed for {executable.name}:\n{details}")
 
 def populate_release(stage: Path, dist: Path, project_licenses: list[Path], hdiffpatch_licenses: list[Path]) -> None:
     stage.mkdir(parents=True)

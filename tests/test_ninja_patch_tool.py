@@ -47,6 +47,12 @@ class CommonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
             common.parse_json('{"a": 1, "a": 2}')
 
+    def test_nonstandard_json_constants_are_rejected(self) -> None:
+        for payload in ('{"value": NaN}', '{"value": Infinity}', '{"value": -Infinity}'):
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(ValueError, "Non-standard JSON constant"):
+                    common.parse_json(payload)
+
     def test_sha256_file_matches_hashlib(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "data.bin"
@@ -184,8 +190,9 @@ This should not be included.
 """
         readme = build_release.create_release_readme(markdown)
         self.assertIn(f"Version {build_release.VERSION}", readme)
-        self.assertIn("add_base.exe path name manifest_id", readme)
+        self.assertIn("add_base path name manifest_id", readme)
         self.assertNotIn("py add_base.py", readme)
+        self.assertNotIn("add_base.exe", readme)
         self.assertNotIn("Python installation", readme)
         self.assertNotIn("Build a release", readme)
         self.assertNotIn("PyInstaller", readme)
@@ -194,10 +201,10 @@ This should not be included.
 
     def test_project_readme_uses_release_executable_commands(self) -> None:
         readme = (build_release.ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("add_base.exe path name manifest_id", readme)
-        self.assertIn("verify_base.exe path name", readme)
-        self.assertIn("make_patch.exe base new output base_name [-c PRESET]", readme)
-        self.assertIn("apply_patch.exe base patch [-o OUTPUT | -i]", readme)
+        self.assertIn("add_base path name manifest_id", readme)
+        self.assertIn("verify_base path name", readme)
+        self.assertIn("make_patch base new output base_name [-c PRESET]", readme)
+        self.assertIn("apply_patch base patch [-o OUTPUT | -i]", readme)
         self.assertIn("When running from source, use the corresponding `.py` script with Python 3.14 instead.", readme)
         self.assertNotIn("py add_base.py path name manifest_id", readme)
         self.assertNotIn("py verify_base.py path name", readme)
@@ -370,12 +377,17 @@ This should not be included.
             calls: list[list[str]] = []
             def run(command, cwd, env, capture_output, text, timeout):
                 calls.append(command)
-                return SimpleNamespace(returncode=0, stdout="Shows this help message", stderr="")
+                if command[1:] == ["-h"]:
+                    return SimpleNamespace(returncode=0, stdout="Shows this help message", stderr="")
+                return SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{build_release.VERSION}\n", stderr="")
 
             with mock.patch.object(build_release.subprocess, "run", side_effect=run):
                 build_release.smoke_test_executables(dist)
-            self.assertEqual([Path(command[0]).name for command in calls], [f"{Path(script).stem}.exe" for script in build_release.ENTRY_SCRIPTS])
-            self.assertTrue(all(command[1:] == ["-h"] for command in calls))
+            expected = []
+            for script in build_release.ENTRY_SCRIPTS:
+                expected.append([f"{Path(script).stem}.exe", "-h"])
+                expected.append([f"{Path(script).stem}.exe", "--version"])
+            self.assertEqual([[Path(command[0]).name, *command[1:]] for command in calls], expected)
 
     def test_release_version_info_contains_explorer_fields(self) -> None:
         descriptions = {
@@ -734,13 +746,15 @@ class ApplyPatchTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "more than one operation"):
             apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json")})
 
-    def test_manifest_rejects_case_only_duplicate_paths(self) -> None:
-        first = {"type": "remove", "path": "Folder/File.bin", "old_size": 1, "old_sha256": "a" * 64}
-        second = {"type": "remove", "path": "folder/file.bin", "old_size": 1, "old_sha256": "b" * 64}
-        manifest = self.minimal_manifest(first, old_count=2, new_count=0)
-        manifest["operations"] = [first, second]
-        with self.assertRaisesRegex(RuntimeError, "more than one operation"):
-            apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json")})
+    def test_manifest_allows_case_only_rename_pair(self) -> None:
+        remove = {"type": "remove", "path": "Folder/File.bin", "old_size": 1, "old_sha256": "a" * 64}
+        add = {"type": "add", "path": "folder/file.bin", "payload": "files/payload.bin", "new_size": 1, "new_sha256": "b" * 64}
+        member = zipfile.ZipInfo("files/payload.bin")
+        member.file_size = 1
+        manifest = self.minimal_manifest(remove, old_count=1, new_count=1)
+        manifest["operations"] = [remove, add]
+        validated = apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json"), "files/payload.bin": member})
+        self.assertEqual(validated["operations"], [remove, add])
 
     def test_manifest_rejects_windows_reserved_target(self) -> None:
         operation = {"type": "remove", "path": "CON.txt", "old_size": 1, "old_sha256": "a" * 64}

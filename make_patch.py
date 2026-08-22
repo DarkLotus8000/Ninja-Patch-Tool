@@ -33,7 +33,7 @@ from common import (
     validate_warframe_installation,
     verify_scanned_file,
     verify_scanned_tree,
-    warn_if_low_disk_space,
+    warn_if_low_disk_space_groups,
 )
 
 HDIFFZ = DATA_DIR / "hdiffz.exe"
@@ -349,8 +349,10 @@ def main() -> int:
         candidate_overhead = largest_modified
         if args.compression == "maximum":
             candidate_overhead *= 2
-        warn_if_low_disk_space(TEMP_ROOT, payload_estimate + candidate_overhead, "temporary patch creation data")
-        warn_if_low_disk_space(output.parent, payload_estimate, "the final patch archive")
+        warn_if_low_disk_space_groups([
+            (TEMP_ROOT, payload_estimate + candidate_overhead, "temporary patch creation data"),
+            (output.parent, payload_estimate, "the final patch archive"),
+        ])
 
         work = make_work_dir("make_patch")
         write_make_session(work, output)
