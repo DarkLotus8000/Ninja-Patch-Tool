@@ -378,23 +378,30 @@ This should not be included.
             self.assertTrue(all(command[1:] == ["-h"] for command in calls))
 
     def test_release_version_info_contains_explorer_fields(self) -> None:
+        descriptions = {
+            "add_base.py": "Add Base - Ninja Patch Tool",
+            "verify_base.py": "Verify Base - Ninja Patch Tool",
+            "make_patch.py": "Make Patch - Ninja Patch Tool",
+            "apply_patch.py": "Apply Patch - Ninja Patch Tool",
+        }
         with tempfile.TemporaryDirectory() as tmp:
-            version_file = build_release.create_version_file(Path("make_patch.py"), Path(tmp))
-            text = version_file.read_text(encoding="utf-8")
-            compile(text, str(version_file), "eval")
-            expected = {
-                "CompanyName": "DarkLotus",
-                "FileDescription": "Ninja Patch Tool - Patch Creator",
-                "FileVersion": build_release.VERSION,
-                "InternalName": "make_patch",
-                "LegalCopyright": "Copyright © DarkLotus",
-                "OriginalFilename": "make_patch.exe",
-                "ProductName": "Ninja Patch Tool",
-                "ProductVersion": build_release.VERSION,
-            }
-            for key, value in expected.items():
-                self.assertIn(f"StringStruct('{key}', '{value}')", text)
-            self.assertIn("VarStruct('Translation', [1033, 1200])", text)
+            for script, description in descriptions.items():
+                version_file = build_release.create_version_file(Path(script), Path(tmp))
+                text = version_file.read_text(encoding="utf-8")
+                compile(text, str(version_file), "eval")
+                expected = {
+                    "CompanyName": "DarkLotus",
+                    "FileDescription": description,
+                    "FileVersion": build_release.VERSION,
+                    "InternalName": Path(script).stem,
+                    "LegalCopyright": "DarkLotus",
+                    "ProductName": "Ninja Patch Tool",
+                    "ProductVersion": build_release.VERSION,
+                }
+                for key, value in expected.items():
+                    self.assertIn(f"StringStruct('{key}', '{value}')", text)
+                self.assertNotIn("StringStruct('OriginalFilename'", text)
+                self.assertIn("VarStruct('Translation', [1033, 1200])", text)
 
     def test_release_output_is_checked_before_building(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -24,10 +24,10 @@ FAVICON = DATA_DIR / "favicon.ico"
 PYTHON_LICENSE = DATA_DIR / "Python_LICENSE.txt"
 ENTRY_SCRIPTS = ("add_base.py", "verify_base.py", "make_patch.py", "apply_patch.py")
 FILE_DESCRIPTIONS = {
-    "add_base.py": "Ninja Patch Tool - Base Indexer",
-    "verify_base.py": "Ninja Patch Tool - Base Verifier",
-    "make_patch.py": "Ninja Patch Tool - Patch Creator",
-    "apply_patch.py": "Ninja Patch Tool - Patch Applier",
+    "add_base.py": "Add Base - Ninja Patch Tool",
+    "verify_base.py": "Verify Base - Ninja Patch Tool",
+    "make_patch.py": "Make Patch - Ninja Patch Tool",
+    "apply_patch.py": "Apply Patch - Ninja Patch Tool",
 }
 RELEASE_DATA_FILES = ("index.json", "hdiffz.exe", "hpatchz.exe", "Python_LICENSE.txt")
 MIN_PYINSTALLER_VERSION = (6, 15, 0)
@@ -200,7 +200,6 @@ def validate_build_environment() -> tuple[list[Path], list[Path], Path]:
 
 def create_version_file(script: Path, destination: Path) -> Path:
     version = version_tuple()
-    executable = f"{script.stem}.exe"
     description = FILE_DESCRIPTIONS[script.name]
     version_file = destination / f"{script.stem}_version.txt"
     text = f"""VSVersionInfo(
@@ -223,8 +222,7 @@ def create_version_file(script: Path, destination: Path) -> Path:
                     StringStruct('FileDescription', '{description}'),
                     StringStruct('FileVersion', '{VERSION}'),
                     StringStruct('InternalName', '{script.stem}'),
-                    StringStruct('LegalCopyright', 'Copyright © {COMPANY_NAME}'),
-                    StringStruct('OriginalFilename', '{executable}'),
+                    StringStruct('LegalCopyright', '{COMPANY_NAME}'),
                     StringStruct('ProductName', '{PRODUCT_NAME}'),
                     StringStruct('ProductVersion', '{VERSION}')
                 ]
