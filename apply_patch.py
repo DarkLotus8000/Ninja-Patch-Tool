@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -21,6 +22,7 @@ from common import (
     display_relative_path,
     format_duration,
     install_termination_handlers,
+    is_ignored_file,
     is_nonnegative_int,
     is_sha256,
     is_steam_manifest_id,
@@ -31,11 +33,13 @@ from common import (
     process_is_running,
     relative_path_parts,
     resolve_patch_input,
+    root_sha256_from_files,
     run_child,
     safe_join,
     scan_tree,
     sha256_file,
     validate_warframe_installation,
+    verify_scanned_file,
     verify_scanned_tree,
     warn_if_low_disk_space_groups,
 )
@@ -46,6 +50,7 @@ RECOVERY_VERSION = 1
 RECOVERY_FILE = "recovery.json"
 MAX_MANIFEST_SIZE = 64 * 1024 * 1024
 SUPPORTED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+COPY_BUFFER_SIZE = 8 * 1024 * 1024
 
 def read_archive_members(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
     # Duplicate ZIP names are ambiguous, so reject them before reading the manifest or any payload.
@@ -196,6 +201,67 @@ def verify_file(path: Path, expected_size: int, expected_hash: str) -> None:
     if sha256_file(path).lower() != expected_hash.lower():
         raise RuntimeError(f"SHA-256 verification failed: {path}")
 
+def installation_size(root: Path) -> int:
+    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+
+def copy_verified_base(base: Path, destination: Path) -> tuple[dict[str, dict], str]:
+    # Separate-output mode hashes each tracked base file while copying it. This verifies the required base and creates
+    # the output in one read pass instead of hashing the whole base before copying it.
+    files: dict[str, dict] = {}
+
+    def copy_file(source_name: str, destination_name: str) -> str:
+        source = Path(source_name)
+        target = Path(destination_name)
+        if is_ignored_file(source):
+            return shutil.copy2(source, target)
+
+        before = source.stat()
+        digest = hashlib.sha256()
+        with source.open("rb") as input_file, target.open("wb") as output_file:
+            while chunk := input_file.read(COPY_BUFFER_SIZE):
+                digest.update(chunk)
+                if output_file.write(chunk) != len(chunk):
+                    raise RuntimeError(f"Could not completely copy base file: {source}")
+        shutil.copystat(source, target)
+        after = source.stat()
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            raise RuntimeError(f"Installation changed while it was being copied:\n{source}\nClose Warframe and the Warframe Launcher and try again.")
+
+        target_stat = target.stat()
+        if target_stat.st_size != after.st_size:
+            raise RuntimeError(f"Base copy size verification failed: {target}")
+        relative = source.relative_to(base).as_posix()
+        files[relative] = {"path": target, "size": target_stat.st_size, "sha256": digest.hexdigest(), "mtime_ns": target_stat.st_mtime_ns}
+        return str(target)
+
+    shutil.copytree(base, destination, copy_function=copy_file)
+    verify_scanned_tree(destination, files)
+    return files, root_sha256_from_files(files)
+
+def verify_operation_old_file(target: Path, operation: dict, tracked_files: dict[str, dict] | None) -> None:
+    if tracked_files is None:
+        verify_file(target, operation["old_size"], operation["old_sha256"])
+        return
+
+    relative = normalized_relative_path(operation["path"])
+    info = tracked_files.get(relative)
+    if info is None or info["size"] != operation["old_size"] or info["sha256"].lower() != operation["old_sha256"].lower():
+        raise RuntimeError(f"Patch old-file metadata does not match the verified base: {operation['path']}")
+    verify_scanned_file(info)
+
+def track_new_file(tracked_files: dict[str, dict] | None, operation: dict, target: Path) -> None:
+    if tracked_files is None:
+        return
+    current = target.stat()
+    if current.st_size != operation["new_size"]:
+        raise RuntimeError(f"Size verification failed after publishing patched file: {target}")
+    tracked_files[normalized_relative_path(operation["path"])] = {
+        "path": target,
+        "size": operation["new_size"],
+        "sha256": operation["new_sha256"],
+        "mtime_ns": current.st_mtime_ns,
+    }
+
 def prune_empty_parents(path: Path, root: Path) -> None:
     # This lets an update safely change a path from file -> directory or directory -> file without leaving empty old directories in the way.
     root = root.resolve()
@@ -237,17 +303,21 @@ def apply_operations(
     members: dict[str, zipfile.ZipInfo],
     scratch: Path,
     operations: list[dict],
+    tracked_files: dict[str, dict] | None = None,
 ) -> None:
     payload_file = scratch / "payload.hdiff"
 
     for operation in ordered_operations(operations):
         operation_type = operation["type"]
         relative_path = operation["path"]
+        normalized_path = normalized_relative_path(relative_path)
         target = safe_join(destination, relative_path)
 
         if operation_type == "remove":
-            verify_file(target, operation["old_size"], operation["old_sha256"])
+            verify_operation_old_file(target, operation, tracked_files)
             target.unlink()
+            if tracked_files is not None:
+                tracked_files.pop(normalized_path, None)
             prune_empty_parents(target.parent, destination)
             print(f"[Removed] {display_relative_path(relative_path)}")
             continue
@@ -257,7 +327,7 @@ def apply_operations(
             raise RuntimeError(f"Temporary output path unexpectedly exists: {temporary}")
 
         if operation_type == "patch":
-            verify_file(target, operation["old_size"], operation["old_sha256"])
+            verify_operation_old_file(target, operation, tracked_files)
             payload_file.unlink(missing_ok=True)
             copy_archive_member(archive, members, operation["payload"], payload_file)
 
@@ -267,6 +337,7 @@ def apply_operations(
                     raise RuntimeError(f"hpatchz failed with exit code {result}: {relative_path}")
                 verify_file(temporary, operation["new_size"], operation["new_sha256"])
                 os.replace(temporary, target)
+                track_new_file(tracked_files, operation, target)
             finally:
                 payload_file.unlink(missing_ok=True)
                 temporary.unlink(missing_ok=True)
@@ -275,7 +346,7 @@ def apply_operations(
             continue
 
         if operation_type == "replace":
-            verify_file(target, operation["old_size"], operation["old_sha256"])
+            verify_operation_old_file(target, operation, tracked_files)
         elif target.exists():
             raise RuntimeError(f"Patch expects a new file, but it already exists: {relative_path}")
 
@@ -283,6 +354,7 @@ def apply_operations(
             copy_archive_member(archive, members, operation["payload"], temporary)
             verify_file(temporary, operation["new_size"], operation["new_sha256"])
             os.replace(temporary, target)
+            track_new_file(tracked_files, operation, target)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -560,11 +632,17 @@ def apply_and_verify(
     members: dict[str, zipfile.ZipInfo],
     scratch: Path,
     manifest: dict,
+    tracked_files: dict[str, dict] | None = None,
 ) -> None:
     print("\nApplying patch...")
-    apply_operations(destination, archive, members, scratch, manifest["operations"])
+    apply_operations(destination, archive, members, scratch, manifest["operations"], tracked_files)
     print("\nVerifying final installation...")
-    if not tree_matches(destination, manifest["new_root_sha256"], manifest["new_file_count"]):
+    if tracked_files is None:
+        valid = tree_matches(destination, manifest["new_root_sha256"], manifest["new_file_count"])
+    else:
+        verify_scanned_tree(destination, tracked_files)
+        valid = len(tracked_files) == manifest["new_file_count"] and root_sha256_from_files(tracked_files).lower() == manifest["new_root_sha256"].lower()
+    if not valid:
         raise RuntimeError("Final installation verification failed.")
 
 def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool) -> int:
@@ -615,32 +693,30 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
         with zipfile.ZipFile(patch, "r") as archive:
             members = read_archive_members(archive)
             manifest = read_manifest(archive, members)
-            print(
-                f"Patch base: {manifest['base']}\n"
-                f"Steam manifest ID: {manifest['base_steam_manifest_id']}\n"
-                "Verifying current base installation..."
-            )
-            base_files, base_hash = scan_tree(base)
+            print(f"Patch base: {manifest['base']}\nSteam manifest ID: {manifest['base_steam_manifest_id']}")
 
-            if base_hash.lower() != manifest["old_root_sha256"].lower() or len(base_files) != manifest["old_file_count"]:
-                raise RuntimeError(
-                    "The supplied installation does not match the exact base required by this patch.\n"
-                    f"Expected files: {manifest['old_file_count']:,}\n"
-                    f"Actual files:   {len(base_files):,}\n"
-                    f"Expected SHA-256: {manifest['old_root_sha256']}\n"
-                    f"Actual SHA-256:   {base_hash}\n"
-                    "No files were changed."
-                )
+            if in_place:
+                print("Verifying current base installation...")
+                base_files, base_hash = scan_tree(base)
+                if base_hash.lower() != manifest["old_root_sha256"].lower() or len(base_files) != manifest["old_file_count"]:
+                    raise RuntimeError(
+                        "The supplied installation does not match the exact base required by this patch.\n"
+                        f"Expected files: {manifest['old_file_count']:,}\n"
+                        f"Actual files:   {len(base_files):,}\n"
+                        f"Expected SHA-256: {manifest['old_root_sha256']}\n"
+                        f"Actual SHA-256:   {base_hash}\n"
+                        "No files were changed."
+                    )
+                print(f'[Verified] Base "{manifest["base"]}" is valid.')
+            else:
+                base_files = None
+                print("Base verification will be performed while copying the installation.")
 
-            print(f'[Verified] Base "{manifest["base"]}" is valid.')
             largest_payload = max(
                 (members[operation["payload"]].file_size for operation in manifest["operations"] if "payload" in operation),
                 default=0,
             )
-            largest_temporary = max(
-                (operation.get("new_size", 0) for operation in manifest["operations"]),
-                default=0,
-            )
+            largest_temporary = max((operation.get("new_size", 0) for operation in manifest["operations"]), default=0)
             if in_place:
                 backup_estimate = sum(
                     operation.get("old_size", 0)
@@ -652,7 +728,7 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
                     (base, largest_temporary, "temporary in-place patch output"),
                 ])
             else:
-                base_estimate = sum(info["size"] for info in base_files.values())
+                base_estimate = installation_size(base)
                 warn_if_low_disk_space_groups([
                     (destination.parent, base_estimate + largest_temporary, "the separate patched installation"),
                     (TEMP_ROOT, largest_payload, "temporary patch payload data"),
@@ -699,14 +775,7 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
                         message = f"\nERROR: {patch_error}\nRolling back changes..."
                     print(message, file=sys.stderr)
                     try:
-                        restore_in_place(
-                            base,
-                            backup,
-                            manifest["operations"],
-                            existed,
-                            manifest["old_root_sha256"],
-                            manifest["old_file_count"],
-                        )
+                        restore_in_place(base, backup, manifest["operations"], existed, manifest["old_root_sha256"], manifest["old_file_count"])
                     except BaseException as rollback_error:
                         raise RuntimeError(
                             "Rollback could not be completed. The persistent recovery backup was kept at:\n"
@@ -721,10 +790,20 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
                 keep_work = True
                 write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest))
                 try:
-                    print(f"\nCreating separate installation:\n{destination}\nCopying base installation...")
-                    shutil.copytree(base, destination)
+                    print(f"\nCreating separate installation:\n{destination}\nCopying and verifying base installation...")
+                    copied_files, copied_hash = copy_verified_base(base, destination)
+                    if copied_hash.lower() != manifest["old_root_sha256"].lower() or len(copied_files) != manifest["old_file_count"]:
+                        raise RuntimeError(
+                            "The supplied installation does not match the exact base required by this patch.\n"
+                            f"Expected files: {manifest['old_file_count']:,}\n"
+                            f"Actual files:   {len(copied_files):,}\n"
+                            f"Expected SHA-256: {manifest['old_root_sha256']}\n"
+                            f"Actual SHA-256:   {copied_hash}\n"
+                            "The original base was not modified."
+                        )
+                    print(f'[Verified] Base "{manifest["base"]}" is valid.')
                     check_temporary_paths(destination, manifest["operations"])
-                    apply_and_verify(destination, archive, members, scratch, manifest)
+                    apply_and_verify(destination, archive, members, scratch, manifest, copied_files)
                     keep_work = False
                 except BaseException:
                     print(

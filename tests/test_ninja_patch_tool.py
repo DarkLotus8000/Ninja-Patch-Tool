@@ -60,6 +60,21 @@ class CommonTests(unittest.TestCase):
             path.write_bytes(data)
             self.assertEqual(common.sha256_file(path), hashlib.sha256(data).hexdigest())
 
+    def test_root_hash_helper_matches_scan_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "b.bin").write_bytes(b"b")
+            (root / "folder").mkdir()
+            (root / "folder" / "a.bin").write_bytes(b"a")
+            files, digest = common.scan_tree(root)
+            self.assertEqual(common.root_sha256_from_files(files), digest)
+
+    def test_root_hash_helper_normalizes_sha256_case(self) -> None:
+        files = {"a.bin": {"size": 1, "sha256": sha256_bytes(b"a")}}
+        expected = common.root_sha256_from_files(files)
+        files["a.bin"]["sha256"] = files["a.bin"]["sha256"].upper()
+        self.assertEqual(common.root_sha256_from_files(files), expected)
+
     def test_sha256_validation_is_strict(self) -> None:
         self.assertTrue(common.is_sha256("a" * 64))
         self.assertTrue(common.is_sha256("ABCDEF0123456789" * 4))
@@ -815,6 +830,74 @@ class ApplyPatchTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "SHA-256 verification failed|Size verification failed"):
                     apply_patch.backup_in_place(base, backup, [operation])
 
+    def test_separate_copy_verifies_base_while_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, destination = root / "base", root / "destination"
+            make_warframe_root(base)
+            (base / "Cache.Windows" / "data.bin").write_bytes(b"A" * 1024)
+            (base / "Launcher.exe").write_bytes(b"ignored but copied")
+            expected_files, expected_hash = common.scan_tree(base)
+
+            copied_files, copied_hash = apply_patch.copy_verified_base(base, destination)
+
+            self.assertEqual(copied_hash, expected_hash)
+            self.assertEqual(set(copied_files), set(expected_files))
+            self.assertEqual((destination / "Cache.Windows" / "data.bin").read_bytes(), b"A" * 1024)
+            self.assertEqual((destination / "Launcher.exe").read_bytes(), b"ignored but copied")
+            self.assertNotIn("Launcher.exe", copied_files)
+
+    def test_tracked_old_file_avoids_rehashing_copied_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination, scratch = root / "destination", root / "scratch"
+            destination.mkdir()
+            scratch.mkdir()
+            target = destination / "a.bin"
+            target.write_bytes(b"old")
+            stat = target.stat()
+            tracked = {
+                "a.bin": {"path": target, "size": 3, "sha256": sha256_bytes(b"old"), "mtime_ns": stat.st_mtime_ns}
+            }
+            operation = {
+                "type": "replace", "path": "a.bin", "payload": "files/new.bin",
+                "old_size": 3, "old_sha256": sha256_bytes(b"old"), "new_size": 3, "new_sha256": sha256_bytes(b"new"),
+            }
+            archive_path = root / "patch.zip"
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as output:
+                output.writestr("files/new.bin", b"new")
+            with zipfile.ZipFile(archive_path, "r") as archive:
+                members = apply_patch.read_archive_members(archive)
+                original_verify = apply_patch.verify_file
+                verified_paths: list[Path] = []
+
+                def record_verify(path: Path, expected_size: int, expected_hash: str) -> None:
+                    verified_paths.append(path)
+                    original_verify(path, expected_size, expected_hash)
+
+                with mock.patch.object(apply_patch, "verify_file", side_effect=record_verify):
+                    apply_patch.apply_operations(destination, archive, members, scratch, [operation], tracked)
+
+            self.assertEqual(target.read_bytes(), b"new")
+            self.assertNotIn(target, verified_paths)
+            self.assertEqual(tracked["a.bin"]["sha256"], sha256_bytes(b"new"))
+
+    def test_tracked_final_verification_does_not_rehash_full_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination, scratch = root / "destination", root / "scratch"
+            destination.mkdir()
+            scratch.mkdir()
+            target = destination / "unchanged.bin"
+            target.write_bytes(b"unchanged")
+            stat = target.stat()
+            tracked = {
+                "unchanged.bin": {"path": target, "size": 9, "sha256": sha256_bytes(b"unchanged"), "mtime_ns": stat.st_mtime_ns}
+            }
+            manifest = {"operations": [], "new_root_sha256": common.root_sha256_from_files(tracked), "new_file_count": 1}
+            with mock.patch.object(apply_patch, "tree_matches", side_effect=AssertionError("full rehash should not run")):
+                apply_patch.apply_and_verify(destination, mock.MagicMock(), {}, scratch, manifest, tracked)
+
     def test_in_place_backup_is_kept_if_base_changes_before_modification(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1032,6 +1115,7 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch.object(common, "TEMP_ROOT", temp_root),
                 mock.patch.object(apply_patch, "TEMP_ROOT", temp_root),
                 mock.patch.object(apply_patch, "HPATCHZ", hpatchz),
+                mock.patch.object(apply_patch, "scan_tree", side_effect=AssertionError("separate mode should not pre-hash the base")),
                 mock.patch.object(apply_patch, "run_child", side_effect=fake_hpatch),
                 mock.patch.object(apply_patch, "install_termination_handlers"),
             ):

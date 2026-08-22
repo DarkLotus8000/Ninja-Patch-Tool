@@ -53,6 +53,13 @@ def validate_warframe_installation(path: Path, label: str) -> bool:
 def natural_sort_key(value: str):
     return tuple((0, int(part)) if part.isdigit() else (1, part.casefold()) for part in re.split(r"(\d+)", value) if part)
 
+def root_sha256_from_files(files: dict[str, dict[str, Any]]) -> str:
+    root_hash = hashlib.sha256()
+    for relative in sorted(files):
+        info = files[relative]
+        root_hash.update(relative.encode("utf-8") + b"\0" + str(info["size"]).encode("ascii") + b"\0" + info["sha256"].lower().encode("ascii") + b"\n")
+    return root_hash.hexdigest()
+
 def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
     # The root hash uses each relative path, size, and file SHA-256. Filesystem enumeration order is not guaranteed,
     # so only the in-memory path list is sorted before hashing; no files are moved or modified.
@@ -62,7 +69,6 @@ def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
     )
     relative_paths = [path.relative_to(root).as_posix() for path in paths]
     files: dict[str, dict[str, Any]] = {}
-    root_hash = hashlib.sha256()
 
     for path, relative in zip(paths, relative_paths):
         before = path.stat()
@@ -71,11 +77,7 @@ def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
         if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
             raise RuntimeError(f"Installation changed while it was being scanned:\n{path}\nClose Warframe and the Warframe Launcher and try again.")
 
-        size = after.st_size
-        files[relative] = {"path": path, "size": size, "sha256": digest, "mtime_ns": after.st_mtime_ns}
-        root_hash.update(
-            relative.encode("utf-8") + b"\0" + str(size).encode("ascii") + b"\0" + digest.encode("ascii") + b"\n"
-        )
+        files[relative] = {"path": path, "size": after.st_size, "sha256": digest, "mtime_ns": after.st_mtime_ns}
 
     current_paths = sorted(
         path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and not is_ignored_file(path)
@@ -83,7 +85,7 @@ def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
     if current_paths != relative_paths:
         raise RuntimeError(f"Installation changed while it was being scanned:\n{root}\nClose Warframe and the Warframe Launcher and try again.")
 
-    return files, root_hash.hexdigest()
+    return files, root_sha256_from_files(files)
 
 def verify_scanned_file(info: dict[str, Any]) -> None:
     path = info["path"]
