@@ -49,7 +49,7 @@ SUPPORTED_VERSIONS = {1}
 RECOVERY_VERSION = 1
 RECOVERY_FILE = "recovery.json"
 MAX_MANIFEST_SIZE = 64 * 1024 * 1024
-SUPPORTED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+SUPPORTED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_LZMA}
 COPY_BUFFER_SIZE = 8 * 1024 * 1024
 
 def read_archive_members(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:

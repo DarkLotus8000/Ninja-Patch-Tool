@@ -2,7 +2,8 @@
 
 Ninja Patch Tool creates and applies self-contained Ninja Patches (Diff Patches) using HDiffPatch. Use Ninja Reverse Proxy (not published yet) instead when a normal Update Patch can be created; Ninja Patch Tool is intended as a fallback.
 
-A ***base*** is a clean, unmodified Warframe installation from a known Steam manifest. Select the Warframe installation root, where at least `Cache.Windows`, `Tools`, and `Warframe.x64.exe` are directly located. Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/depot/230411/manifests/).
+A ***base*** is a clean, unmodified Warframe installation from a known Steam manifest. Select the Warframe installation root, where at least `Cache.Windows`, `Tools`, and `Warframe.x64.exe` are directly located.
+Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/depot/230411/manifests/).
 
 ## Requirements
 
@@ -46,7 +47,8 @@ verify_base path name
 
 Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.
 
-Before using an installation as `new`, fully download all language files and both DirectX 11 and DirectX 12 files in the Warframe Launcher, then open the launcher settings, click **Optimize**, and let the process finish. Close Warframe and the Warframe Launcher before creating the patch.
+Before using an installation as `new`, fully download all language files and both DirectX 11 and DirectX 12 files in the Warframe Launcher, then open the launcher settings, click **Optimize**, and let the process finish.
+Close Warframe and the Warframe Launcher before creating the patch.
 
 ```text
 make_patch base new output base_name [-c PRESET]
@@ -57,8 +59,6 @@ make_patch base new output base_name [-c PRESET]
 - `output` - Patch filename or output path; `.patch` is appended automatically. A bare filename is saved in the tool's `output` folder.
 - `base_name` - Base name from `data/index.json`, for example `U43.5.1`
 - `-c, --compression PRESET` - Compression preset (default: `normal`): `normal`, `high`, `higher`, `maximum`
-
-Compression presets: normal is the default. High and higher trade more time and memory for potentially smaller patches. Maximum tries several matching strategies per modified file and can take much longer.
 
 Example:
 

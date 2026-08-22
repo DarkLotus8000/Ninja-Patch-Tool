@@ -91,7 +91,7 @@ class CommonTests(unittest.TestCase):
 
     def test_version_has_single_source(self) -> None:
         self.assertEqual(build_release.VERSION, common.VERSION)
-        self.assertEqual(common.VERSION, "1.0.0")
+        self.assertEqual(common.VERSION, "1.1.0")
 
     def test_argument_parser_uses_python_314_cli_improvements(self) -> None:
         parser = common.ErrorArgumentParser()
@@ -225,6 +225,12 @@ This should not be included.
         self.assertNotIn("py verify_base.py path name", readme)
         self.assertNotIn("py make_patch.py base new output base_name [-c PRESET]", readme)
         self.assertNotIn("py apply_patch.py base patch [-o OUTPUT | -i]", readme)
+        for technical in ("HDiff payloads", "DEFLATE", "LZMA", "ZIP compression"):
+            self.assertNotIn(technical, readme)
+
+        release_readme = build_release.create_release_readme(readme)
+        for technical in ("HDiff payloads", "DEFLATE", "LZMA", "ZIP compression"):
+            self.assertNotIn(technical, release_readme)
 
     def test_runtime_data_paths_are_centralized(self) -> None:
         self.assertEqual(common.DATA_DIR, common.TOOL_DIR / "data")
@@ -560,6 +566,42 @@ class MakePatchTests(unittest.TestCase):
             with zipfile.ZipFile(output, "r") as archive:
                 self.assertEqual(set(archive.namelist()), {"manifest.json", "diffs/a.hdiff", "files/b.bin"})
 
+    def test_patch_archive_member_compression_follows_preset(self) -> None:
+        expected = {
+            "normal": zipfile.ZIP_STORED,
+            "high": zipfile.ZIP_DEFLATED,
+            "higher": zipfile.ZIP_LZMA,
+            "maximum": zipfile.ZIP_LZMA,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            (work / "diffs").mkdir(parents=True)
+            (work / "files").mkdir()
+            (work / "manifest.json").write_text("{}", encoding="utf-8")
+            (work / "diffs" / "a.hdiff").write_bytes(b"already compressed delta")
+            (work / "files" / "b.bin").write_bytes(b"full file payload" * 1024)
+
+            for preset, full_file_compression in expected.items():
+                with self.subTest(preset=preset):
+                    output = root / f"{preset}.patch"
+                    make_patch.create_patch_archive(work, output, preset)
+                    with zipfile.ZipFile(output, "r") as archive:
+                        members = {member.filename: member for member in archive.infolist()}
+                    self.assertEqual(members["manifest.json"].compress_type, zipfile.ZIP_DEFLATED)
+                    self.assertEqual(members["diffs/a.hdiff"].compress_type, zipfile.ZIP_STORED)
+                    self.assertEqual(members["files/b.bin"].compress_type, full_file_compression)
+
+    def test_create_archive_refuses_unknown_compression_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            (work / "diffs").mkdir(parents=True)
+            (work / "files").mkdir()
+            (work / "manifest.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Unknown compression preset"):
+                make_patch.create_patch_archive(work, root / "test.patch", "impossible")
+
     def test_create_archive_refuses_preexisting_tmp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -747,6 +789,24 @@ class ApplyPatchTests(unittest.TestCase):
             with zipfile.ZipFile(patch, "r") as archive:
                 members = apply_patch.read_archive_members(archive)
                 self.assertEqual(members["manifest.json"].compress_type, zipfile.ZIP_DEFLATED)
+
+    def test_patch_archive_accepts_lzma_members(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            patch = Path(tmp) / "compressed.patch"
+            with zipfile.ZipFile(patch, "w", compression=zipfile.ZIP_LZMA) as archive:
+                archive.writestr("manifest.json", b"{}")
+            with zipfile.ZipFile(patch, "r") as archive:
+                members = apply_patch.read_archive_members(archive)
+                self.assertEqual(members["manifest.json"].compress_type, zipfile.ZIP_LZMA)
+
+    def test_patch_archive_rejects_unsupported_bzip2_members(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            patch = Path(tmp) / "unsupported.patch"
+            with zipfile.ZipFile(patch, "w", compression=zipfile.ZIP_BZIP2) as archive:
+                archive.writestr("manifest.json", b"{}")
+            with zipfile.ZipFile(patch, "r") as archive:
+                with self.assertRaisesRegex(RuntimeError, "unsupported ZIP compression"):
+                    apply_patch.read_archive_members(archive)
 
     def test_manifest_size_is_limited_before_reading(self) -> None:
         info = zipfile.ZipInfo("manifest.json")

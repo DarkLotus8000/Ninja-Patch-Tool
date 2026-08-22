@@ -59,6 +59,15 @@ MAXIMUM_STREAM_CANDIDATES = [["-s-1k"], ["-s-2k"], ["-s-4k"], ["-s-8k"], ["-s-16
 # at 1 GiB; normal intentionally keeps its proven -m-3 behavior.
 STREAM_MODE_THRESHOLD = 1024 * 1024 * 1024
 
+# The outer .patch ZIP container does not recompress .hdiff payloads because HDiffPatch already compresses them with LZMA2.
+# Full-file payloads use progressively stronger ZIP compression with higher presets.
+FULL_FILE_ZIP_COMPRESSION = {
+    "normal": (zipfile.ZIP_STORED, None),
+    "high": (zipfile.ZIP_DEFLATED, 9),
+    "higher": (zipfile.ZIP_LZMA, None),
+    "maximum": (zipfile.ZIP_LZMA, None),
+}
+
 def temporary_patch_path(output: Path) -> Path:
     return output.with_name(output.name + ".tmp")
 
@@ -213,7 +222,7 @@ def run_hdiff(old: Path, new: Path, output: Path, compression: str) -> None:
             candidate.unlink(missing_ok=True)
         raise
 
-def create_patch_archive(work: Path, output: Path) -> None:
+def create_patch_archive(work: Path, output: Path, compression: str = "normal") -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise FileExistsError(f"Patch output already exists: {output}")
@@ -224,13 +233,21 @@ def create_patch_archive(work: Path, output: Path) -> None:
 
     try:
         # Only patch-format files belong in the archive. In particular, session.json is local recovery metadata and
-        # must never leak into a distributed patch.
+        # must never leak into a distributed patch. HDiff payloads are already LZMA2-compressed, while complete-file
+        # payloads use the selected preset's ZIP compression.
+        try:
+            full_file_compression, full_file_compresslevel = FULL_FILE_ZIP_COMPRESSION[compression]
+        except KeyError:
+            raise ValueError(f"Unknown compression preset: {compression}") from None
+
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
-            archive.write(work / "manifest.json", "manifest.json")
-            for folder in ("diffs", "files"):
-                for path in sorted((work / folder).rglob("*")):
-                    if path.is_file():
-                        archive.write(path, path.relative_to(work).as_posix())
+            archive.write(work / "manifest.json", "manifest.json", compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+            for path in sorted((work / "diffs").rglob("*")):
+                if path.is_file():
+                    archive.write(path, path.relative_to(work).as_posix(), compress_type=zipfile.ZIP_STORED)
+            for path in sorted((work / "files").rglob("*")):
+                if path.is_file():
+                    archive.write(path, path.relative_to(work).as_posix(), compress_type=full_file_compression, compresslevel=full_file_compresslevel)
 
         if output.exists():
             raise FileExistsError(f"Patch output appeared while the patch was being created: {output}")
@@ -244,13 +261,7 @@ def create_patch_archive(work: Path, output: Path) -> None:
 
 def main() -> int:
     install_termination_handlers()
-    parser = ErrorArgumentParser(
-        description="Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.",
-        epilog=(
-            "Compression presets: normal is the default. High and higher trade more time and memory for potentially "
-            "smaller patches. Maximum tries several matching strategies per modified file and can take much longer."
-        ),
-    )
+    parser = ErrorArgumentParser(description="Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.")
     parser.add_argument("base", type=Path, help="Clean indexed Steam manifest base")
     parser.add_argument("new", type=Path, help="Newer installation")
     parser.add_argument(
@@ -448,7 +459,7 @@ def main() -> int:
         )
 
         print(f"\nCreating single patch file:\n{output}")
-        create_patch_archive(work, output)
+        create_patch_archive(work, output, args.compression)
         try:
             verify_scanned_tree(base, old_files)
             verify_scanned_tree(new, new_files)
