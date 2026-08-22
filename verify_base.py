@@ -39,7 +39,7 @@ def main() -> int:
         print(f'Verifying base "{canonical_name}"...\n' "Calculating installation SHA-256...")
 
         with operation_lock("installation", base, "operation using this installation"):
-            files, actual_hash = scan_tree(base)
+            files, actual_hash = scan_tree(base, "Hashing base")
 
         if actual_hash.lower() != expected["sha256"].lower() or len(files) != expected["file_count"]:
             print(

@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from common import (
+    ByteProgress,
     ErrorArgumentParser,
     SingleUseStoreAction,
     SingleUseStoreTrueAction,
@@ -30,7 +31,8 @@ from common import (
     make_work_dir,
     operation_lock,
     parse_json,
-    process_is_running,
+    process_identity,
+    process_matches_identity,
     relative_path_parts,
     resolve_patch_input,
     root_sha256_from_files,
@@ -45,8 +47,9 @@ from common import (
 )
 
 HPATCHZ = DATA_DIR / "hpatchz.exe"
-SUPPORTED_VERSIONS = {1}
-RECOVERY_VERSION = 1
+SUPPORTED_VERSIONS = {1, 2}
+RECOVERY_VERSION = 2
+SUPPORTED_RECOVERY_VERSIONS = {1, 2}
 RECOVERY_FILE = "recovery.json"
 MAX_MANIFEST_SIZE = 64 * 1024 * 1024
 SUPPORTED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_LZMA}
@@ -119,6 +122,9 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
             canonical_path = normalized_relative_path(relative_path)
         except ValueError as exc:
             raise RuntimeError(f"Patch operation {index} has an unsafe path: {relative_path!r}") from exc
+
+        if is_ignored_file(Path(canonical_path)):
+            raise RuntimeError(f"Patch operation {index} targets a file Ninja Patch Tool intentionally ignores: {relative_path}")
 
         path_key = canonical_path.casefold()
         path_group = seen_paths.setdefault(path_key, [])
@@ -204,16 +210,19 @@ def verify_file(path: Path, expected_size: int, expected_hash: str) -> None:
 def installation_size(root: Path) -> int:
     return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
 
-def copy_verified_base(base: Path, destination: Path) -> tuple[dict[str, dict], str]:
+def copy_verified_base(base: Path, destination: Path, total_size: int | None = None) -> tuple[dict[str, dict], str]:
     # Separate-output mode hashes each tracked base file while copying it. This verifies the required base and creates
     # the output in one read pass instead of hashing the whole base before copying it.
     files: dict[str, dict] = {}
+    progress = ByteProgress("Copying and verifying base", installation_size(base) if total_size is None else total_size)
 
     def copy_file(source_name: str, destination_name: str) -> str:
         source = Path(source_name)
         target = Path(destination_name)
         if is_ignored_file(source):
-            return shutil.copy2(source, target)
+            result = shutil.copy2(source, target)
+            progress.update(source.stat().st_size)
+            return result
 
         before = source.stat()
         digest = hashlib.sha256()
@@ -222,6 +231,7 @@ def copy_verified_base(base: Path, destination: Path) -> tuple[dict[str, dict], 
                 digest.update(chunk)
                 if output_file.write(chunk) != len(chunk):
                     raise RuntimeError(f"Could not completely copy base file: {source}")
+                progress.update(len(chunk))
         shutil.copystat(source, target)
         after = source.stat()
         if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
@@ -235,6 +245,7 @@ def copy_verified_base(base: Path, destination: Path) -> tuple[dict[str, dict], 
         return str(target)
 
     shutil.copytree(base, destination, copy_function=copy_file)
+    progress.finish()
     verify_scanned_tree(destination, files)
     return files, root_sha256_from_files(files)
 
@@ -384,6 +395,7 @@ def case_only_additions(operations: list[dict]) -> set[str]:
 def backup_in_place(base: Path, backup: Path, operations: list[dict]) -> dict[str, bool]:
     existed: dict[str, bool] = {}
     rename_additions = case_only_additions(operations)
+    progress = ByteProgress("Creating recovery backup", sum(operation.get("old_size", 0) for operation in operations))
     for operation in operations:
         relative = operation["path"]
         target = safe_join(base, relative)
@@ -397,8 +409,25 @@ def backup_in_place(base: Path, backup: Path, operations: list[dict]) -> dict[st
                 raise RuntimeError(f"Patch expects a new file, but an original file exists: {relative}")
             backup_path = safe_join(backup, relative)
             backup_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target, backup_path)
+            before = target.stat()
+            digest = hashlib.sha256()
+            with target.open("rb") as input_file, backup_path.open("wb") as output_file:
+                while chunk := input_file.read(COPY_BUFFER_SIZE):
+                    digest.update(chunk)
+                    if output_file.write(chunk) != len(chunk):
+                        raise RuntimeError(f"Could not completely copy recovery file: {target}")
+                    progress.update(len(chunk))
+            shutil.copystat(target, backup_path)
+            after = target.stat()
+            if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+                raise RuntimeError(f"Installation changed while the recovery backup was being created:\n{target}")
+            if after.st_size != operation["old_size"] or digest.hexdigest().lower() != operation["old_sha256"].lower():
+                raise RuntimeError(f"Recovery backup source verification failed: {target}")
+            backup_stat = backup_path.stat()
+            if backup_stat.st_size != operation["old_size"]:
+                raise RuntimeError(f"Recovery backup size verification failed: {backup_path}")
             verify_file(backup_path, operation["old_size"], operation["old_sha256"])
+    progress.finish()
     return existed
 
 def rollback_in_place(base: Path, backup: Path, operations: list[dict], existed: dict[str, bool]) -> None:
@@ -437,7 +466,7 @@ def write_recovery_state(work: Path, state: dict) -> None:
     # replacement so abrupt termination can be repaired on the next run.
     recovery = work / RECOVERY_FILE
     temporary = recovery.with_name(recovery.name + ".tmp")
-    state = {"recovery_version": RECOVERY_VERSION, "pid": os.getpid(), **state}
+    state = {"recovery_version": RECOVERY_VERSION, "pid": os.getpid(), "process_identity": process_identity(os.getpid()), **state}
 
     with temporary.open("w", encoding="utf-8", newline="\n") as output:
         json.dump(state, output, indent=2, ensure_ascii=False)
@@ -452,10 +481,13 @@ def make_recovery_state(
     destination: Path,
     patch: Path,
     manifest: dict,
+    phase: str,
     existed: dict[str, bool] | None = None,
+    working_destination: Path | None = None,
 ) -> dict:
     state = {
         "mode": mode,
+        "phase": phase,
         "base": str(base),
         "destination": str(destination),
         "patch": str(patch),
@@ -467,6 +499,8 @@ def make_recovery_state(
     if mode == "in_place":
         state["operations"] = manifest["operations"]
         state["existed"] = existed or {}
+    elif working_destination is not None:
+        state["working_destination"] = str(working_destination)
     return state
 
 def recovery_matches_manifest(state: dict, manifest: dict) -> bool:
@@ -475,8 +509,8 @@ def recovery_matches_manifest(state: dict, manifest: dict) -> bool:
         for key in ("old_root_sha256", "new_root_sha256", "old_file_count", "new_file_count")
     )
 
-def tree_matches(root: Path, expected_hash: str, expected_count: int) -> bool:
-    files, root_hash = scan_tree(root)
+def tree_matches(root: Path, expected_hash: str, expected_count: int, progress_label: str | None = None) -> bool:
+    files, root_hash = scan_tree(root, progress_label)
     return root_hash.lower() == expected_hash.lower() and len(files) == expected_count
 
 @contextmanager
@@ -504,13 +538,28 @@ def restore_in_place(
 ) -> None:
     with protected_cleanup():
         rollback_in_place(base, backup, operations, existed)
-        if not tree_matches(base, old_root_sha256, old_file_count):
+        if not tree_matches(base, old_root_sha256, old_file_count, "Verifying restored base"):
             raise RuntimeError("Rollback failed: the original base could not be fully restored.")
 
 def remove_incomplete_output(destination: Path) -> bool:
     with protected_cleanup():
         shutil.rmtree(destination, ignore_errors=True)
     return not destination.exists()
+
+def separate_working_destination(destination: Path, work: Path) -> Path:
+    token = work.name.removeprefix("apply_patch_")
+    return destination.with_name(f".{destination.name}.npt-{token}.tmp")
+
+def publish_output_directory(working_destination: Path, destination: Path) -> None:
+    if destination.exists():
+        raise FileExistsError(f"Output path appeared while the patch was being applied:\n{destination}")
+    try:
+        # Windows directory rename is atomic on the same volume and refuses to replace an existing destination.
+        working_destination.rename(destination)
+    except OSError as exc:
+        if destination.exists():
+            raise FileExistsError(f"Output path appeared while the patch was being applied:\n{destination}") from exc
+        raise
 
 def recover_interrupted_operations(base: Path, destination: Path) -> dict | None:
     # Recovery records exist only when an apply operation may need cleanup. Recovery runs before normal patch
@@ -531,7 +580,7 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
             continue
 
         recovery_version = state.get("recovery_version") if isinstance(state, dict) else None
-        if not isinstance(recovery_version, int) or isinstance(recovery_version, bool) or recovery_version != RECOVERY_VERSION:
+        if not isinstance(recovery_version, int) or isinstance(recovery_version, bool) or recovery_version not in SUPPORTED_RECOVERY_VERSIONS:
             print(f"WARNING: Unsupported recovery state:\n{recovery}\nThe folder was left untouched.", file=sys.stderr)
             continue
 
@@ -549,26 +598,34 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
             continue
 
         pid = state.get("pid")
-        if isinstance(pid, int) and pid != os.getpid() and process_is_running(pid):
-            raise RuntimeError(
-                "Another apply_patch operation appears to still be running for this base/output.\n"
-                f"Recovery state: {recovery}"
-            )
+        if isinstance(pid, int) and pid != os.getpid() and process_matches_identity(pid, state.get("process_identity")):
+            raise RuntimeError("Another Apply Patch operation appears to still be running for this base/output.\n" f"Recovery state: {recovery}")
 
         old_hash, new_hash = state.get("old_root_sha256"), state.get("new_root_sha256")
         old_count, new_count = state.get("old_file_count"), state.get("new_file_count")
-        if (
-            not is_sha256(old_hash)
-            or not is_sha256(new_hash)
-            or not is_nonnegative_int(old_count)
-            or not is_nonnegative_int(new_count)
-        ):
+        if not is_sha256(old_hash) or not is_sha256(new_hash) or not is_nonnegative_int(old_count) or not is_nonnegative_int(new_count):
             raise RuntimeError(f"Interrupted patch recovery data is invalid.\nRecovery state: {recovery}")
 
+        phase = state.get("phase") if recovery_version >= 2 else "applying"
         print("\n[Recovery] Interrupted patch application detected.")
 
         if mode == "in_place":
+            if phase not in {"preparing", "prepared", "applying"}:
+                raise RuntimeError(f"Interrupted patch recovery data contains an unknown phase: {phase!r}\nRecovery state: {recovery}")
             print("Checking the current base before recovery...")
+            if tree_matches(base, old_hash, old_count):
+                print("[Recovery] The original base is already intact.")
+                cleanup_work_dir(work)
+                continue
+
+            if phase in {"preparing", "prepared"}:
+                backup_description = "partial recovery data" if phase == "preparing" else "the verified recovery backup"
+                raise RuntimeError(
+                    "The base changed before Ninja Patch Tool started modifying it, so automatic rollback was intentionally skipped.\n"
+                    f"{backup_description.capitalize()} was kept at:\n{work}\n"
+                    "Do not delete this folder if the base was changed or deleted unexpectedly."
+                )
+
             if tree_matches(base, new_hash, new_count):
                 print("[Recovery] The in-place patch had already completed successfully.")
                 cleanup_work_dir(work)
@@ -576,18 +633,13 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
                     raise RuntimeError("More than one completed recovery state with different patch identities was found for this base.")
                 completed_state = state
                 continue
-            if tree_matches(base, old_hash, old_count):
-                print("[Recovery] The original base is already intact.")
-                cleanup_work_dir(work)
-                continue
 
             operations, existed = state.get("operations"), state.get("existed")
             backup = work / "backup"
             if not isinstance(operations, list) or not isinstance(existed, dict) or not backup.is_dir():
                 raise RuntimeError(
                     "Interrupted in-place patch requires recovery, but its backup data is incomplete.\n"
-                    f"Recovery folder: {work}\n"
-                    "Do not delete this folder."
+                    f"Recovery folder: {work}\nDo not delete this folder."
                 )
 
             print("Restoring the original base from the recovery backup...")
@@ -597,28 +649,69 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
             continue
 
         if mode == "separate":
-            if not recovery_destination.exists():
-                print("[Recovery] The interrupted output no longer exists.")
+            if recovery_version == 1:
+                # Compatibility with recovery state written by Ninja Patch Tool <=1.1.0, which built directly at the final destination.
+                if not recovery_destination.exists():
+                    print("[Recovery] The interrupted output no longer exists.")
+                    cleanup_work_dir(work)
+                    continue
+                print("Checking the interrupted output installation...")
+                if tree_matches(recovery_destination, new_hash, new_count):
+                    print("[Recovery] The previous output had already completed successfully.")
+                    cleanup_work_dir(work)
+                    if completed_state is not None and not recovery_matches_manifest(completed_state, state):
+                        raise RuntimeError("More than one completed recovery state with different patch identities was found for this base/output.")
+                    completed_state = state
+                    continue
+                print("Removing the incomplete output installation...")
+                if not remove_incomplete_output(recovery_destination):
+                    raise RuntimeError(f"Could not remove the incomplete output installation.\nOutput: {recovery_destination}\nRecovery folder: {work}")
+                print("[Recovery] Incomplete output removed successfully.")
                 cleanup_work_dir(work)
                 continue
 
-            print("Checking the interrupted output installation...")
-            if tree_matches(recovery_destination, new_hash, new_count):
-                print("[Recovery] The previous output had already completed successfully.")
+            raw_working = state.get("working_destination")
+            if not isinstance(raw_working, str):
+                raise RuntimeError(f"Interrupted separate-output recovery data is invalid.\nRecovery state: {recovery}")
+            working_destination = Path(raw_working).resolve()
+            if working_destination != separate_working_destination(recovery_destination, work).resolve():
+                raise RuntimeError(f"Interrupted separate-output recovery data contains an unexpected temporary output path.\nRecovery state: {recovery}")
+
+            if recovery_destination.exists():
+                if tree_matches(recovery_destination, new_hash, new_count):
+                    print("[Recovery] The previous output had already completed successfully.")
+                    if working_destination.exists():
+                        remove_incomplete_output(working_destination)
+                    cleanup_work_dir(work)
+                    if completed_state is not None and not recovery_matches_manifest(completed_state, state):
+                        raise RuntimeError("More than one completed recovery state with different patch identities was found for this base/output.")
+                    completed_state = state
+                    continue
+                raise RuntimeError(
+                    "The final output path exists but cannot be identified as Ninja Patch Tool's completed output, so it was left untouched.\n"
+                    f"Output: {recovery_destination}\nRecovery folder: {work}"
+                )
+
+            if not working_destination.exists():
+                print("[Recovery] The interrupted temporary output no longer exists.")
+                cleanup_work_dir(work)
+                continue
+
+            print("Checking the interrupted temporary output installation...")
+            if tree_matches(working_destination, new_hash, new_count):
+                print("Publishing the already completed temporary output...")
+                publish_output_directory(working_destination, recovery_destination)
+                print("[Recovery] Previous output published successfully.")
                 cleanup_work_dir(work)
                 if completed_state is not None and not recovery_matches_manifest(completed_state, state):
                     raise RuntimeError("More than one completed recovery state with different patch identities was found for this base/output.")
                 completed_state = state
                 continue
 
-            print("Removing the incomplete output installation...")
-            if not remove_incomplete_output(recovery_destination):
-                raise RuntimeError(
-                    "Could not remove the incomplete output installation.\n"
-                    f"Output: {recovery_destination}\n"
-                    f"Recovery folder: {work}"
-                )
-            print("[Recovery] Incomplete output removed successfully.")
+            print("Removing the incomplete temporary output installation...")
+            if not remove_incomplete_output(working_destination):
+                raise RuntimeError(f"Could not remove the incomplete temporary output.\nOutput: {working_destination}\nRecovery folder: {work}")
+            print("[Recovery] Incomplete temporary output removed successfully.")
             cleanup_work_dir(work)
             continue
 
@@ -633,17 +726,24 @@ def apply_and_verify(
     scratch: Path,
     manifest: dict,
     tracked_files: dict[str, dict] | None = None,
-) -> None:
+) -> tuple[float, float]:
     print("\nApplying patch...")
+    patch_started = time.perf_counter()
     apply_operations(destination, archive, members, scratch, manifest["operations"], tracked_files)
+    patch_duration = time.perf_counter() - patch_started
+
     print("\nVerifying final installation...")
+    verify_started = time.perf_counter()
     if tracked_files is None:
-        valid = tree_matches(destination, manifest["new_root_sha256"], manifest["new_file_count"])
+        valid = tree_matches(destination, manifest["new_root_sha256"], manifest["new_file_count"], "Hashing final installation")
     else:
         verify_scanned_tree(destination, tracked_files)
         valid = len(tracked_files) == manifest["new_file_count"] and root_sha256_from_files(tracked_files).lower() == manifest["new_root_sha256"].lower()
+    verification_duration = time.perf_counter() - verify_started
     if not valid:
         raise RuntimeError("Final installation verification failed.")
+    print(f"Patch operations: {format_duration(patch_duration)}\nFinal verification: {format_duration(verification_duration)}")
+    return patch_duration, verification_duration
 
 def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool) -> int:
     try:
@@ -697,7 +797,7 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
 
             if in_place:
                 print("Verifying current base installation...")
-                base_files, base_hash = scan_tree(base)
+                base_files, base_hash = scan_tree(base, "Hashing base")
                 if base_hash.lower() != manifest["old_root_sha256"].lower() or len(base_files) != manifest["old_file_count"]:
                     raise RuntimeError(
                         "The supplied installation does not match the exact base required by this patch.\n"
@@ -744,19 +844,19 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
                 backup.mkdir()
                 print("\n--in-place was specified.\nCreating and verifying a temporary backup before modifying the base...")
 
-                # Write recovery before the potentially long backup. If the process is killed during backup the base
-                # is still unchanged, so the next run can safely discard the partial backup.
                 keep_work = True
-                write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest))
+                write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "preparing"))
                 try:
                     existed = backup_in_place(base, backup, manifest["operations"])
-                except BaseException:
-                    keep_work = False
-                    raise
-
+                    write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "prepared", existed))
+                except BaseException as exc:
+                    raise RuntimeError(
+                        "In-place recovery preparation failed before any patch changes were made. Recovery data was kept at:\n"
+                        f"{work}"
+                    ) from exc
                 try:
-                    write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, existed))
                     verify_scanned_tree(base, base_files)
+                    write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "applying", existed))
                 except BaseException as exc:
                     raise RuntimeError(
                         "The base changed or recovery metadata could not be finalized after the in-place backup was created.\n"
@@ -787,11 +887,17 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
                     raise
 
             else:
+                working_destination = separate_working_destination(destination, work)
+                if working_destination.exists():
+                    raise RuntimeError(f"Temporary output path unexpectedly exists:\n{working_destination}")
                 keep_work = True
-                write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest))
+                write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "copying", working_destination=working_destination))
                 try:
                     print(f"\nCreating separate installation:\n{destination}\nCopying and verifying base installation...")
-                    copied_files, copied_hash = copy_verified_base(base, destination)
+                    copy_started = time.perf_counter()
+                    copied_files, copied_hash = copy_verified_base(base, working_destination, base_estimate)
+                    copy_duration = time.perf_counter() - copy_started
+                    print(f"Copy and base verification: {format_duration(copy_duration)}")
                     if copied_hash.lower() != manifest["old_root_sha256"].lower() or len(copied_files) != manifest["old_file_count"]:
                         raise RuntimeError(
                             "The supplied installation does not match the exact base required by this patch.\n"
@@ -802,20 +908,23 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
                             "The original base was not modified."
                         )
                     print(f'[Verified] Base "{manifest["base"]}" is valid.')
-                    check_temporary_paths(destination, manifest["operations"])
-                    apply_and_verify(destination, archive, members, scratch, manifest, copied_files)
+                    check_temporary_paths(working_destination, manifest["operations"])
+                    write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "applying", working_destination=working_destination))
+                    apply_and_verify(working_destination, archive, members, scratch, manifest, copied_files)
+                    write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "publishing", working_destination=working_destination))
+                    publish_output_directory(working_destination, destination)
                     keep_work = False
                 except BaseException:
                     print(
-                        "\nPatch interrupted or failed. Removing the incomplete output installation...\n"
-                        "The original base was not modified.",
+                        "\nPatch interrupted or failed. Removing Ninja Patch Tool's incomplete temporary output...\n"
+                        "The original base and any unrelated final output were not modified.",
                         file=sys.stderr,
                     )
-                    if remove_incomplete_output(destination):
+                    if remove_incomplete_output(working_destination):
                         keep_work = False
                     else:
                         print(
-                            "WARNING: The incomplete output could not be removed completely. Recovery data was kept at:\n"
+                            "WARNING: The incomplete temporary output could not be removed completely. Recovery data was kept at:\n"
                             f"{work}",
                             file=sys.stderr,
                         )

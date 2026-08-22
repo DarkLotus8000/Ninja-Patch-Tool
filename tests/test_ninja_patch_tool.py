@@ -35,12 +35,17 @@ def tree_identity(root: Path) -> tuple[str, int]:
     files, digest = common.scan_tree(root)
     return digest, len(files)
 
-def write_recovery(work: Path, state: dict) -> None:
+def tracked_info(path: Path) -> dict:
+    stat = path.stat()
+    return {"path": path, "size": stat.st_size, "sha256": common.sha256_file(path), "mtime_ns": stat.st_mtime_ns}
+
+def write_recovery(work: Path, state: dict, recovery_version: int | None = None) -> None:
     work.mkdir(parents=True, exist_ok=True)
-    (work / apply_patch.RECOVERY_FILE).write_text(
-        json.dumps({"recovery_version": apply_patch.RECOVERY_VERSION, "pid": -1, **state}),
-        encoding="utf-8",
-    )
+    version = apply_patch.RECOVERY_VERSION if recovery_version is None else recovery_version
+    data = {"recovery_version": version, "pid": -1, **state}
+    if version >= 2 and "phase" not in data:
+        data["phase"] = "applying"
+    (work / apply_patch.RECOVERY_FILE).write_text(json.dumps(data), encoding="utf-8")
 
 class CommonTests(unittest.TestCase):
     def test_duplicate_json_keys_are_rejected(self) -> None:
@@ -91,7 +96,13 @@ class CommonTests(unittest.TestCase):
 
     def test_version_has_single_source(self) -> None:
         self.assertEqual(build_release.VERSION, common.VERSION)
-        self.assertEqual(common.VERSION, "1.1.0")
+        self.assertEqual(common.VERSION, "1.2.0")
+
+    def test_process_identity_prevents_pid_reuse_false_positive(self) -> None:
+        with mock.patch.object(common, "process_is_running", return_value=True), mock.patch.object(common, "process_identity", return_value="123:new"):
+            self.assertFalse(common.process_matches_identity(123, "123:old"))
+            self.assertTrue(common.process_matches_identity(123, "123:new"))
+            self.assertTrue(common.process_matches_identity(123, None))
 
     def test_argument_parser_uses_python_314_cli_improvements(self) -> None:
         parser = common.ErrorArgumentParser()
@@ -388,6 +399,20 @@ This should not be included.
             self.assertEqual(environments[0]["TMP"], str(dist.parent))
             self.assertEqual(environments[0]["PYINSTALLER_CONFIG_DIR"], str(dist.parent / "pyinstaller_config"))
 
+    def test_release_builder_runs_source_tests_with_deprecation_warnings_as_errors(self) -> None:
+        result = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(build_release.subprocess, "run", return_value=result) as run:
+            build_release.run_source_tests()
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], [sys.executable, "-W", "error::DeprecationWarning"])
+        self.assertEqual(command[3:], ["-m", "unittest", "discover", "-s", "tests"])
+
+    def test_release_builder_stops_when_source_tests_fail(self) -> None:
+        result = SimpleNamespace(returncode=1, stdout="failure", stderr="")
+        with mock.patch.object(build_release.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "Source test suite failed"):
+                build_release.run_source_tests()
+
     def test_release_smoke_tests_all_executables(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp) / "dist"
@@ -546,7 +571,7 @@ class MakePatchTests(unittest.TestCase):
             partial = make_patch.temporary_patch_path(output)
             partial.write_bytes(b"partial")
             (work / make_patch.MAKE_SESSION_FILE).write_text(json.dumps({"pid": 123, "output": str(output)}), encoding="utf-8")
-            with mock.patch.object(make_patch, "TEMP_ROOT", temp_root), mock.patch.object(make_patch, "process_is_running", return_value=False):
+            with mock.patch.object(make_patch, "TEMP_ROOT", temp_root), mock.patch.object(make_patch, "process_matches_identity", return_value=False):
                 make_patch.cleanup_stale_make_patch_work(output)
             self.assertFalse(partial.exists())
             self.assertFalse(work.exists())
@@ -556,13 +581,13 @@ class MakePatchTests(unittest.TestCase):
             root = Path(tmp)
             work = root / "work"
             (work / "diffs").mkdir(parents=True)
-            (work / "files").mkdir()
             (work / "manifest.json").write_text("{}", encoding="utf-8")
             (work / "session.json").write_text("secret", encoding="utf-8")
             (work / "diffs" / "a.hdiff").write_bytes(b"diff")
-            (work / "files" / "b.bin").write_bytes(b"file")
+            source = root / "full.bin"
+            source.write_bytes(b"file")
             output = root / "test.patch"
-            make_patch.create_patch_archive(work, output)
+            make_patch.create_patch_archive(work, output, "normal", {"files/b.bin": tracked_info(source)})
             with zipfile.ZipFile(output, "r") as archive:
                 self.assertEqual(set(archive.namelist()), {"manifest.json", "diffs/a.hdiff", "files/b.bin"})
 
@@ -577,43 +602,63 @@ class MakePatchTests(unittest.TestCase):
             root = Path(tmp)
             work = root / "work"
             (work / "diffs").mkdir(parents=True)
-            (work / "files").mkdir()
             (work / "manifest.json").write_text("{}", encoding="utf-8")
             (work / "diffs" / "a.hdiff").write_bytes(b"already compressed delta")
-            (work / "files" / "b.bin").write_bytes(b"full file payload" * 1024)
+            source = root / "full.bin"
+            source.write_bytes(b"full file payload" * 1024)
+            source_info = tracked_info(source)
 
             for preset, full_file_compression in expected.items():
                 with self.subTest(preset=preset):
                     output = root / f"{preset}.patch"
-                    make_patch.create_patch_archive(work, output, preset)
+                    make_patch.create_patch_archive(work, output, preset, {"files/b.bin": source_info})
                     with zipfile.ZipFile(output, "r") as archive:
                         members = {member.filename: member for member in archive.infolist()}
                     self.assertEqual(members["manifest.json"].compress_type, zipfile.ZIP_DEFLATED)
                     self.assertEqual(members["diffs/a.hdiff"].compress_type, zipfile.ZIP_STORED)
                     self.assertEqual(members["files/b.bin"].compress_type, full_file_compression)
 
+    def test_patch_archive_is_reproducible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            (work / "diffs").mkdir(parents=True)
+            (work / "manifest.json").write_text('{"version": 2}\n', encoding="utf-8")
+            (work / "diffs" / "a.hdiff").write_bytes(b"same delta")
+            source = root / "full.bin"
+            source.write_bytes(b"same full payload" * 100)
+            for preset in make_patch.COMPRESSION_PRESETS:
+                with self.subTest(preset=preset):
+                    source_info = tracked_info(source)
+                    first, second = root / f"{preset}-first.patch", root / f"{preset}-second.patch"
+                    make_patch.create_patch_archive(work, first, preset, {"files/b.bin": source_info})
+                    source.touch()
+                    (work / "manifest.json").touch()
+                    (work / "diffs" / "a.hdiff").touch()
+                    source_info = tracked_info(source)
+                    make_patch.create_patch_archive(work, second, preset, {"files/b.bin": source_info})
+                    self.assertEqual(first.read_bytes(), second.read_bytes())
+
     def test_create_archive_refuses_unknown_compression_preset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             work = root / "work"
             (work / "diffs").mkdir(parents=True)
-            (work / "files").mkdir()
             (work / "manifest.json").write_text("{}", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Unknown compression preset"):
-                make_patch.create_patch_archive(work, root / "test.patch", "impossible")
+                make_patch.create_patch_archive(work, root / "test.patch", "impossible", {})
 
     def test_create_archive_refuses_preexisting_tmp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             work = root / "work"
             (work / "diffs").mkdir(parents=True)
-            (work / "files").mkdir()
             (work / "manifest.json").write_text("{}", encoding="utf-8")
             output = root / "test.patch"
             partial = make_patch.temporary_patch_path(output)
             partial.write_bytes(b"keep")
             with self.assertRaises(FileExistsError):
-                make_patch.create_patch_archive(work, output)
+                make_patch.create_patch_archive(work, output, "normal", {})
             self.assertEqual(partial.read_bytes(), b"keep")
 
     def test_create_archive_never_overwrites_output_created_during_publication(self) -> None:
@@ -621,7 +666,6 @@ class MakePatchTests(unittest.TestCase):
             root = Path(tmp)
             work = root / "work"
             (work / "diffs").mkdir(parents=True)
-            (work / "files").mkdir()
             (work / "manifest.json").write_text("{}", encoding="utf-8")
             output = root / "test.patch"
             original_publish = make_patch.publish_patch_archive
@@ -632,10 +676,27 @@ class MakePatchTests(unittest.TestCase):
 
             with mock.patch.object(make_patch, "publish_patch_archive", side_effect=race):
                 with self.assertRaisesRegex(FileExistsError, "appeared while the patch was being created"):
-                    make_patch.create_patch_archive(work, output)
+                    make_patch.create_patch_archive(work, output, "normal", {})
 
             self.assertEqual(output.read_bytes(), b"unrelated")
             self.assertFalse(make_patch.temporary_patch_path(output).exists())
+
+    def test_higher_and_maximum_compare_compressed_full_file_against_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            diff = root / "delta.hdiff"
+            source = root / "new.bin"
+            diff.write_bytes(b"d" * 50)
+            source.write_bytes(b"n" * 100)
+            info = tracked_info(source)
+            for preset in ("higher", "maximum"):
+                with self.subTest(preset=preset):
+                    with mock.patch.object(make_patch, "measure_full_file_compressed_size", return_value=20) as measure:
+                        self.assertTrue(make_patch.should_store_full_file(diff, info, preset, root, "x"))
+                        measure.assert_called_once()
+            with mock.patch.object(make_patch, "measure_full_file_compressed_size") as measure:
+                self.assertFalse(make_patch.should_store_full_file(diff, info, "high", root, "x"))
+                measure.assert_not_called()
 
     def test_make_main_locks_output_and_installations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -774,6 +835,16 @@ class ApplyPatchTests(unittest.TestCase):
             "operations": [operation],
         }
 
+    def test_applier_supports_v1_and_v2_patch_manifests(self) -> None:
+        operation = {"type": "remove", "path": "a.bin", "old_size": 1, "old_sha256": "a" * 64}
+        for version in (1, 2):
+            with self.subTest(version=version):
+                manifest = self.minimal_manifest(operation, old_count=1, new_count=0)
+                manifest["version"] = version
+                self.assertEqual(apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json")})["version"], version)
+        self.assertEqual(make_patch.PATCH_VERSION, 2)
+        self.assertEqual(apply_patch.SUPPORTED_VERSIONS, {1, 2})
+
     def test_manifest_rejects_boolean_patch_version(self) -> None:
         operation = {"type": "remove", "path": "a.bin", "old_size": 1, "old_sha256": "a" * 64}
         manifest = self.minimal_manifest(operation, old_count=1, new_count=0)
@@ -831,6 +902,12 @@ class ApplyPatchTests(unittest.TestCase):
         validated = apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json"), "files/payload.bin": member})
         self.assertEqual(validated["operations"], [remove, add])
 
+    def test_manifest_rejects_operations_targeting_ignored_files(self) -> None:
+        operation = {"type": "remove", "path": "Tools/Launcher.exe", "old_size": 1, "old_sha256": "a" * 64}
+        manifest = self.minimal_manifest(operation, old_count=1, new_count=0)
+        with self.assertRaisesRegex(RuntimeError, "intentionally ignores"):
+            apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json")})
+
     def test_manifest_rejects_windows_reserved_target(self) -> None:
         operation = {"type": "remove", "path": "CON.txt", "old_size": 1, "old_sha256": "a" * 64}
         manifest = self.minimal_manifest(operation, old_count=1, new_count=0)
@@ -881,14 +958,9 @@ class ApplyPatchTests(unittest.TestCase):
             base.mkdir()
             backup.mkdir()
             (base / "a.bin").write_bytes(b"old")
-            operation = {"type": "replace", "path": "a.bin", "old_size": 3, "old_sha256": sha256_bytes(b"old")}
-
-            def corrupt_copy(source: Path, destination: Path) -> None:
-                Path(destination).write_bytes(b"bad")
-
-            with mock.patch.object(apply_patch.shutil, "copy2", side_effect=corrupt_copy):
-                with self.assertRaisesRegex(RuntimeError, "SHA-256 verification failed|Size verification failed"):
-                    apply_patch.backup_in_place(base, backup, [operation])
+            operation = {"type": "replace", "path": "a.bin", "old_size": 3, "old_sha256": sha256_bytes(b"wrong")}
+            with self.assertRaisesRegex(RuntimeError, "Recovery backup source verification failed"):
+                apply_patch.backup_in_place(base, backup, [operation])
 
     def test_separate_copy_verifies_base_while_copying(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1012,6 +1084,63 @@ class ApplyPatchTests(unittest.TestCase):
             self.assertIn("verified recovery backup was kept", stderr.getvalue())
             self.assertIn(str(work), stderr.getvalue())
 
+    def test_separate_output_publication_refuses_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            working, destination = root / "working", root / "final"
+            working.mkdir()
+            destination.mkdir()
+            (working / "ours.bin").write_bytes(b"ours")
+            (destination / "theirs.bin").write_bytes(b"theirs")
+            with self.assertRaisesRegex(FileExistsError, "Output path appeared"):
+                apply_patch.publish_output_directory(working, destination)
+            self.assertTrue((working / "ours.bin").is_file())
+            self.assertEqual((destination / "theirs.bin").read_bytes(), b"theirs")
+
+    def test_prepared_in_place_recovery_never_rolls_back_external_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base"
+            base.mkdir()
+            (base / "changed.bin").write_bytes(b"external")
+            work = root / "temp" / "apply_patch_test"
+            backup = work / "backup"
+            backup.mkdir(parents=True)
+            (backup / "changed.bin").write_bytes(b"old")
+            state = {
+                "mode": "in_place", "phase": "prepared", "base": str(base), "destination": str(base), "patch": str(root / "test.patch"),
+                "old_root_sha256": "a" * 64, "new_root_sha256": "b" * 64, "old_file_count": 1, "new_file_count": 1,
+                "operations": [{"type": "replace", "path": "changed.bin"}], "existed": {"changed.bin": True},
+            }
+            write_recovery(work, state)
+            with mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"), mock.patch.object(apply_patch, "tree_matches", return_value=False), mock.patch.object(apply_patch, "restore_in_place") as restore:
+                with self.assertRaisesRegex(RuntimeError, "automatic rollback was intentionally skipped"):
+                    apply_patch.recover_interrupted_operations(base, base)
+            restore.assert_not_called()
+            self.assertTrue(backup.is_dir())
+
+    def test_v2_separate_recovery_publishes_completed_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, destination = root / "base", root / "final"
+            make_warframe_root(base)
+            work = root / "temp" / "apply_patch_test"
+            working = apply_patch.separate_working_destination(destination, work)
+            shutil.copytree(base, working)
+            (working / "new.bin").write_bytes(b"new")
+            old_hash, old_count = tree_identity(base)
+            new_hash, new_count = tree_identity(working)
+            state = {
+                "mode": "separate", "phase": "publishing", "base": str(base), "destination": str(destination), "working_destination": str(working), "patch": str(root / "one.patch"),
+                "old_root_sha256": old_hash, "new_root_sha256": new_hash, "old_file_count": old_count, "new_file_count": new_count,
+            }
+            write_recovery(work, state)
+            with mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"), mock.patch.object(common, "TEMP_ROOT", root / "temp"):
+                completed = apply_patch.recover_interrupted_operations(base, destination)
+            self.assertIsNotNone(completed)
+            self.assertFalse(working.exists())
+            self.assertEqual((destination / "new.bin").read_bytes(), b"new")
+
     def test_rollback_restores_original_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1066,7 +1195,7 @@ class ApplyPatchTests(unittest.TestCase):
                 "old_root_sha256": old_hash, "new_root_sha256": new_hash, "old_file_count": old_count, "new_file_count": new_count,
                 "operations": operations, "existed": {"Tools/tool.bin": True, "Tools": False},
             }
-            write_recovery(work, state)
+            write_recovery(work, state, recovery_version=1)
             with mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"), mock.patch.object(common, "TEMP_ROOT", root / "temp"):
                 recovered = apply_patch.recover_interrupted_operations(base, base)
             self.assertIsNone(recovered)
@@ -1095,7 +1224,7 @@ class ApplyPatchTests(unittest.TestCase):
                 "old_root_sha256": old_hash, "new_root_sha256": "f" * 64, "old_file_count": old_count, "new_file_count": 999,
                 "operations": operations, "existed": {"Tools/tool.bin": True, "Tools": False},
             }
-            write_recovery(work, state)
+            write_recovery(work, state, recovery_version=1)
             stderr = io.StringIO()
             argv = ["apply_patch.py", str(base), str(root / "missing.patch"), "--in-place"]
             with (
@@ -1162,7 +1291,7 @@ class ApplyPatchTests(unittest.TestCase):
 
             with zipfile.ZipFile(patch_path, "r") as archive:
                 manifest = json.loads(archive.read("manifest.json"))
-            self.assertEqual(manifest["version"], 1)
+            self.assertEqual(manifest["version"], 2)
             self.assertEqual(manifest["base_steam_manifest_id"], 4895911296145320793)
 
             def fake_hpatch(command: list[str]) -> int:
@@ -1199,7 +1328,7 @@ class ApplyPatchTests(unittest.TestCase):
                 "mode": "separate", "base": str(base), "destination": str(destination), "patch": str(root / "one.patch"),
                 "old_root_sha256": old_hash, "new_root_sha256": new_hash, "old_file_count": old_count, "new_file_count": new_count,
             }
-            write_recovery(work, state)
+            write_recovery(work, state, recovery_version=1)
             with mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"), mock.patch.object(common, "TEMP_ROOT", root / "temp"):
                 completed = apply_patch.recover_interrupted_operations(base, destination)
             self.assertIsNotNone(completed)

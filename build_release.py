@@ -278,6 +278,22 @@ def build_executable(script: Path, dist: Path, work: Path, specs: Path) -> Path:
         raise RuntimeError(f"PyInstaller did not create the expected executable: {executable}")
     return executable
 
+def run_source_tests() -> None:
+    print("[Testing] Source test suite")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-W", "error::DeprecationWarning", "-m", "unittest", "discover", "-s", "tests"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Source test suite timed out.") from exc
+    if result.returncode != 0:
+        details = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip()) or "No output was produced."
+        raise RuntimeError(f"Source test suite failed:\n{details}")
+
 def smoke_test_executables(dist: Path) -> None:
     print("[Testing] Standalone executables")
     environment = build_environment(dist.parent)
@@ -374,6 +390,7 @@ def main() -> int:
         archive = release_archive_path()
         with operation_lock("release", archive, "release build for this version"):
             validate_release_output_available()
+            run_source_tests()
             release_name = f"NinjaPatchTool-v{VERSION}"
             RELEASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
             try:

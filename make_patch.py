@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import sys
 import time
 import zipfile
@@ -12,6 +11,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from common import (
+    ByteProgress,
     ErrorArgumentParser,
     SingleUseStoreAction,
     DATA_DIR,
@@ -25,7 +25,8 @@ from common import (
     make_work_dir,
     operation_lock,
     parse_json,
-    process_is_running,
+    process_identity,
+    process_matches_identity,
     resolve_base_name,
     resolve_patch_output,
     run_child,
@@ -37,7 +38,7 @@ from common import (
 )
 
 HDIFFZ = DATA_DIR / "hdiffz.exe"
-PATCH_VERSION = 1
+PATCH_VERSION = 2
 MAKE_SESSION_FILE = "session.json"
 MAKE_SESSION_GRACE_SECONDS = 10
 
@@ -93,7 +94,7 @@ def write_make_session(work: Path, output: Path) -> None:
     # another make_patch process that is still active.
     session = work / MAKE_SESSION_FILE
     temporary = session.with_name(session.name + ".tmp")
-    data = {"pid": os.getpid(), "output": str(output)}
+    data = {"pid": os.getpid(), "process_identity": process_identity(os.getpid()), "output": str(output)}
 
     with temporary.open("w", encoding="utf-8", newline="\n") as file:
         json.dump(data, file, indent=2, ensure_ascii=False)
@@ -112,6 +113,7 @@ def cleanup_stale_make_patch_work(output: Path) -> None:
             session = work / MAKE_SESSION_FILE
             session_output = None
             pid = None
+            state = None
 
             if session.is_file():
                 try:
@@ -126,7 +128,7 @@ def cleanup_stale_make_patch_work(output: Path) -> None:
                 except Exception:
                     pass
 
-            if isinstance(pid, int) and process_is_running(pid):
+            if isinstance(pid, int) and process_matches_identity(pid, state.get("process_identity") if isinstance(state, dict) else None):
                 active_for_output |= session_output == output
                 continue
 
@@ -222,7 +224,56 @@ def run_hdiff(old: Path, new: Path, output: Path, compression: str) -> None:
             candidate.unlink(missing_ok=True)
         raise
 
-def create_patch_archive(work: Path, output: Path, compression: str = "normal") -> None:
+def reproducible_zip_info(name: str, compression: int, compresslevel: int | None = None) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    info.compress_type = compression
+    info.create_system = 3
+    info.external_attr = 0o100644 << 16
+    info._compresslevel = compresslevel
+    return info
+
+def write_reproducible_member(
+    archive: zipfile.ZipFile,
+    source: Path,
+    name: str,
+    compression: int,
+    compresslevel: int | None = None,
+    progress: ByteProgress | None = None,
+) -> None:
+    info = reproducible_zip_info(name, compression, compresslevel)
+    with source.open("rb") as input_file, archive.open(info, "w", force_zip64=True) as output_file:
+        while chunk := input_file.read(8 * 1024 * 1024):
+            output_file.write(chunk)
+            if progress is not None:
+                progress.update(len(chunk))
+
+def measure_full_file_compressed_size(file_info: dict, compression: str, work: Path, item_id: str) -> int | None:
+    compress_type, compresslevel = FULL_FILE_ZIP_COMPRESSION[compression]
+    candidate = work / f"full_candidate_{item_id}.zip"
+    candidate.unlink(missing_ok=True)
+    try:
+        verify_scanned_file(file_info)
+        with zipfile.ZipFile(candidate, "x", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+            write_reproducible_member(archive, file_info["path"], "candidate.bin", compress_type, compresslevel)
+        verify_scanned_file(file_info)
+        with zipfile.ZipFile(candidate, "r") as archive:
+            return archive.getinfo("candidate.bin").compress_size
+    except Exception as exc:
+        print(f"WARNING: Could not test compressed full-file candidate for {file_info['path']}: {exc}", file=sys.stderr)
+        return None
+    finally:
+        candidate.unlink(missing_ok=True)
+
+def should_store_full_file(diff_path: Path, new_info: dict, compression: str, work: Path, item_id: str) -> bool:
+    diff_size = diff_path.stat().st_size
+    if diff_size >= new_info["size"]:
+        return True
+    if compression not in {"higher", "maximum"}:
+        return False
+    compressed_size = measure_full_file_compressed_size(new_info, compression, work, item_id)
+    return compressed_size is not None and compressed_size < diff_size
+
+def create_patch_archive(work: Path, output: Path, compression: str, full_file_sources: dict[str, dict]) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise FileExistsError(f"Patch output already exists: {output}")
@@ -232,28 +283,27 @@ def create_patch_archive(work: Path, output: Path, compression: str = "normal") 
         raise FileExistsError(f"Temporary patch path already exists: {temporary}")
 
     try:
-        # Only patch-format files belong in the archive. In particular, session.json is local recovery metadata and
-        # must never leak into a distributed patch. HDiff payloads are already LZMA2-compressed, while complete-file
-        # payloads use the selected preset's ZIP compression.
         try:
             full_file_compression, full_file_compresslevel = FULL_FILE_ZIP_COMPRESSION[compression]
         except KeyError:
             raise ValueError(f"Unknown compression preset: {compression}") from None
 
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
-            archive.write(work / "manifest.json", "manifest.json", compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+        full_progress = ByteProgress("Archiving full-file payloads", sum(info["size"] for info in full_file_sources.values())) if full_file_sources else None
+        with zipfile.ZipFile(temporary, "x", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+            write_reproducible_member(archive, work / "manifest.json", "manifest.json", zipfile.ZIP_DEFLATED, 9)
             for path in sorted((work / "diffs").rglob("*")):
                 if path.is_file():
-                    archive.write(path, path.relative_to(work).as_posix(), compress_type=zipfile.ZIP_STORED)
-            for path in sorted((work / "files").rglob("*")):
-                if path.is_file():
-                    archive.write(path, path.relative_to(work).as_posix(), compress_type=full_file_compression, compresslevel=full_file_compresslevel)
+                    write_reproducible_member(archive, path, path.relative_to(work).as_posix(), zipfile.ZIP_STORED)
+            for payload in sorted(full_file_sources):
+                file_info = full_file_sources[payload]
+                verify_scanned_file(file_info)
+                write_reproducible_member(archive, file_info["path"], payload, full_file_compression, full_file_compresslevel, full_progress)
+                verify_scanned_file(file_info)
+        if full_progress is not None:
+            full_progress.finish()
 
         if output.exists():
             raise FileExistsError(f"Patch output appeared while the patch was being created: {output}")
-
-        # Publish only after the complete archive is written. Publication itself must also refuse an output created
-        # after the check above, closing the final race without overwriting another process's file.
         publish_patch_archive(temporary, output)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -329,7 +379,7 @@ def main() -> int:
         indexed_base = index[canonical_name]
 
         print(f'Verifying base "{canonical_name}" before patch creation...\nScanning and hashing base files...')
-        old_files, old_root_hash = scan_tree(base)
+        old_files, old_root_hash = scan_tree(base, "Hashing base")
 
         if old_root_hash.lower() != indexed_base["sha256"].lower() or len(old_files) != indexed_base["file_count"]:
             raise RuntimeError(
@@ -338,7 +388,7 @@ def main() -> int:
             )
 
         print(f'[Verified] Base "{canonical_name}" is unmodified.\nCompression: {args.compression}\nScanning and hashing the new installation...')
-        new_files, new_root_hash = scan_tree(new)
+        new_files, new_root_hash = scan_tree(new, "Hashing new installation")
         old_names, new_names = set(old_files), set(new_files)
         common_names = old_names & new_names
         added = sorted(new_names - old_names)
@@ -355,22 +405,21 @@ def main() -> int:
             "Creating patch payload..."
         )
 
-        payload_estimate = sum(new_files[relative]["size"] for relative in modified + added)
+        final_payload_estimate = sum(new_files[relative]["size"] for relative in modified + added)
+        temporary_payload_estimate = sum(new_files[relative]["size"] for relative in modified)
         largest_modified = max((new_files[relative]["size"] for relative in modified), default=0)
-        candidate_overhead = largest_modified
-        if args.compression == "maximum":
-            candidate_overhead *= 2
+        candidate_overhead = largest_modified * (2 if args.compression == "maximum" else 1)
         warn_if_low_disk_space_groups([
-            (TEMP_ROOT, payload_estimate + candidate_overhead, "temporary patch creation data"),
-            (output.parent, payload_estimate, "the final patch archive"),
+            (TEMP_ROOT, temporary_payload_estimate + candidate_overhead, "temporary patch creation data"),
+            (output.parent, final_payload_estimate, "the final patch archive"),
         ])
 
         work = make_work_dir("make_patch")
         write_make_session(work, output)
-        diffs_dir, files_dir = work / "diffs", work / "files"
+        diffs_dir = work / "diffs"
         diffs_dir.mkdir()
-        files_dir.mkdir()
         operations = []
+        full_file_sources: dict[str, dict] = {}
 
         for relative in modified:
             old_info, new_info = old_files[relative], new_files[relative]
@@ -387,17 +436,14 @@ def main() -> int:
             verify_scanned_file(old_info)
             verify_scanned_file(new_info)
 
-            if diff_path.stat().st_size >= new_info["size"]:
-                # A delta that is no smaller than the new file is pointless; store the complete replacement instead.
+            if should_store_full_file(diff_path, new_info, args.compression, work, item_id):
                 diff_path.unlink()
-                payload_path = files_dir / f"{item_id}.bin"
-                verify_scanned_file(new_info)
-                shutil.copy2(new_info["path"], payload_path)
-                verify_scanned_file(new_info)
+                payload = f"files/{item_id}.bin"
+                full_file_sources[payload] = new_info
                 operations.append({
                     "type": "replace",
                     "path": relative,
-                    "payload": f"files/{payload_path.name}",
+                    "payload": payload,
                     "old_size": old_info["size"],
                     "old_sha256": old_info["sha256"],
                     "new_size": new_info["size"],
@@ -417,14 +463,12 @@ def main() -> int:
 
         for relative in added:
             info = new_files[relative]
-            payload_path = files_dir / f"{payload_id(relative)}.bin"
-            verify_scanned_file(info)
-            shutil.copy2(info["path"], payload_path)
-            verify_scanned_file(info)
+            payload = f"files/{payload_id(relative)}.bin"
+            full_file_sources[payload] = info
             operations.append({
                 "type": "add",
                 "path": relative,
-                "payload": f"files/{payload_path.name}",
+                "payload": payload,
                 "new_size": info["size"],
                 "new_sha256": info["sha256"],
             })
@@ -459,7 +503,7 @@ def main() -> int:
         )
 
         print(f"\nCreating single patch file:\n{output}")
-        create_patch_archive(work, output, args.compression)
+        create_patch_archive(work, output, args.compression, full_file_sources)
         try:
             verify_scanned_tree(base, old_files)
             verify_scanned_tree(new, new_files)

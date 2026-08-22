@@ -10,12 +10,13 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 def get_tool_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -60,7 +61,7 @@ def root_sha256_from_files(files: dict[str, dict[str, Any]]) -> str:
         root_hash.update(relative.encode("utf-8") + b"\0" + str(info["size"]).encode("ascii") + b"\0" + info["sha256"].lower().encode("ascii") + b"\n")
     return root_hash.hexdigest()
 
-def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
+def scan_tree(root: Path, progress_label: str | None = None) -> tuple[dict[str, dict[str, Any]], str]:
     # The root hash uses each relative path, size, and file SHA-256. Filesystem enumeration order is not guaranteed,
     # so only the in-memory path list is sorted before hashing; no files are moved or modified.
     paths = sorted(
@@ -68,11 +69,20 @@ def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
         key=lambda path: path.relative_to(root).as_posix(),
     )
     relative_paths = [path.relative_to(root).as_posix() for path in paths]
+    progress = ByteProgress(progress_label, sum(path.stat().st_size for path in paths)) if progress_label else None
     files: dict[str, dict[str, Any]] = {}
 
     for path, relative in zip(paths, relative_paths):
         before = path.stat()
-        digest = sha256_file(path)
+        if progress is None:
+            digest = sha256_file(path)
+        else:
+            digest_hash = hashlib.sha256()
+            with path.open("rb") as file:
+                while chunk := file.read(8 * 1024 * 1024):
+                    digest_hash.update(chunk)
+                    progress.update(len(chunk))
+            digest = digest_hash.hexdigest()
         after = path.stat()
         if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
             raise RuntimeError(f"Installation changed while it was being scanned:\n{path}\nClose Warframe and the Warframe Launcher and try again.")
@@ -84,6 +94,8 @@ def scan_tree(root: Path) -> tuple[dict[str, dict[str, Any]], str]:
     )
     if current_paths != relative_paths:
         raise RuntimeError(f"Installation changed while it was being scanned:\n{root}\nClose Warframe and the Warframe Launcher and try again.")
+    if progress is not None:
+        progress.finish()
 
     return files, root_sha256_from_files(files)
 
@@ -236,7 +248,6 @@ def run_child(command: list[str]) -> int:
         raise
 
 def process_is_running(pid: int) -> bool:
-    # Recovery/cleanup state stores the creator PID so one tool instance does not delete another live instance's working directory.
     if pid <= 0:
         return False
 
@@ -260,6 +271,50 @@ def process_is_running(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+def process_identity(pid: int) -> str | None:
+    # A PID can eventually be reused. Pair it with the process creation/start time so stale work is not mistaken for
+    # a live Ninja Patch Tool operation merely because an unrelated process later received the same PID.
+    if pid <= 0:
+        return None
+
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME)]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            created, exited, kernel, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+            creation = (created.dwHighDateTime << 32) | created.dwLowDateTime
+            return f"{pid}:{creation}"
+        finally:
+            kernel32.CloseHandle(handle)
+
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = stat[stat.rfind(")") + 2:].split()
+        return f"{pid}:{fields[19]}"
+    except (OSError, IndexError):
+        return None
+
+def process_matches_identity(pid: int, identity: object) -> bool:
+    if not process_is_running(pid):
+        return False
+    if not isinstance(identity, str) or not identity:
+        # Old session/recovery records contain only a PID, so remain conservative when reading them.
+        return True
+    current = process_identity(pid)
+    return current is None or current == identity
 
 @contextmanager
 def operation_lock(kind: str, target: Path, description: str):
@@ -422,6 +477,36 @@ def format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
+
+class ByteProgress:
+    def __init__(self, label: str, total: int) -> None:
+        self.label = label
+        self.total = max(0, total)
+        self.completed = 0
+        self.last_percent = -10
+        self.last_time = time.monotonic()
+        self.finished = False
+
+    def update(self, amount: int) -> None:
+        self.completed += max(0, amount)
+        if self.total <= 0:
+            return
+        percent = min(100, self.completed * 100 // self.total)
+        now = time.monotonic()
+        if percent >= self.last_percent + 10 or now - self.last_time >= 5 or self.completed >= self.total:
+            print(f"{self.label}: {format_bytes(self.completed)} / {format_bytes(self.total)} ({percent}%)")
+            self.last_percent = percent
+            self.last_time = now
+            if self.completed >= self.total:
+                self.finished = True
+
+    def finish(self) -> None:
+        if self.finished:
+            return
+        if self.total > 0:
+            self.completed = self.total
+            print(f"{self.label}: {format_bytes(self.total)} / {format_bytes(self.total)} (100%)")
+        self.finished = True
 
 class CompactHelpFormatter(argparse.HelpFormatter):
     def __init__(self, prog: str) -> None:

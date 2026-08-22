@@ -47,7 +47,7 @@ def main() -> int:
     try:
         with operation_lock("installation", base, "operation using this installation"):
             print(f'Hashing base "{name}"...\n' "This may take a while for large installations.")
-            files, root_hash = scan_tree(base)
+            files, root_hash = scan_tree(base, "Hashing base")
 
             # Keep the installation locked until its verified identity is committed to the index.
             with operation_lock("index", INDEX_FILE, "base index update"):
