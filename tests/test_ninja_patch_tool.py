@@ -815,6 +815,60 @@ class ApplyPatchTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "SHA-256 verification failed|Size verification failed"):
                     apply_patch.backup_in_place(base, backup, [operation])
 
+    def test_in_place_backup_is_kept_if_base_changes_before_modification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base"
+            base.mkdir()
+            patch = root / "test.patch"
+            patch.write_bytes(b"patch")
+            hpatchz = root / "hpatchz.exe"
+            hpatchz.write_bytes(b"fake")
+            work = root / "temp" / "apply_patch_test"
+            work.mkdir(parents=True)
+            base_files = {"a.bin": {"size": 3}}
+            manifest = {
+                "version": 1,
+                "base": "U43.5.1",
+                "base_steam_manifest_id": 4895911296145320793,
+                "old_root_sha256": "a" * 64,
+                "new_root_sha256": "b" * 64,
+                "old_file_count": 1,
+                "new_file_count": 0,
+                "operations": [{"type": "remove", "path": "a.bin", "old_size": 3, "old_sha256": "c" * 64}],
+            }
+            archive = mock.MagicMock()
+            archive.__enter__.return_value = archive
+            archive.__exit__.return_value = False
+            cleanup = mock.Mock()
+            stderr = io.StringIO()
+
+            with (
+                mock.patch.object(apply_patch, "recover_interrupted_operations", return_value=None),
+                mock.patch.object(apply_patch, "validate_warframe_installation", return_value=True),
+                mock.patch.object(apply_patch, "HPATCHZ", hpatchz),
+                mock.patch.object(apply_patch.zipfile, "ZipFile", return_value=archive),
+                mock.patch.object(apply_patch, "read_archive_members", return_value={}),
+                mock.patch.object(apply_patch, "read_manifest", return_value=manifest),
+                mock.patch.object(apply_patch, "scan_tree", return_value=(base_files, "a" * 64)),
+                mock.patch.object(apply_patch, "warn_if_low_disk_space_groups"),
+                mock.patch.object(apply_patch, "make_work_dir", return_value=work),
+                mock.patch.object(apply_patch, "check_temporary_paths"),
+                mock.patch.object(apply_patch, "write_recovery_state"),
+                mock.patch.object(apply_patch, "backup_in_place", return_value={"a.bin": True}),
+                mock.patch.object(apply_patch, "verify_scanned_tree", side_effect=RuntimeError("changed")),
+                mock.patch.object(apply_patch, "cleanup_work_dir", cleanup),
+                mock.patch.object(apply_patch, "apply_and_verify") as apply_and_verify,
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(apply_patch.run_locked_apply(base, patch, base, True), 1)
+
+            cleanup.assert_not_called()
+            apply_and_verify.assert_not_called()
+            self.assertTrue((work / "backup").is_dir())
+            self.assertIn("verified recovery backup was kept", stderr.getvalue())
+            self.assertIn(str(work), stderr.getvalue())
+
     def test_rollback_restores_original_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

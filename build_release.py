@@ -285,20 +285,10 @@ def smoke_test_executables(dist: Path) -> None:
         executable = dist / f"{Path(script).stem}.exe"
         try:
             help_result = subprocess.run(
-                [str(executable), "-h"],
-                cwd=ROOT,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=30,
+                [str(executable), "-h"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30
             )
             version_result = subprocess.run(
-                [str(executable), "--version"],
-                cwd=ROOT,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=30,
+                [str(executable), "--version"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"Standalone executable smoke test timed out: {executable.name}") from exc

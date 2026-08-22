@@ -36,7 +36,8 @@ def main() -> int:
         canonical_name = resolve_base_name(index, args.name)
         expected = index[canonical_name]
 
-        print(f'Verifying base "{canonical_name}"...\nCalculating installation SHA-256...')
+        print(f'Verifying base "{canonical_name}"...\n' "Calculating installation SHA-256...")
+
         with operation_lock("installation", base, "operation using this installation"):
             files, actual_hash = scan_tree(base)
 
@@ -58,9 +59,11 @@ def main() -> int:
             f"SHA-256: {actual_hash}"
         )
         return 0
+
     except KeyError:
         print(f'ERROR: Base "{args.name}" is not present in data/index.json.', file=sys.stderr)
         return 1
+
     except KeyboardInterrupt:
         print("\nBase verification cancelled.", file=sys.stderr)
         return 130

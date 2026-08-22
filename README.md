@@ -89,7 +89,7 @@ apply_patch "D:\WF\U43.5.1" "U43.5.2.patch"
 
 Close Warframe and the Warframe Launcher before applying a patch, especially when using `--in-place`.
 
-In-place mode creates a recovery backup before modifying the base. Interrupted operations are cleaned up or recovered automatically when possible.
+In-place mode creates a recovery backup of only the files the patch may modify or remove before changing the base. Interrupted operations are cleaned up or recovered automatically when possible.
 
 ## Build a release
 

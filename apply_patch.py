@@ -674,11 +674,20 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
                 write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest))
                 try:
                     existed = backup_in_place(base, backup, manifest["operations"])
-                    write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, existed))
-                    verify_scanned_tree(base, base_files)
                 except BaseException:
                     keep_work = False
                     raise
+
+                try:
+                    write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, existed))
+                    verify_scanned_tree(base, base_files)
+                except BaseException as exc:
+                    raise RuntimeError(
+                        "The base changed or recovery metadata could not be finalized after the in-place backup was created.\n"
+                        "No patch changes were made. The verified recovery backup was kept at:\n"
+                        f"{work}\n"
+                        "Do not delete this folder if the base was changed or deleted unexpectedly."
+                    ) from exc
 
                 try:
                     apply_and_verify(base, archive, members, scratch, manifest)
