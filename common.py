@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -29,6 +30,8 @@ INDEX_FILE = DATA_DIR / "index.json"
 TEMP_ROOT = TOOL_DIR / "temp"
 # We don't need this garbage.
 IGNORED_FILENAMES = {"launcher.zip", "launcher.exe", "remotecrashsender.exe"}
+_PROCESS_LOCKS_GUARD = threading.Lock()
+_PROCESS_LOCKS: set[str] = set()
 
 def sha256_file(path: Path) -> str:
     with path.open("rb") as file:
@@ -323,57 +326,70 @@ def operation_lock(kind: str, target: Path, description: str):
         resolved = resolved.casefold()
     digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()
     safe_kind = re.sub(r"[^0-9A-Za-z_.-]", "_", kind)
+    process_key = f"{safe_kind}:{digest}"
 
-    if os.name == "nt":
-        import ctypes
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
-        kernel32.CreateMutexW.restype = ctypes.c_void_p
-        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
-        kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
-        kernel32.ReleaseMutex.restype = ctypes.c_int
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel32.CloseHandle.restype = ctypes.c_int
-
-        handle = kernel32.CreateMutexW(None, False, f"Local\\DarkLotus.NinjaPatchTool.{safe_kind}.{digest}")
-        if not handle:
-            raise OSError(ctypes.get_last_error(), "Could not create the operation mutex.")
-        wait_result = kernel32.WaitForSingleObject(handle, 0)
-        if wait_result == 0x102:
-            kernel32.CloseHandle(handle)
+    # Windows mutexes are recursive for the thread that already owns them, so a second acquisition in the same
+    # process would otherwise succeed. Keep a small process-local registry so operation locks have identical
+    # non-reentrant semantics on Windows and POSIX, while the OS lock still protects against other processes.
+    with _PROCESS_LOCKS_GUARD:
+        if process_key in _PROCESS_LOCKS:
             raise RuntimeError(f"Another {description} is already running for:\n{target}")
-        if wait_result not in {0, 0x80}:
-            error = ctypes.get_last_error()
-            kernel32.CloseHandle(handle)
-            raise OSError(error, "Could not acquire the operation mutex.")
-        try:
-            yield
-        finally:
-            kernel32.ReleaseMutex(handle)
-            kernel32.CloseHandle(handle)
-        return
+        _PROCESS_LOCKS.add(process_key)
 
-    # The project targets Windows, but keep the test/development path safe on POSIX too.
-    import fcntl
-    locks = TEMP_ROOT / "locks"
-    locks.mkdir(parents=True, exist_ok=True)
-    lock_path = locks / f"{safe_kind}_{digest}.lock"
-    with lock_path.open("a+b") as lock_file:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError(f"Another {description} is already running for:\n{target}") from None
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-    lock_path.unlink(missing_ok=True)
     try:
-        locks.rmdir()
-        TEMP_ROOT.rmdir()
-    except OSError:
-        pass
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+            kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+            kernel32.ReleaseMutex.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+
+            handle = kernel32.CreateMutexW(None, False, f"Local\\DarkLotus.NinjaPatchTool.{safe_kind}.{digest}")
+            if not handle:
+                raise OSError(ctypes.get_last_error(), "Could not create the operation mutex.")
+            wait_result = kernel32.WaitForSingleObject(handle, 0)
+            if wait_result == 0x102:
+                kernel32.CloseHandle(handle)
+                raise RuntimeError(f"Another {description} is already running for:\n{target}")
+            if wait_result not in {0, 0x80}:
+                error = ctypes.get_last_error()
+                kernel32.CloseHandle(handle)
+                raise OSError(error, "Could not acquire the operation mutex.")
+            try:
+                yield
+            finally:
+                kernel32.ReleaseMutex(handle)
+                kernel32.CloseHandle(handle)
+            return
+
+        # The project targets Windows, but keep the test/development path safe on POSIX too.
+        import fcntl
+        locks = TEMP_ROOT / "locks"
+        locks.mkdir(parents=True, exist_ok=True)
+        lock_path = locks / f"{safe_kind}_{digest}.lock"
+        with lock_path.open("a+b") as lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError(f"Another {description} is already running for:\n{target}") from None
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_path.unlink(missing_ok=True)
+        try:
+            locks.rmdir()
+            TEMP_ROOT.rmdir()
+        except OSError:
+            pass
+    finally:
+        with _PROCESS_LOCKS_GUARD:
+            _PROCESS_LOCKS.discard(process_key)
 
 def is_within(path: Path, parent: Path) -> bool:
     return path.resolve().is_relative_to(parent.resolve())

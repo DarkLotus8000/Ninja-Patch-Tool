@@ -484,6 +484,16 @@ This should not be included.
                         with common.operation_lock("test", target, "test operation"):
                             pass
 
+    def test_operation_lock_can_be_reacquired_after_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            with mock.patch.object(common, "TEMP_ROOT", root / "temp"):
+                with common.operation_lock("test", target, "test operation"):
+                    pass
+                with common.operation_lock("test", target, "test operation"):
+                    pass
+
     def test_apply_main_locks_base_and_separate_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
