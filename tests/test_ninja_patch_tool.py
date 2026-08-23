@@ -1367,6 +1367,7 @@ class ApplyPatchTests(unittest.TestCase):
                 self.assertEqual(make_patch.main(), 0)
             self.assertIn(f"[Diffing 1/1] {common.display_relative_path('Cache.Windows/data.bin')} (memory mode)", make_stdout.getvalue())
             self.assertIn(f"[Finished 1/1] {common.display_relative_path('Cache.Windows/data.bin')}", make_stdout.getvalue())
+            self.assertIn(f"Patch size: {common.format_bytes(patch_path.stat().st_size)}", make_stdout.getvalue())
 
             with zipfile.ZipFile(patch_path, "r") as archive:
                 manifest = json.loads(archive.read("manifest.json"))

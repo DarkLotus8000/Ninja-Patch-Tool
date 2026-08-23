@@ -18,6 +18,7 @@ from common import (
     TEMP_ROOT,
     cleanup_work_dir,
     display_relative_path,
+    format_bytes,
     format_duration,
     install_termination_handlers,
     is_within,
@@ -531,7 +532,7 @@ def main() -> int:
             f"Base: {canonical_name}\n"
             f"Steam manifest ID: {indexed_base['steam_manifest_id']}\n"
             f"Duration: {duration}\n"
-            f"Patch size: {output.stat().st_size:,} bytes"
+            f"Patch size: {format_bytes(output.stat().st_size)}"
         )
         return 0
 
