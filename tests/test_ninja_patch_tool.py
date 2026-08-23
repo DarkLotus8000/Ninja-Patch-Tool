@@ -444,14 +444,8 @@ This should not be included.
             self.assertEqual([[Path(command[0]).name, *command[1:]] for command in calls], expected)
 
     def test_release_version_info_contains_explorer_fields(self) -> None:
-        descriptions = {
-            "add_base.py": "Add Base - Ninja Patch Tool",
-            "verify_base.py": "Verify Base - Ninja Patch Tool",
-            "make_patch.py": "Make Patch - Ninja Patch Tool",
-            "apply_patch.py": "Apply Patch - Ninja Patch Tool",
-        }
         with tempfile.TemporaryDirectory() as tmp:
-            for script, description in descriptions.items():
+            for script, description in build_release.ENTRY_SCRIPTS.items():
                 version_file = build_release.create_version_file(Path(script), Path(tmp))
                 text = version_file.read_text(encoding="utf-8")
                 compile(text, str(version_file), "eval")

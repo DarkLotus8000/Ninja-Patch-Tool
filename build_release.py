@@ -15,14 +15,12 @@ from pathlib import Path
 from common import VERSION, operation_lock, parse_json, sha256_file, validate_index
 
 COMPANY_NAME = "DarkLotus"
-PRODUCT_NAME = "Ninja Patch Tool"
 ROOT = Path(__file__).resolve().parent
 RELEASE_DIR = ROOT / "release"
 RELEASE_TEMP_DIR = ROOT / "release_temp"
 DATA_DIR = ROOT / "data"
 FAVICON = DATA_DIR / "favicon.ico"
-ENTRY_SCRIPTS = ("add_base.py", "verify_base.py", "make_patch.py", "apply_patch.py")
-FILE_DESCRIPTIONS = {
+ENTRY_SCRIPTS = {
     "add_base.py": "Add Base - Ninja Patch Tool",
     "verify_base.py": "Verify Base - Ninja Patch Tool",
     "make_patch.py": "Make Patch - Ninja Patch Tool",
@@ -195,7 +193,6 @@ def validate_build_environment() -> list[Path]:
 
 def create_version_file(script: Path, destination: Path) -> Path:
     version = version_tuple()
-    description = FILE_DESCRIPTIONS[script.name]
     version_file = destination / f"{script.stem}_version.txt"
     text = f"""VSVersionInfo(
     ffi=FixedFileInfo(
@@ -214,11 +211,11 @@ def create_version_file(script: Path, destination: Path) -> Path:
                 '040904B0',
                 [
                     StringStruct('CompanyName', '{COMPANY_NAME}'),
-                    StringStruct('FileDescription', '{description}'),
+                    StringStruct('FileDescription', '{ENTRY_SCRIPTS[script.name]}'),
                     StringStruct('FileVersion', '{VERSION}'),
                     StringStruct('InternalName', '{script.stem}'),
                     StringStruct('LegalCopyright', '{COMPANY_NAME}'),
-                    StringStruct('ProductName', '{PRODUCT_NAME}'),
+                    StringStruct('ProductName', 'Ninja Patch Tool'),
                     StringStruct('ProductVersion', '{VERSION}')
                 ]
             )
@@ -385,7 +382,6 @@ def main() -> int:
             validate_release_output_available()
             clean_stale_release_temp()
             run_source_tests()
-            release_name = f"NinjaPatchTool-v{VERSION}"
             RELEASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
             try:
                 with tempfile.TemporaryDirectory(prefix="ninja_patch_tool_release_", dir=RELEASE_TEMP_DIR) as temporary_dir:
@@ -393,7 +389,7 @@ def main() -> int:
                     dist = temporary / "dist"
                     work = temporary / "build"
                     specs = temporary / "spec"
-                    stage = temporary / release_name
+                    stage = temporary / f"NinjaPatchTool-v{VERSION}"
                     dist.mkdir()
                     work.mkdir()
                     specs.mkdir()
@@ -409,9 +405,13 @@ def main() -> int:
                 except OSError:
                     pass
 
-        size_mib = archive.stat().st_size / (1024 * 1024)
         print(f"\n[Created] {archive}")
-        print(f"Version: {VERSION}\nSize: {size_mib:.1f} MiB\nSHA-256: {digest}\nChecksum: {checksum}")
+        print(
+            f"Version: {VERSION}\n"
+            f"Size: {archive.stat().st_size / (1024 * 1024):.1f} MiB\n"
+            f"SHA-256: {digest}\n"
+            f"Checksum: {checksum}"
+        )
         return 0
     except KeyboardInterrupt:
         print("\nRelease creation interrupted.", file=sys.stderr)
