@@ -249,7 +249,6 @@ This should not be included.
         self.assertEqual(apply_patch.HPATCHZ, common.DATA_DIR / "hpatchz.exe")
         self.assertEqual(build_release.DATA_DIR, build_release.ROOT / "data")
         self.assertEqual(build_release.FAVICON, build_release.DATA_DIR / "favicon.ico")
-        self.assertEqual(build_release.PYTHON_LICENSE, build_release.DATA_DIR / "Python_LICENSE.txt")
 
     def test_release_temp_directory_is_separate_from_patch_temp(self) -> None:
         self.assertEqual(build_release.RELEASE_TEMP_DIR, build_release.ROOT / "release_temp")
@@ -287,13 +286,19 @@ This should not be included.
             dist = root / "dist"
             data.mkdir()
             dist.mkdir()
-            (data / "index.json").write_text("{}", encoding="utf-8")
+
+            expected = {
+                "index.json",
+                "hdiffz.exe",
+                "hpatchz.exe",
+                "Python_LICENSE.txt",
+                "HDiffPatch_LICENSE.txt",
+            }
+            self.assertEqual(set(build_release.RELEASE_DATA_FILES), expected)
+            for name in expected:
+                (data / name).write_bytes(b"{}" if name == "index.json" else name.encode("ascii"))
+
             (data / "favicon.ico").write_bytes(b"icon")
-            (data / "hdiffz.exe").write_bytes(b"hdiff")
-            (data / "hpatchz.exe").write_bytes(b"hpatch")
-            (data / "Python_LICENSE.txt").write_text("python license", encoding="utf-8")
-            hdiff_license = data / "HDiffPatch_LICENSE.txt"
-            hdiff_license.write_text("license", encoding="utf-8")
             (data / "notes.txt").write_text("do not ship", encoding="utf-8")
             (data / "README.md").write_text("source-only data notes", encoding="utf-8")
             (root / "README.md").write_text("# Ninja Patch Tool\n", encoding="utf-8")
@@ -303,17 +308,9 @@ This should not be included.
                 mock.patch.object(build_release, "DATA_DIR", data),
                 mock.patch.object(build_release, "ENTRY_SCRIPTS", ()),
             ):
-                build_release.populate_release(stage, dist, [], [hdiff_license])
+                build_release.populate_release(stage, dist, [])
 
-            self.assertTrue((stage / "data" / "index.json").is_file())
-            self.assertTrue((stage / "data" / "hdiffz.exe").is_file())
-            self.assertTrue((stage / "data" / "hpatchz.exe").is_file())
-            self.assertTrue((stage / "data" / hdiff_license.name).is_file())
-            self.assertEqual((stage / "data" / "Python_LICENSE.txt").read_text(encoding="utf-8"), "python license")
-            self.assertFalse((stage / "PYTHON_LICENSE.txt").exists())
-            self.assertFalse((stage / "data" / "favicon.ico").exists())
-            self.assertFalse((stage / "data" / "notes.txt").exists())
-            self.assertFalse((stage / "data" / "README.md").exists())
+            self.assertEqual({path.name for path in (stage / "data").iterdir()}, expected)
 
     def test_release_preflight_validates_x64_pe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1107,12 +1104,11 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch.object(apply_patch, "tree_matches", side_effect=AssertionError("full rehash should not run")),
                 mock.patch("sys.stdout", stdout),
             ):
-                apply_patch.apply_and_verify(destination, mock.MagicMock(), {}, scratch, manifest, tracked)
+                duration = apply_patch.apply_and_verify(destination, mock.MagicMock(), {}, scratch, manifest, tracked)
 
-            output = stdout.getvalue()
-            self.assertIn("Verifying final installation...", output)
-            self.assertIn("Patch operations:", output)
-            self.assertNotIn("Final verification:", output)
+            self.assertIsInstance(duration, float)
+            self.assertIn("Patch operations:", stdout.getvalue())
+            self.assertNotIn("Final verification:", stdout.getvalue())
 
     def test_in_place_backup_is_kept_if_base_changes_before_modification(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
