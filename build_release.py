@@ -109,6 +109,15 @@ def validate_release_output_available() -> Path:
             raise FileExistsError(f"Release output temporary file already exists: {temporary}")
     return archive
 
+def clean_stale_release_temp() -> None:
+    if not RELEASE_TEMP_DIR.exists():
+        return
+    print("[Cleaning] Previous temporary build files")
+    try:
+        shutil.rmtree(RELEASE_TEMP_DIR)
+    except OSError as exc:
+        raise RuntimeError(f"Could not remove previous temporary build files: {RELEASE_TEMP_DIR}") from exc
+
 def find_project_licenses() -> list[Path]:
     licenses: set[Path] = set()
     for pattern in ("LICENSE*", "COPYING*"):
@@ -390,6 +399,7 @@ def main() -> int:
         archive = release_archive_path()
         with operation_lock("release", archive, "release build for this version"):
             validate_release_output_available()
+            clean_stale_release_temp()
             run_source_tests()
             release_name = f"NinjaPatchTool-v{VERSION}"
             RELEASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)

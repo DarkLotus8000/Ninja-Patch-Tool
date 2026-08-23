@@ -255,17 +255,29 @@ This should not be included.
         self.assertEqual(build_release.RELEASE_TEMP_DIR, build_release.ROOT / "release_temp")
         self.assertNotEqual(build_release.RELEASE_TEMP_DIR, common.TEMP_ROOT)
 
-    def test_release_temp_parent_cleanup_ignores_nonempty_directory(self) -> None:
+    def test_stale_release_temp_is_removed_before_build(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release_temp = Path(tmp) / "release_temp"
-            release_temp.mkdir()
-            (release_temp / "keep").write_text("keep", encoding="utf-8")
-            with mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp):
-                try:
-                    build_release.RELEASE_TEMP_DIR.rmdir()
-                except OSError:
-                    pass
-            self.assertTrue(release_temp.is_dir())
+            nested = release_temp / "old_build" / "build"
+            nested.mkdir(parents=True)
+            (nested / "leftover.bin").write_bytes(b"leftover")
+            with (
+                mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp),
+                mock.patch("builtins.print") as print_mock,
+            ):
+                build_release.clean_stale_release_temp()
+            self.assertFalse(release_temp.exists())
+            print_mock.assert_called_once_with("[Cleaning] Previous temporary build files")
+
+    def test_stale_release_temp_cleanup_is_silent_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_temp = Path(tmp) / "release_temp"
+            with (
+                mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp),
+                mock.patch("builtins.print") as print_mock,
+            ):
+                build_release.clean_stale_release_temp()
+            print_mock.assert_not_called()
 
     def test_release_data_is_allowlisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -955,7 +967,7 @@ class ApplyPatchTests(unittest.TestCase):
             self.assertEqual((destination / "Node" / "child.txt").read_bytes(), b"child")
             self.assertEqual(
                 first_stdout.getvalue().strip().splitlines(),
-                ["[Removed 1/2] Node", "[Added 2/2] Node/child.txt"],
+                ["[Removed 1/2] Node", f"[Added 2/2] {common.display_relative_path('Node/child.txt')}"],
             )
 
             remove_child = {"type": "remove", "path": "Node/child.txt", "old_size": 5, "old_sha256": sha256_bytes(b"child")}
@@ -967,7 +979,7 @@ class ApplyPatchTests(unittest.TestCase):
             self.assertEqual((destination / "Node").read_bytes(), b"new-node")
             self.assertEqual(
                 second_stdout.getvalue().strip().splitlines(),
-                ["[Removed 1/2] Node/child.txt", "[Added 2/2] Node"],
+                [f"[Removed 1/2] {common.display_relative_path('Node/child.txt')}", "[Added 2/2] Node"],
             )
 
     def test_backup_is_verified_before_modification(self) -> None:
@@ -1309,8 +1321,8 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch("sys.stdout", make_stdout),
             ):
                 self.assertEqual(make_patch.main(), 0)
-            self.assertIn("[Diffing 1/1] Cache.Windows/data.bin (memory mode)", make_stdout.getvalue())
-            self.assertIn("[Finished 1/1] Cache.Windows/data.bin", make_stdout.getvalue())
+            self.assertIn(f"[Diffing 1/1] {common.display_relative_path('Cache.Windows/data.bin')} (memory mode)", make_stdout.getvalue())
+            self.assertIn(f"[Finished 1/1] {common.display_relative_path('Cache.Windows/data.bin')}", make_stdout.getvalue())
 
             with zipfile.ZipFile(patch_path, "r") as archive:
                 manifest = json.loads(archive.read("manifest.json"))
@@ -1334,7 +1346,7 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch("sys.stdout", apply_stdout),
             ):
                 self.assertEqual(apply_patch.main(), 0)
-            self.assertIn("[Patched 1/1] Cache.Windows/data.bin", apply_stdout.getvalue())
+            self.assertIn(f"[Patched 1/1] {common.display_relative_path('Cache.Windows/data.bin')}", apply_stdout.getvalue())
 
             expected_hash, expected_count = tree_identity(new)
             actual_hash, actual_count = tree_identity(destination)
