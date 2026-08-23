@@ -1102,8 +1102,17 @@ class ApplyPatchTests(unittest.TestCase):
                 "unchanged.bin": {"path": target, "size": 9, "sha256": sha256_bytes(b"unchanged"), "mtime_ns": stat.st_mtime_ns}
             }
             manifest = {"operations": [], "new_root_sha256": common.root_sha256_from_files(tracked), "new_file_count": 1}
-            with mock.patch.object(apply_patch, "tree_matches", side_effect=AssertionError("full rehash should not run")):
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(apply_patch, "tree_matches", side_effect=AssertionError("full rehash should not run")),
+                mock.patch("sys.stdout", stdout),
+            ):
                 apply_patch.apply_and_verify(destination, mock.MagicMock(), {}, scratch, manifest, tracked)
+
+            output = stdout.getvalue()
+            self.assertIn("Verifying final installation...", output)
+            self.assertIn("Patch operations:", output)
+            self.assertNotIn("Final verification:", output)
 
     def test_in_place_backup_is_kept_if_base_changes_before_modification(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

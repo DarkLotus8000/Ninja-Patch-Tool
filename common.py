@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 def get_tool_dir() -> Path:
     if getattr(sys, "frozen", False):

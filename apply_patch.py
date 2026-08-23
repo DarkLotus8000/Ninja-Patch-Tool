@@ -728,24 +728,22 @@ def apply_and_verify(
     scratch: Path,
     manifest: dict,
     tracked_files: dict[str, dict] | None = None,
-) -> tuple[float, float]:
+) -> float:
     print("\nApplying patch...")
     patch_started = time.perf_counter()
     apply_operations(destination, archive, members, scratch, manifest["operations"], tracked_files)
     patch_duration = time.perf_counter() - patch_started
 
     print("\nVerifying final installation...")
-    verify_started = time.perf_counter()
     if tracked_files is None:
         valid = tree_matches(destination, manifest["new_root_sha256"], manifest["new_file_count"], "Hashing final installation")
     else:
         verify_scanned_tree(destination, tracked_files)
         valid = len(tracked_files) == manifest["new_file_count"] and root_sha256_from_files(tracked_files).lower() == manifest["new_root_sha256"].lower()
-    verification_duration = time.perf_counter() - verify_started
     if not valid:
         raise RuntimeError("Final installation verification failed.")
-    print(f"Patch operations: {format_duration(patch_duration)}\nFinal verification: {format_duration(verification_duration)}")
-    return patch_duration, verification_duration
+    print(f"Patch operations: {format_duration(patch_duration)}")
+    return patch_duration
 
 def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool) -> int:
     try:
