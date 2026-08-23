@@ -788,6 +788,50 @@ class MakePatchTests(unittest.TestCase):
                 self.assertEqual(make_patch.main(), 1)
             self.assertIn("Patch output must not be inside", stderr.getvalue())
 
+    def test_make_rejects_different_paths_with_identical_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, new = root / "base", root / "new"
+            make_warframe_root(base)
+            (base / "Cache.Windows" / "data.bin").write_bytes(b"same")
+            shutil.copytree(base, new)
+
+            base_files, base_hash = common.scan_tree(base)
+            index_path = root / "index.json"
+            index_path.write_text(json.dumps({
+                "U43.5.1": {
+                    "steam_manifest_id": 4895911296145320793,
+                    "sha256": base_hash,
+                    "file_count": len(base_files),
+                }
+            }), encoding="utf-8")
+
+            hdiffz = root / "hdiffz.exe"
+            hdiffz.write_bytes(b"fake")
+            output = root / "out.patch"
+            temp_root = root / "temp"
+            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.1"]
+            stderr = io.StringIO()
+
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(common, "INDEX_FILE", index_path),
+                mock.patch.object(common, "TEMP_ROOT", temp_root),
+                mock.patch.object(make_patch, "TEMP_ROOT", temp_root),
+                mock.patch.object(make_patch, "HDIFFZ", hdiffz),
+                mock.patch.object(make_patch, "make_work_dir") as make_work_dir,
+                mock.patch.object(make_patch, "run_hdiff") as run_hdiff,
+                mock.patch.object(make_patch, "install_termination_handlers"),
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(make_patch.main(), 1)
+
+            self.assertIn("Base and new installations are identical.", stderr.getvalue())
+            self.assertIn("There are no changes to include in a patch.", stderr.getvalue())
+            self.assertFalse(output.exists())
+            make_work_dir.assert_not_called()
+            run_hdiff.assert_not_called()
+
     def test_make_aborts_if_source_changes_after_scan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

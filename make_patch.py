@@ -389,6 +389,13 @@ def main() -> int:
 
         print(f'[Verified] Base "{canonical_name}" is unmodified.\nCompression: {args.compression}\nScanning and hashing the new installation...')
         new_files, new_root_hash = scan_tree(new, "Hashing new installation")
+
+        if old_root_hash.lower() == new_root_hash.lower() and len(old_files) == len(new_files):
+            raise RuntimeError(
+                "Base and new installations are identical.\n"
+                "There are no changes to include in a patch."
+            )
+
         old_names, new_names = set(old_files), set(new_files)
         common_names = old_names & new_names
         added = sorted(new_names - old_names)
