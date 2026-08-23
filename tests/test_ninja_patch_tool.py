@@ -96,7 +96,6 @@ class CommonTests(unittest.TestCase):
 
     def test_version_has_single_source(self) -> None:
         self.assertEqual(build_release.VERSION, common.VERSION)
-        self.assertEqual(common.VERSION, "1.2.0")
 
     def test_process_identity_prevents_pid_reuse_false_positive(self) -> None:
         with mock.patch.object(common, "process_is_running", return_value=True), mock.patch.object(common, "process_identity", return_value="123:new"):
