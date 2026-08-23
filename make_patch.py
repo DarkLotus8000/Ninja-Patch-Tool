@@ -420,6 +420,8 @@ def main() -> int:
         diffs_dir.mkdir()
         operations = []
         full_file_sources: dict[str, dict] = {}
+        total_operations = len(modified) + len(added) + len(removed)
+        completed_operations = 0
 
         for relative in modified:
             old_info, new_info = old_files[relative], new_files[relative]
@@ -429,7 +431,8 @@ def main() -> int:
                 mode = "stream"
             else:
                 mode = "memory"
-            print(f"[Diffing] {display_relative_path(relative)} ({mode} mode)")
+            operation_number = completed_operations + 1
+            print(f"[Diffing {operation_number}/{total_operations}] {display_relative_path(relative)} ({mode} mode)")
             verify_scanned_file(old_info)
             verify_scanned_file(new_info)
             run_hdiff(old_info["path"], new_info["path"], diff_path, args.compression)
@@ -461,6 +464,9 @@ def main() -> int:
                     "new_sha256": new_info["sha256"],
                 })
 
+            completed_operations += 1
+            print(f"[Finished {completed_operations}/{total_operations}] {display_relative_path(relative)}")
+
         for relative in added:
             info = new_files[relative]
             payload = f"files/{payload_id(relative)}.bin"
@@ -472,7 +478,8 @@ def main() -> int:
                 "new_size": info["size"],
                 "new_sha256": info["sha256"],
             })
-            print(f"[Added] {display_relative_path(relative)}")
+            completed_operations += 1
+            print(f"[Added {completed_operations}/{total_operations}] {display_relative_path(relative)}")
 
         for relative in removed:
             info = old_files[relative]
@@ -482,7 +489,8 @@ def main() -> int:
                 "old_size": info["size"],
                 "old_sha256": info["sha256"],
             })
-            print(f"[Removed] {display_relative_path(relative)}")
+            completed_operations += 1
+            print(f"[Removed {completed_operations}/{total_operations}] {display_relative_path(relative)}")
 
         verify_scanned_tree(base, old_files)
         verify_scanned_tree(new, new_files)

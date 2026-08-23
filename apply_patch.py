@@ -317,8 +317,10 @@ def apply_operations(
     tracked_files: dict[str, dict] | None = None,
 ) -> None:
     payload_file = scratch / "payload.hdiff"
+    ordered = ordered_operations(operations)
+    total_operations = len(ordered)
 
-    for operation in ordered_operations(operations):
+    for operation_number, operation in enumerate(ordered, start=1):
         operation_type = operation["type"]
         relative_path = operation["path"]
         normalized_path = normalized_relative_path(relative_path)
@@ -330,7 +332,7 @@ def apply_operations(
             if tracked_files is not None:
                 tracked_files.pop(normalized_path, None)
             prune_empty_parents(target.parent, destination)
-            print(f"[Removed] {display_relative_path(relative_path)}")
+            print(f"[Removed {operation_number}/{total_operations}] {display_relative_path(relative_path)}")
             continue
 
         temporary = temporary_output(target)
@@ -353,7 +355,7 @@ def apply_operations(
                 payload_file.unlink(missing_ok=True)
                 temporary.unlink(missing_ok=True)
 
-            print(f"[Patched] {display_relative_path(relative_path)}")
+            print(f"[Patched {operation_number}/{total_operations}] {display_relative_path(relative_path)}")
             continue
 
         if operation_type == "replace":
@@ -373,7 +375,7 @@ def apply_operations(
             action = "Patched"
         else:
             action = "Added"
-        print(f"[{action}] {display_relative_path(relative_path)}")
+        print(f"[{action} {operation_number}/{total_operations}] {display_relative_path(relative_path)}")
 
 def case_only_additions(operations: list[dict]) -> set[str]:
     removed = {}

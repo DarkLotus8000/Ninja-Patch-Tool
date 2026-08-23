@@ -949,17 +949,27 @@ class ApplyPatchTests(unittest.TestCase):
 
             remove_node = {"type": "remove", "path": "Node", "old_size": 3, "old_sha256": sha256_bytes(b"old")}
             add_child = {"type": "add", "path": "Node/child.txt", "payload": "files/child.bin", "new_size": 5, "new_sha256": sha256_bytes(b"child")}
-            with zipfile.ZipFile(archive_path, "r") as archive:
+            first_stdout = io.StringIO()
+            with zipfile.ZipFile(archive_path, "r") as archive, mock.patch("sys.stdout", first_stdout):
                 members = apply_patch.read_archive_members(archive)
                 apply_patch.apply_operations(destination, archive, members, scratch, [add_child, remove_node])
             self.assertEqual((destination / "Node" / "child.txt").read_bytes(), b"child")
+            self.assertEqual(
+                first_stdout.getvalue().strip().splitlines(),
+                ["[Removed 1/2] Node", "[Added 2/2] Node/child.txt"],
+            )
 
             remove_child = {"type": "remove", "path": "Node/child.txt", "old_size": 5, "old_sha256": sha256_bytes(b"child")}
             add_node = {"type": "add", "path": "Node", "payload": "files/node.bin", "new_size": 8, "new_sha256": sha256_bytes(b"new-node")}
-            with zipfile.ZipFile(archive_path, "r") as archive:
+            second_stdout = io.StringIO()
+            with zipfile.ZipFile(archive_path, "r") as archive, mock.patch("sys.stdout", second_stdout):
                 members = apply_patch.read_archive_members(archive)
                 apply_patch.apply_operations(destination, archive, members, scratch, [add_node, remove_child])
             self.assertEqual((destination / "Node").read_bytes(), b"new-node")
+            self.assertEqual(
+                second_stdout.getvalue().strip().splitlines(),
+                ["[Removed 1/2] Node/child.txt", "[Added 2/2] Node"],
+            )
 
     def test_backup_is_verified_before_modification(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1288,6 +1298,7 @@ class ApplyPatchTests(unittest.TestCase):
                 output.write_bytes(b"d")
 
             make_argv = ["make_patch.py", str(base), str(new), str(patch_path), "U43.5.1"]
+            make_stdout = io.StringIO()
             with (
                 mock.patch.object(sys, "argv", make_argv),
                 mock.patch.object(common, "INDEX_FILE", index_path),
@@ -1296,8 +1307,11 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch.object(make_patch, "HDIFFZ", hdiffz),
                 mock.patch.object(make_patch, "run_hdiff_command", side_effect=fake_hdiff),
                 mock.patch.object(make_patch, "install_termination_handlers"),
+                mock.patch("sys.stdout", make_stdout),
             ):
                 self.assertEqual(make_patch.main(), 0)
+            self.assertIn("[Diffing 1/1] Cache.Windows/data.bin (memory mode)", make_stdout.getvalue())
+            self.assertIn("[Finished 1/1] Cache.Windows/data.bin", make_stdout.getvalue())
 
             with zipfile.ZipFile(patch_path, "r") as archive:
                 manifest = json.loads(archive.read("manifest.json"))
@@ -1309,6 +1323,7 @@ class ApplyPatchTests(unittest.TestCase):
                 return 0
 
             apply_argv = ["apply_patch.py", str(base), str(patch_path), "--output", str(destination)]
+            apply_stdout = io.StringIO()
             with (
                 mock.patch.object(sys, "argv", apply_argv),
                 mock.patch.object(common, "TEMP_ROOT", temp_root),
@@ -1317,8 +1332,10 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch.object(apply_patch, "scan_tree", side_effect=AssertionError("separate mode should not pre-hash the base")),
                 mock.patch.object(apply_patch, "run_child", side_effect=fake_hpatch),
                 mock.patch.object(apply_patch, "install_termination_handlers"),
+                mock.patch("sys.stdout", apply_stdout),
             ):
                 self.assertEqual(apply_patch.main(), 0)
+            self.assertIn("[Patched 1/1] Cache.Windows/data.bin", apply_stdout.getvalue())
 
             expected_hash, expected_count = tree_identity(new)
             actual_hash, actual_count = tree_identity(destination)
