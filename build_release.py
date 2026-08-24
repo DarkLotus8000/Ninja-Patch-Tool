@@ -245,6 +245,8 @@ def build_executable(script: Path, dist: Path, work: Path, specs: Path) -> Path:
         "-m",
         "PyInstaller",
         "--noconfirm",
+        "--log-level",
+        "WARN",
         "--onefile",
         "--console",
         "--noupx",

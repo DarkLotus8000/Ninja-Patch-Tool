@@ -402,6 +402,8 @@ This should not be included.
             version_index = commands[0].index("--version-file")
             self.assertEqual(commands[0][icon_index + 1], str(build_release.FAVICON))
             self.assertTrue(Path(commands[0][version_index + 1]).is_file())
+            log_level_index = commands[0].index("--log-level")
+            self.assertEqual(commands[0][log_level_index + 1], "WARN")
             self.assertNotIn("--clean", commands[0])
             self.assertEqual(environments[0]["TEMP"], str(dist.parent))
             self.assertEqual(environments[0]["TMP"], str(dist.parent))
