@@ -386,7 +386,7 @@ def main() -> int:
             run_source_tests()
             RELEASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
             try:
-                with tempfile.TemporaryDirectory(prefix="ninja_patch_tool_release_", dir=RELEASE_TEMP_DIR) as temporary_dir:
+                with tempfile.TemporaryDirectory(prefix="npt_release_", dir=RELEASE_TEMP_DIR) as temporary_dir:
                     temporary = Path(temporary_dir)
                     dist = temporary / "dist"
                     work = temporary / "build"

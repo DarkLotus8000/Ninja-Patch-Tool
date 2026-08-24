@@ -254,6 +254,11 @@ This should not be included.
         self.assertEqual(build_release.RELEASE_TEMP_DIR, build_release.ROOT / "release_temp")
         self.assertNotEqual(build_release.RELEASE_TEMP_DIR, common.TEMP_ROOT)
 
+    def test_release_temp_workspace_uses_short_npt_prefix(self) -> None:
+        source = Path(build_release.__file__).read_text(encoding="utf-8")
+        self.assertIn('TemporaryDirectory(prefix="npt_release_"', source)
+        self.assertNotIn('TemporaryDirectory(prefix="ninja_patch_tool_release_"', source)
+
     def test_stale_release_temp_is_removed_before_build(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release_temp = Path(tmp) / "release_temp"
