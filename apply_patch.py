@@ -34,7 +34,7 @@ from common import (
     process_identity,
     process_matches_identity,
     relative_path_parts,
-    resolve_patch_input,
+    resolve_patch_path,
     root_sha256_from_files,
     run_child,
     safe_join,
@@ -977,7 +977,7 @@ def main() -> int:
     args = parser.parse_args()
 
     base = args.base.resolve()
-    patch = resolve_patch_input(args.patch)
+    patch = resolve_patch_path(args.patch)
 
     if not base.is_dir():
         print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)

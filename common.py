@@ -40,11 +40,8 @@ def sha256_file(path: Path) -> str:
 def is_ignored_file(path: Path) -> bool:
     return path.name.casefold() in IGNORED_FILENAMES
 
-def is_warframe_installation(path: Path) -> bool:
-    return (path / "Cache.Windows").is_dir() and (path / "Tools").is_dir() and (path / "Warframe.x64.exe").is_file()
-
 def validate_warframe_installation(path: Path, label: str) -> bool:
-    if is_warframe_installation(path):
+    if (path / "Cache.Windows").is_dir() and (path / "Tools").is_dir() and (path / "Warframe.x64.exe").is_file():
         return True
     print(
         f"ERROR: {label} directory is not a Warframe installation root:\n"
@@ -577,15 +574,8 @@ class SingleUseStoreTrueAction(argparse.Action):
         setattr(namespace, marker, True)
         setattr(namespace, self.dest, True)
 
-def resolve_patch_output(path: Path) -> Path:
-    """Resolve a patch output path without creating directories; bare filenames go to <tool>/output/."""
-    path = ensure_patch_extension(path)
-    if path.parent == Path("."):
-        return TOOL_DIR / "output" / path.name
-    return path.resolve()
-
-def resolve_patch_input(path: Path) -> Path:
-    """Resolve a patch input path; bare filenames are looked up in <tool>/output/."""
+def resolve_patch_path(path: Path) -> Path:
+    """Resolve a patch path; bare filenames use <tool>/output/."""
     path = ensure_patch_extension(path)
     if path.parent == Path("."):
         return TOOL_DIR / "output" / path.name

@@ -29,7 +29,7 @@ from common import (
     process_identity,
     process_matches_identity,
     resolve_base_name,
-    resolve_patch_output,
+    resolve_patch_path,
     run_child,
     scan_tree,
     validate_warframe_installation,
@@ -336,7 +336,7 @@ def main() -> int:
 
     base = args.base.resolve()
     new = args.new.resolve()
-    output = resolve_patch_output(args.output)
+    output = resolve_patch_path(args.output)
 
     if not base.is_dir():
         print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)

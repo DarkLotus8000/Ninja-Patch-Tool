@@ -135,8 +135,9 @@ class CommonTests(unittest.TestCase):
             root = Path(tmp)
             make_warframe_root(root)
             (root / "installscript.vdf").write_text("extra", encoding="utf-8")
-            self.assertTrue(common.is_warframe_installation(root))
-            self.assertFalse(common.is_warframe_installation(root.parent))
+            self.assertTrue(common.validate_warframe_installation(root, "Base"))
+            with mock.patch("sys.stderr", io.StringIO()):
+                self.assertFalse(common.validate_warframe_installation(root.parent, "Base"))
 
     def test_windows_unsafe_paths_are_rejected_on_every_os(self) -> None:
         unsafe_paths = (
@@ -1275,7 +1276,7 @@ class ApplyPatchTests(unittest.TestCase):
             with mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"), mock.patch.object(common, "TEMP_ROOT", root / "temp"):
                 recovered = apply_patch.recover_interrupted_operations(base, base)
             self.assertIsNone(recovered)
-            self.assertTrue(common.is_warframe_installation(base))
+            self.assertTrue(common.validate_warframe_installation(base, "Base"))
             self.assertEqual((base / "Tools" / "tool.bin").read_bytes(), b"tool")
 
     def test_main_recovers_before_warframe_root_validation(self) -> None:
@@ -1311,7 +1312,7 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch("sys.stderr", stderr),
             ):
                 self.assertEqual(apply_patch.main(), 1)
-            self.assertTrue(common.is_warframe_installation(base))
+            self.assertTrue(common.validate_warframe_installation(base, "Base"))
             self.assertIn("Patch file does not exist", stderr.getvalue())
             self.assertNotIn("not a Warframe installation root", stderr.getvalue())
 
