@@ -1,6 +1,6 @@
 # Ninja Patch Tool
 
-Ninja Patch Tool creates and applies self-contained Ninja Patches (Diff Patches) using HDiffPatch. Use Ninja Reverse Proxy (not published yet) instead when a normal Update Patch can be created; Ninja Patch Tool is intended as a fallback.
+Ninja Patch Tool creates and applies self-contained Ninja Patches (Diff Patches) using HDiffPatch. Use Ninja Capture Tool (not published yet) instead when a normal Update Patch can be created; Ninja Patch Tool is intended as a fallback.
 
 A ***base*** is a clean, unmodified Warframe installation from a known Steam manifest. Select the Warframe installation root, where at least `Cache.Windows`, `Tools`, and `Warframe.x64.exe` are directly located.
 Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/depot/230411/manifests/).
@@ -9,6 +9,8 @@ Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/
 
 - Windows 10 (64-bit) or newer
 - Python 3.14 (not required for release executables)
+
+Ninja Patch Tool targets Windows. On non-Windows systems, use the Windows release executables through Wine; native Linux/macOS source execution is not supported. Wine compatibility is not yet officially verified.
 
 No packages need to be installed to run the tool from source. Building a release additionally requires PyInstaller.
 

@@ -75,15 +75,9 @@ def temporary_patch_path(output: Path) -> Path:
 
 def publish_patch_archive(temporary: Path, output: Path) -> None:
     try:
-        if os.name == "nt":
-            # Unlike os.replace(), Windows os.rename() fails if the destination already exists, so another process
-            # cannot have its file overwritten during publication.
-            temporary.rename(output)
-        else:
-            # Keep the same no-overwrite guarantee on non-Windows systems used by the test suite, where os.rename()
-            # may replace an existing destination.
-            os.link(temporary, output)
-            temporary.unlink()
+        # Unlike os.replace(), Windows os.rename() fails if the destination already exists, so another process cannot
+        # have its file overwritten during publication. Wine follows the Windows behavior for this Windows build.
+        temporary.rename(output)
     except FileExistsError:
         raise FileExistsError(f"Patch output appeared while the patch was being created: {output}") from None
 

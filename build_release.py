@@ -12,7 +12,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from common import VERSION, operation_lock, parse_json, sha256_file, validate_index
+from common import VERSION, format_bytes, operation_lock, parse_json, sha256_file, validate_index
 
 COMPANY_NAME = "DarkLotus"
 ROOT = Path(__file__).resolve().parent
@@ -20,13 +20,15 @@ RELEASE_DIR = ROOT / "release"
 RELEASE_TEMP_DIR = ROOT / "release_temp"
 DATA_DIR = ROOT / "data"
 FAVICON = DATA_DIR / "favicon.ico"
+LICENSES_DIR = DATA_DIR / "licenses"
 ENTRY_SCRIPTS = {
     "add_base.py": "Add Base - Ninja Patch Tool",
     "verify_base.py": "Verify Base - Ninja Patch Tool",
     "make_patch.py": "Make Patch - Ninja Patch Tool",
     "apply_patch.py": "Apply Patch - Ninja Patch Tool",
 }
-RELEASE_DATA_FILES = ("index.json", "hdiffz.exe", "hpatchz.exe", "Python_LICENSE.txt", "HDiffPatch_LICENSE.txt")
+RELEASE_DATA_FILES = ("index.json", "hdiffz.exe", "hpatchz.exe")
+THIRD_PARTY_LICENSE_FILES = ("Python_LICENSE.txt", "HDiffPatch_LICENSE.txt")
 MIN_PYINSTALLER_VERSION = (6, 15, 0)
 
 def clean_markdown_inline(text: str) -> str:
@@ -149,11 +151,24 @@ def validate_ico(path: Path) -> None:
     directory_end = 6 + count * 16
     if reserved != 0 or icon_type != 1 or count == 0 or len(data) < directory_end:
         raise RuntimeError(f"Invalid ICO file: {path}")
+
+    has_modern_256 = False
     for index in range(count):
         entry_offset = 6 + index * 16
+        width = data[entry_offset] or 256
+        height = data[entry_offset + 1] or 256
         size, offset = struct.unpack_from("<II", data, entry_offset + 8)
         if size == 0 or offset < directory_end or offset + size > len(data):
             raise RuntimeError(f"Invalid ICO file: {path}")
+
+        payload = data[offset:offset + size]
+        if width == 256 and height == 256 and payload.startswith(b"\x89PNG\r\n\x1a\n"):
+            # PNG color types 4 and 6 contain an alpha channel.
+            if len(payload) >= 26 and payload[12:16] == b"IHDR" and payload[25] in {4, 6}:
+                has_modern_256 = True
+
+    if not has_modern_256:
+        raise RuntimeError(f"ICO must contain a transparent 256x256 PNG-compressed image: {path}")
 
 def validate_build_environment() -> list[Path]:
     if sys.platform != "win32":
@@ -172,6 +187,7 @@ def validate_build_environment() -> list[Path]:
     required = [ROOT / script for script in ENTRY_SCRIPTS]
     required.extend([ROOT / "common.py", ROOT / "README.md", FAVICON])
     required.extend(DATA_DIR / name for name in RELEASE_DATA_FILES)
+    required.extend(LICENSES_DIR / name for name in THIRD_PARTY_LICENSE_FILES)
     missing = [path for path in required if not path.is_file()]
     if missing:
         details = "\n".join(f"- {path}" for path in missing)
@@ -319,19 +335,23 @@ def populate_release(stage: Path, dist: Path, project_licenses: list[Path]) -> N
     release_data.mkdir()
     for name in RELEASE_DATA_FILES:
         shutil.copy2(DATA_DIR / name, release_data / name)
+
+    release_licenses = release_data / "licenses"
+    release_licenses.mkdir()
+    for name in THIRD_PARTY_LICENSE_FILES:
+        shutil.copy2(LICENSES_DIR / name, release_licenses / name)
     for license_file in project_licenses:
-        shutil.copy2(license_file, stage / license_file.name)
+        destination = release_licenses / license_file.name
+        if destination.exists():
+            raise RuntimeError(f"License filename collision while staging release: {license_file.name}")
+        shutil.copy2(license_file, destination)
 
     readme = create_release_readme((ROOT / "README.md").read_text(encoding="utf-8"))
     (stage / "README.txt").write_text(readme, encoding="utf-8", newline="\r\n")
 
 def publish_without_overwrite(temporary: Path, output: Path) -> None:
     try:
-        if os.name == "nt":
-            temporary.rename(output)
-        else:
-            os.link(temporary, output)
-            temporary.unlink()
+        temporary.rename(output)
     except FileExistsError:
         raise FileExistsError(f"Release output appeared while the release was being created: {output}") from None
 
@@ -410,7 +430,7 @@ def main() -> int:
         print(f"\n[Created] {archive}")
         print(
             f"Version: {VERSION}\n"
-            f"Size: {archive.stat().st_size / (1024 * 1024):.1f} MiB\n"
+            f"Size: {format_bytes(archive.stat().st_size)}\n"
             f"SHA-256: {digest}\n"
             f"Checksum: {checksum}"
         )

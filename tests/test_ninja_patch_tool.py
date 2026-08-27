@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -238,6 +239,10 @@ This should not be included.
         self.assertNotIn("py apply_patch.py base patch [-o OUTPUT | -i]", readme)
         for technical in ("HDiff payloads", "DEFLATE", "LZMA", "ZIP compression"):
             self.assertNotIn(technical, readme)
+        self.assertIn("Ninja Capture Tool", readme)
+        self.assertNotIn("Ninja Reverse Proxy", readme)
+        self.assertIn("through Wine", readme)
+        self.assertIn("native Linux/macOS source execution is not supported", readme)
 
         release_readme = build_release.create_release_readme(readme)
         for technical in ("HDiff payloads", "DEFLATE", "LZMA", "ZIP compression"):
@@ -250,6 +255,7 @@ This should not be included.
         self.assertEqual(apply_patch.HPATCHZ, common.DATA_DIR / "hpatchz.exe")
         self.assertEqual(build_release.DATA_DIR, build_release.ROOT / "data")
         self.assertEqual(build_release.FAVICON, build_release.DATA_DIR / "favicon.ico")
+        self.assertEqual(build_release.LICENSES_DIR, build_release.DATA_DIR / "licenses")
 
     def test_release_temp_directory_is_separate_from_patch_temp(self) -> None:
         self.assertEqual(build_release.RELEASE_TEMP_DIR, build_release.ROOT / "release_temp")
@@ -288,17 +294,20 @@ This should not be included.
             data.mkdir()
             dist.mkdir()
 
-            expected = {
-                "index.json",
-                "hdiffz.exe",
-                "hpatchz.exe",
-                "Python_LICENSE.txt",
-                "HDiffPatch_LICENSE.txt",
-            }
-            self.assertEqual(set(build_release.RELEASE_DATA_FILES), expected)
-            for name in expected:
+            expected_data = {"index.json", "hdiffz.exe", "hpatchz.exe"}
+            expected_licenses = {"Python_LICENSE.txt", "HDiffPatch_LICENSE.txt", "LICENSE"}
+            self.assertEqual(set(build_release.RELEASE_DATA_FILES), expected_data)
+            self.assertEqual(set(build_release.THIRD_PARTY_LICENSE_FILES), {"Python_LICENSE.txt", "HDiffPatch_LICENSE.txt"})
+            for name in expected_data:
                 (data / name).write_bytes(b"{}" if name == "index.json" else name.encode("ascii"))
 
+            licenses = data / "licenses"
+            licenses.mkdir()
+            for name in build_release.THIRD_PARTY_LICENSE_FILES:
+                (licenses / name).write_text(name, encoding="ascii")
+
+            project_license = root / "LICENSE"
+            project_license.write_text("project license", encoding="ascii")
             (data / "favicon.ico").write_bytes(b"icon")
             (data / "notes.txt").write_text("do not ship", encoding="utf-8")
             (data / "README.md").write_text("source-only data notes", encoding="utf-8")
@@ -307,11 +316,13 @@ This should not be included.
             with (
                 mock.patch.object(build_release, "ROOT", root),
                 mock.patch.object(build_release, "DATA_DIR", data),
+                mock.patch.object(build_release, "LICENSES_DIR", licenses),
                 mock.patch.object(build_release, "ENTRY_SCRIPTS", ()),
             ):
-                build_release.populate_release(stage, dist, [])
+                build_release.populate_release(stage, dist, [project_license])
 
-            self.assertEqual({path.name for path in (stage / "data").iterdir()}, expected)
+            self.assertEqual({path.name for path in (stage / "data").iterdir()}, {*expected_data, "licenses"})
+            self.assertEqual({path.name for path in (stage / "data" / "licenses").iterdir()}, expected_licenses)
 
     def test_release_preflight_validates_x64_pe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -335,6 +346,18 @@ This should not be included.
             icon.write_bytes(b"not an icon")
             with self.assertRaisesRegex(RuntimeError, "Invalid ICO"):
                 build_release.validate_ico(icon)
+
+            old_style = Path(tmp) / "old-style.ico"
+            payload = b"not-png"
+            old_style.write_bytes(
+                b"\x00\x00\x01\x00\x01\x00"
+                + b"\x00\x00\x00\x00\x01\x00\x20\x00"
+                + len(payload).to_bytes(4, "little")
+                + (22).to_bytes(4, "little")
+                + payload
+            )
+            with self.assertRaisesRegex(RuntimeError, "transparent 256x256 PNG-compressed"):
+                build_release.validate_ico(old_style)
 
     def test_release_checksum_is_generated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -479,6 +502,7 @@ This should not be included.
                 with self.assertRaisesRegex(FileExistsError, "already exists"):
                     build_release.validate_release_output_available()
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows mutex test")
     def test_operation_lock_rejects_same_target_concurrently(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -489,6 +513,7 @@ This should not be included.
                         with common.operation_lock("test", target, "test operation"):
                             pass
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows mutex test")
     def test_operation_lock_can_be_reacquired_after_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -687,7 +712,8 @@ class MakePatchTests(unittest.TestCase):
 
             def race(temporary: Path, destination: Path) -> None:
                 destination.write_bytes(b"unrelated")
-                original_publish(temporary, destination)
+                with mock.patch.object(Path, "rename", side_effect=FileExistsError):
+                    original_publish(temporary, destination)
 
             with mock.patch.object(make_patch, "publish_patch_archive", side_effect=race):
                 with self.assertRaisesRegex(FileExistsError, "appeared while the patch was being created"):
@@ -813,6 +839,7 @@ class MakePatchTests(unittest.TestCase):
                 mock.patch.object(common, "TEMP_ROOT", temp_root),
                 mock.patch.object(make_patch, "TEMP_ROOT", temp_root),
                 mock.patch.object(make_patch, "HDIFFZ", hdiffz),
+                mock.patch.object(make_patch, "operation_lock", side_effect=lambda *args: nullcontext()),
                 mock.patch.object(make_patch, "make_work_dir") as make_work_dir,
                 mock.patch.object(make_patch, "run_hdiff") as run_hdiff,
                 mock.patch.object(make_patch, "install_termination_handlers"),
@@ -862,6 +889,8 @@ class MakePatchTests(unittest.TestCase):
                 mock.patch.object(common, "TEMP_ROOT", temp_root),
                 mock.patch.object(make_patch, "TEMP_ROOT", temp_root),
                 mock.patch.object(make_patch, "HDIFFZ", hdiffz),
+                mock.patch.object(make_patch, "operation_lock", side_effect=lambda *args: nullcontext()),
+                mock.patch.object(make_patch, "process_identity", return_value="test-process"),
                 mock.patch.object(make_patch, "run_hdiff", side_effect=changing_hdiff),
                 mock.patch.object(make_patch, "install_termination_handlers"),
                 mock.patch("sys.stderr", stderr),
@@ -1308,6 +1337,7 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"),
                 mock.patch.object(common, "TEMP_ROOT", root / "temp"),
+                mock.patch.object(apply_patch, "operation_lock", side_effect=lambda *args: nullcontext()),
                 mock.patch.object(apply_patch, "install_termination_handlers"),
                 mock.patch("sys.stderr", stderr),
             ):
@@ -1362,6 +1392,8 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch.object(common, "TEMP_ROOT", temp_root),
                 mock.patch.object(make_patch, "TEMP_ROOT", temp_root),
                 mock.patch.object(make_patch, "HDIFFZ", hdiffz),
+                mock.patch.object(make_patch, "operation_lock", side_effect=lambda *args: nullcontext()),
+                mock.patch.object(make_patch, "process_identity", return_value="test-process"),
                 mock.patch.object(make_patch, "run_hdiff_command", side_effect=fake_hdiff),
                 mock.patch.object(make_patch, "install_termination_handlers"),
                 mock.patch("sys.stdout", make_stdout),
@@ -1387,6 +1419,8 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch.object(common, "TEMP_ROOT", temp_root),
                 mock.patch.object(apply_patch, "TEMP_ROOT", temp_root),
                 mock.patch.object(apply_patch, "HPATCHZ", hpatchz),
+                mock.patch.object(apply_patch, "operation_lock", side_effect=lambda *args: nullcontext()),
+                mock.patch.object(apply_patch, "process_identity", return_value="test-process"),
                 mock.patch.object(apply_patch, "scan_tree", side_effect=AssertionError("separate mode should not pre-hash the base")),
                 mock.patch.object(apply_patch, "run_child", side_effect=fake_hpatch),
                 mock.patch.object(apply_patch, "install_termination_handlers"),

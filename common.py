@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import shutil
 import signal
@@ -17,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-VERSION = "1.3.1.1"
+VERSION = "1.3.1.2"
 
 def get_tool_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -28,7 +27,7 @@ TOOL_DIR = get_tool_dir()
 DATA_DIR = TOOL_DIR / "data"
 INDEX_FILE = DATA_DIR / "index.json"
 TEMP_ROOT = TOOL_DIR / "temp"
-# We don't need this garbage.
+# Files intentionally excluded from installation identity and patches.
 IGNORED_FILENAMES = {"launcher.zip", "launcher.exe", "remotecrashsender.exe"}
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: set[str] = set()
@@ -251,61 +250,44 @@ def process_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
 
-    if os.name == "nt":
-        import ctypes
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel32.CloseHandle.restype = ctypes.c_int
-        handle = kernel32.OpenProcess(0x1000, False, pid)
-        if handle:
-            kernel32.CloseHandle(handle)
-            return True
-        return ctypes.get_last_error() == 5
-
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if handle:
+        kernel32.CloseHandle(handle)
         return True
-    return True
+    return ctypes.get_last_error() == 5
 
 def process_identity(pid: int) -> str | None:
-    # A PID can eventually be reused. Pair it with the process creation/start time so stale work is not mistaken for
+    # A PID can eventually be reused. Pair it with the Windows process creation time so stale work is not mistaken for
     # a live Ninja Patch Tool operation merely because an unrelated process later received the same PID.
     if pid <= 0:
         return None
 
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME)]
-        kernel32.GetProcessTimes.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return None
-        try:
-            created, exited, kernel, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
-            if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
-                return None
-            creation = (created.dwHighDateTime << 32) | created.dwLowDateTime
-            return f"{pid}:{creation}"
-        finally:
-            kernel32.CloseHandle(handle)
-
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-        fields = stat[stat.rfind(")") + 2:].split()
-        return f"{pid}:{fields[19]}"
-    except (OSError, IndexError):
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME)]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
         return None
+    try:
+        created, exited, kernel, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        creation = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return f"{pid}:{creation}"
+    finally:
+        kernel32.CloseHandle(handle)
 
 def process_matches_identity(pid: int, identity: object) -> bool:
     if not process_is_running(pid):
@@ -318,72 +300,46 @@ def process_matches_identity(pid: int, identity: object) -> bool:
 
 @contextmanager
 def operation_lock(kind: str, target: Path, description: str):
-    resolved = str(target.resolve())
-    if os.name == "nt":
-        resolved = resolved.casefold()
+    resolved = str(target.resolve()).casefold()
     digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()
     safe_kind = re.sub(r"[^0-9A-Za-z_.-]", "_", kind)
     process_key = f"{safe_kind}:{digest}"
 
-    # Windows mutexes are recursive for the thread that already owns them, so a second acquisition in the same
-    # process would otherwise succeed. Keep a small process-local registry so operation locks have identical
-    # non-reentrant semantics on Windows and POSIX, while the OS lock still protects against other processes.
+    # Windows mutexes are recursive for the thread that already owns them, so keep a small process-local registry
+    # to make a second acquisition in this process fail while the OS mutex protects against other processes.
     with _PROCESS_LOCKS_GUARD:
         if process_key in _PROCESS_LOCKS:
             raise RuntimeError(f"Another {description} is already running for:\n{target}")
         _PROCESS_LOCKS.add(process_key)
 
     try:
-        if os.name == "nt":
-            import ctypes
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
-            kernel32.CreateMutexW.restype = ctypes.c_void_p
-            kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-            kernel32.WaitForSingleObject.restype = ctypes.c_uint32
-            kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
-            kernel32.ReleaseMutex.restype = ctypes.c_int
-            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-            kernel32.CloseHandle.restype = ctypes.c_int
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+        kernel32.ReleaseMutex.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
 
-            handle = kernel32.CreateMutexW(None, False, f"Local\\DarkLotus.NinjaPatchTool.{safe_kind}.{digest}")
-            if not handle:
-                raise OSError(ctypes.get_last_error(), "Could not create the operation mutex.")
-            wait_result = kernel32.WaitForSingleObject(handle, 0)
-            if wait_result == 0x102:
-                kernel32.CloseHandle(handle)
-                raise RuntimeError(f"Another {description} is already running for:\n{target}")
-            if wait_result not in {0, 0x80}:
-                error = ctypes.get_last_error()
-                kernel32.CloseHandle(handle)
-                raise OSError(error, "Could not acquire the operation mutex.")
-            try:
-                yield
-            finally:
-                kernel32.ReleaseMutex(handle)
-                kernel32.CloseHandle(handle)
-            return
-
-        # The project targets Windows, but keep the test/development path safe on POSIX too.
-        import fcntl
-        locks = TEMP_ROOT / "locks"
-        locks.mkdir(parents=True, exist_ok=True)
-        lock_path = locks / f"{safe_kind}_{digest}.lock"
-        with lock_path.open("a+b") as lock_file:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise RuntimeError(f"Another {description} is already running for:\n{target}") from None
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        lock_path.unlink(missing_ok=True)
+        handle = kernel32.CreateMutexW(None, False, f"Local\\DarkLotus.NinjaPatchTool.{safe_kind}.{digest}")
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "Could not create the operation mutex.")
+        wait_result = kernel32.WaitForSingleObject(handle, 0)
+        if wait_result == 0x102:
+            kernel32.CloseHandle(handle)
+            raise RuntimeError(f"Another {description} is already running for:\n{target}")
+        if wait_result not in {0, 0x80}:
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(handle)
+            raise OSError(error, "Could not acquire the operation mutex.")
         try:
-            locks.rmdir()
-            TEMP_ROOT.rmdir()
-        except OSError:
-            pass
+            yield
+        finally:
+            kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
     finally:
         with _PROCESS_LOCKS_GUARD:
             _PROCESS_LOCKS.discard(process_key)
@@ -401,7 +357,7 @@ def relative_path_parts(relative: str) -> tuple[str, ...]:
         raise ValueError(f"Unsafe relative path: {relative!r}")
 
     # Ninja Patches target Warframe on Windows. Reject names that Windows normalizes specially or interprets as
-    # devices/alternate data streams, even when validation runs on another OS.
+    # devices/alternate data streams.
     for part in posix.parts:
         stem = part.split(".", 1)[0].rstrip(" ").casefold()
         if (
@@ -582,4 +538,4 @@ def resolve_patch_path(path: Path) -> Path:
     return path.resolve()
 
 def display_relative_path(relative: str) -> str:
-    return relative.replace("/", os.sep)
+    return relative.replace("/", "\\")
