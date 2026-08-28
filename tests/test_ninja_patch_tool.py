@@ -768,6 +768,34 @@ This should not be included.
             self.assertIsNone(update.handle_automatic_update(args, []))
             load_config.assert_not_called()
 
+    def test_missing_updater_is_rejected_before_update_download(self) -> None:
+        args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+        release = {"version": "1.5", "assets": [], "url": "https://example.test/release"}
+        missing = Path("missing-updater.exe")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(update.sys, "frozen", True, create=True),
+            mock.patch.object(update, "automatic_update_check_due", return_value=True),
+            mock.patch.object(update, "check_for_update", return_value=release),
+            mock.patch.object(
+                update,
+                "_installed_updater_path",
+                side_effect=RuntimeError(f"Updater executable is missing: {missing}"),
+            ),
+            mock.patch.object(update, "download_release") as download,
+            mock.patch.object(update, "extract_release_archive") as extract,
+            mock.patch.object(update, "launch_updater") as launch,
+            mock.patch.object(update, "_record_update_check_result") as record,
+            mock.patch("sys.stderr", stderr),
+        ):
+            self.assertIsNone(update.handle_automatic_update(args, []))
+
+        download.assert_not_called()
+        extract.assert_not_called()
+        launch.assert_not_called()
+        record.assert_called_once_with("failure")
+        self.assertIn("Updater executable is missing", stderr.getvalue())
+
     def test_automatic_update_interrupt_exits_cleanly(self) -> None:
         args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
         stderr = io.StringIO()
@@ -792,6 +820,7 @@ This should not be included.
                 mock.patch.object(update, "TEMP_ROOT", temp_root),
                 mock.patch.object(update, "automatic_update_check_due", return_value=True),
                 mock.patch.object(update, "check_for_update", return_value=release),
+                mock.patch.object(update, "_installed_updater_path", return_value=Path("updater.exe")),
                 mock.patch.object(update, "_record_update_check_result"),
                 mock.patch.object(update, "download_release", side_effect=KeyboardInterrupt),
                 mock.patch("sys.stderr", io.StringIO()),

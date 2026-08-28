@@ -465,10 +465,15 @@ def download_release(release: dict[str, Any], work: Path) -> Path:
     raise RuntimeError(f"Update download failed after {UPDATE_ATTEMPTS} attempts: {last_error}")
 
 
-def _copy_updater_for_launch() -> Path:
+def _installed_updater_path() -> Path:
     updater = TOOL_DIR / "updater.exe"
     if not updater.is_file():
         raise RuntimeError(f"Updater executable is missing: {updater}")
+    return updater
+
+
+def _copy_updater_for_launch() -> Path:
+    updater = _installed_updater_path()
     temporary = Path(tempfile.gettempdir()) / f"NinjaPatchToolUpdater_{uuid.uuid4().hex}.exe"
     shutil.copy2(updater, temporary)
     return temporary
@@ -611,6 +616,7 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
         if release is None:
             _record_update_check_result("success")
             return None
+        _installed_updater_path()
         _record_update_check_result("update_available")
         print(f"[Update] Ninja Patch Tool v{release['version']} is available (current: v{VERSION}).")
         TEMP_ROOT.mkdir(parents=True, exist_ok=True)
