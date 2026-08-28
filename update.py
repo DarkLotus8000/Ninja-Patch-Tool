@@ -30,6 +30,7 @@ from common import (
     parse_version,
     relative_path_parts,
     sha256_file,
+    validate_index,
 )
 
 UPDATE_CONFIG_FILE = DATA_DIR / "update.json"
@@ -169,6 +170,10 @@ def automatic_update_check_due(now: float | None = None) -> bool:
 
 
 def _record_update_check_result(result: str, now: float | None = None) -> None:
+    # Source checkouts must not write runtime cooldown state into the repository.
+    if not getattr(sys, "frozen", False):
+        return
+
     # State persistence must never turn an otherwise successful update check into a user-visible failure.
     try:
         config = _read_update_config()
@@ -419,8 +424,7 @@ def extract_release_archive(archive_path: Path, destination: Path, release_versi
         raise RuntimeError("Downloaded release is incomplete; missing: " + ", ".join(missing))
     try:
         index = parse_json((destination / "data" / "index.json").read_text(encoding="utf-8"))
-        if not isinstance(index, dict):
-            raise ValueError("index.json must contain a JSON object.")
+        validate_index(index)
         update_config = parse_json((destination / "data" / "update.json").read_text(encoding="utf-8"))
         if not isinstance(update_config, dict) or not isinstance(update_config.get("auto_update"), bool):
             raise ValueError('update.json must contain boolean "auto_update".')

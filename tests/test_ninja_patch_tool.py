@@ -309,7 +309,15 @@ This should not be included.
             self.assertEqual(set(build_release.THIRD_PARTY_LICENSE_FILES), {"Python_LICENSE.txt", "HDiffPatch_LICENSE.txt"})
             self.assertIn("updater.py", build_release.ENTRY_SCRIPTS)
             for name in expected_data:
-                (data / name).write_bytes(b"{}" if name in {"index.json", "update.json"} else name.encode("ascii"))
+                if name == "index.json":
+                    (data / name).write_bytes(b"{}")
+                elif name == "update.json":
+                    (data / name).write_text(
+                        '{"auto_update": false, "last_successful_check": 123, "last_failed_check": 456}\n',
+                        encoding="utf-8",
+                    )
+                else:
+                    (data / name).write_bytes(name.encode("ascii"))
 
             licenses = data / "licenses"
             licenses.mkdir()
@@ -333,6 +341,10 @@ This should not be included.
 
             self.assertEqual({path.name for path in (stage / "data").iterdir()}, {*expected_data, "licenses"})
             self.assertEqual({path.name for path in (stage / "data" / "licenses").iterdir()}, expected_licenses)
+            self.assertEqual(
+                json.loads((stage / "data" / "update.json").read_text(encoding="utf-8")),
+                {"auto_update": True},
+            )
 
     def test_release_preflight_validates_x64_pe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -717,9 +729,30 @@ This should not be included.
                 '{"auto_update": true, "last_successful_check": 1000, "last_failed_check": 2000}\n',
                 encoding="utf-8",
             )
-            with mock.patch.object(update, "UPDATE_CONFIG_FILE", config):
+            with (
+                mock.patch.object(update, "UPDATE_CONFIG_FILE", config),
+                mock.patch.object(update.sys, "frozen", True, create=True),
+            ):
                 update._record_update_check_result("update_available", now=3000)
             self.assertEqual(json.loads(config.read_text(encoding="utf-8")), {"auto_update": True})
+
+    def test_source_update_checks_do_not_persist_cooldown_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "update.json"
+            original = {
+                "auto_update": True,
+                "last_successful_check": 1000,
+                "last_failed_check": 2000,
+            }
+            for result in ("success", "failure", "update_available"):
+                with self.subTest(result=result):
+                    config.write_text(json.dumps(original) + "\n", encoding="utf-8")
+                    with (
+                        mock.patch.object(update, "UPDATE_CONFIG_FILE", config),
+                        mock.patch.object(update.sys, "frozen", False, create=True),
+                    ):
+                        update._record_update_check_result(result, now=3000)
+                    self.assertEqual(json.loads(config.read_text(encoding="utf-8")), original)
 
     def test_automatic_update_skips_github_during_success_cooldown(self) -> None:
         args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
@@ -1086,6 +1119,31 @@ This should not be included.
             stage = update.extract_release_archive(archive_path, root / "stage", "1.5")
             self.assertEqual((stage / "README.txt").read_bytes(), b"readme")
             self.assertTrue((stage / "data" / "licenses" / "LICENSE").is_file())
+
+    def test_update_archive_rejects_invalid_index_schema_before_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "release.zip"
+            release_root = "NinjaPatchTool-v1.5"
+            files = {
+                "add_base.exe": b"exe",
+                "verify_base.exe": b"exe",
+                "make_patch.exe": b"exe",
+                "apply_patch.exe": b"exe",
+                "updater.exe": b"exe",
+                "README.txt": b"readme",
+                "data/index.json": b'{"U1": {}}',
+                "data/update.json": b'{"auto_update": true}',
+                "data/hdiffz.exe": b"exe",
+                "data/hpatchz.exe": b"exe",
+                "data/licenses/LICENSE": b"license",
+            }
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for name, payload in files.items():
+                    archive.writestr(f"{release_root}/{name}", payload)
+
+            with self.assertRaisesRegex(RuntimeError, "invalid or missing steam_manifest_id"):
+                update.extract_release_archive(archive_path, root / "stage", "1.5")
 
     def test_update_archive_rejects_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

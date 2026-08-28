@@ -341,7 +341,11 @@ def populate_release(stage: Path, dist: Path, project_licenses: list[Path]) -> N
     release_data = stage / "data"
     release_data.mkdir()
     for name in RELEASE_DATA_FILES:
-        shutil.copy2(DATA_DIR / name, release_data / name)
+        if name == "update.json":
+            # Runtime cooldown timestamps are installation state and must never be shipped in a fresh release.
+            (release_data / name).write_text('{\n  "auto_update": true\n}\n', encoding="utf-8", newline="\n")
+        else:
+            shutil.copy2(DATA_DIR / name, release_data / name)
 
     release_licenses = release_data / "licenses"
     release_licenses.mkdir()
