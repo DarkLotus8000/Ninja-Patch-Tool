@@ -13,9 +13,19 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from common import ErrorArgumentParser, compare_versions, natural_sort_key, parse_json, parse_version, validate_index
+from common import (
+    ErrorArgumentParser,
+    compare_versions,
+    natural_sort_key,
+    parse_json,
+    parse_version,
+    process_identity,
+    validate_index,
+)
 
 UPDATER_LOCK_TIMEOUT_SECONDS = 120
+UPDATE_INSTALLER_ARGUMENT = "--update-installer"
+UPDATE_SESSION_FILE = "update_session.json"
 
 
 def ignore_interrupts() -> None:
@@ -87,6 +97,20 @@ def wait_for_process_exit(pid: int, timeout_seconds: int = 30) -> None:
             raise OSError(ctypes.get_last_error(), "Could not wait for Ninja Patch Tool to exit.")
     finally:
         kernel32.CloseHandle(handle)
+
+
+def write_update_session(work: Path) -> None:
+    session = work / UPDATE_SESSION_FILE
+    temporary = session.with_name(f"{session.name}.{uuid.uuid4().hex}.tmp")
+    state = {
+        "pid": os.getpid(),
+        "process_identity": process_identity(os.getpid()),
+    }
+    try:
+        temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
+        temporary.replace(session)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _remove_path(path: Path) -> None:
@@ -206,16 +230,6 @@ def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[t
     return backup, changes
 
 
-def cleanup_update_work(work: Path) -> None:
-    try:
-        # An incomplete rollback deliberately leaves backup_* behind for manual recovery. Never destroy that evidence.
-        if any(path.name.startswith("backup_") for path in work.iterdir()):
-            return
-    except OSError:
-        return
-    shutil.rmtree(work, ignore_errors=True)
-
-
 def _read_installed_version(executable: Path, cwd: Path) -> str:
     try:
         result = subprocess.run(
@@ -260,16 +274,17 @@ def installed_executable_satisfies_target(executable: Path, target_version: str,
     return None
 
 
-def relaunch(executable: Path, argv: list[str], cwd: Path) -> subprocess.Popen:
+def relaunch(executable: Path, argv: list[str], cwd: Path, cleanup_work: Path | None = None) -> subprocess.Popen:
     environment = os.environ.copy()
-    # Skip exactly one update check after a successful handoff. Injecting --no-auto-update would conflict with an
-    # original --auto-update argument, so the user's command line is left unchanged.
+    # Skip exactly one update check after a handoff. Injecting --no-auto-update would conflict with an original
+    # --auto-update argument, so the user's command line is left unchanged.
     environment["NPT_SKIP_UPDATE_CHECK_ONCE"] = "1"
-    environment["NPT_UPDATER_CLEANUP"] = str(Path(sys.executable).resolve())
+    if cleanup_work is not None:
+        environment["NPT_UPDATE_WORK_CLEANUP"] = str(cleanup_work)
     return subprocess.Popen([str(executable), *argv], cwd=cwd, env=environment)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     if sys.platform != "win32":
         print("ERROR: Ninja Patch Tool updater is Windows-only.", file=sys.stderr)
         return 1
@@ -286,10 +301,11 @@ def main() -> int:
     parser.add_argument("relaunch_args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     parser.add_version_argument()
     parser.add_help_argument()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     install_dir = args.install_dir.resolve()
     stage = args.stage_dir.resolve()
+    work = stage.parent
     executable = args.relaunch_executable.resolve()
     relaunch_cwd = args.relaunch_cwd.resolve()
     relaunch_args = args.relaunch_args
@@ -298,14 +314,14 @@ def main() -> int:
 
     transaction: tuple[Path, list[tuple[Path, Path | None]]] | None = None
     try:
+        write_update_session(work)
         wait_for_process_exit(args.parent_pid)
         with updater_install_lock(install_dir):
             # Another updater may have completed while this updater was waiting for the installation mutex. Never let
             # an older queued updater replace a version that is equal to or newer than its own target.
             installed_version = installed_executable_satisfies_target(executable, args.target_version, install_dir)
             if installed_version is not None:
-                cleanup_update_work(stage.parent)
-                relaunch(executable, relaunch_args, relaunch_cwd)
+                relaunch(executable, relaunch_args, relaunch_cwd, work)
                 if compare_versions(installed_version, args.target_version) > 0:
                     print(
                         f"[Update] Ninja Patch Tool v{installed_version} is already installed; "
@@ -318,7 +334,7 @@ def main() -> int:
             try:
                 transaction = install_staged_release(stage, install_dir)
                 validate_installed_executable(executable, args.target_version, install_dir)
-                relaunch(executable, relaunch_args, relaunch_cwd)
+                relaunch(executable, relaunch_args, relaunch_cwd, work)
             except Exception as exc:
                 if transaction is not None:
                     backup, changes = transaction
@@ -331,27 +347,24 @@ def main() -> int:
                         )
                         return 1
 
-                cleanup_update_work(stage.parent)
                 print(
                     f"ERROR: Ninja Patch Tool update failed; the previous installation was restored when possible: {exc}",
                     file=sys.stderr,
                 )
                 try:
-                    relaunch(executable, relaunch_args, relaunch_cwd)
+                    relaunch(executable, relaunch_args, relaunch_cwd, work)
                 except Exception as relaunch_error:
                     print(f"ERROR: Could not restart Ninja Patch Tool after the failed update: {relaunch_error}", file=sys.stderr)
                 return 1
 
             backup, _ = transaction
             shutil.rmtree(backup, ignore_errors=True)
-            shutil.rmtree(stage.parent, ignore_errors=True)
             print(f"[Update] Ninja Patch Tool updated successfully to v{args.target_version}.")
             return 0
     except Exception as exc:
-        cleanup_update_work(stage.parent)
         print(f"ERROR: Ninja Patch Tool updater could not start the installation: {exc}", file=sys.stderr)
         try:
-            relaunch(executable, relaunch_args, relaunch_cwd)
+            relaunch(executable, relaunch_args, relaunch_cwd, work)
         except Exception as relaunch_error:
             print(f"ERROR: Could not restart Ninja Patch Tool after the failed update: {relaunch_error}", file=sys.stderr)
         return 1

@@ -7,7 +7,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 import uuid
@@ -28,10 +27,12 @@ from common import (
     is_sha256,
     parse_json,
     parse_version,
+    process_matches_identity,
     relative_path_parts,
     sha256_file,
     validate_index,
 )
+from updater import UPDATE_INSTALLER_ARGUMENT, UPDATE_SESSION_FILE, main as updater_main
 
 UPDATE_CONFIG_FILE = DATA_DIR / "update.json"
 GITHUB_RELEASES_API = "https://api.github.com/repos/DarkLotus8000/Ninja-Patch-Tool/releases/latest"
@@ -286,9 +287,16 @@ def check_update_only() -> int:
 
 
 def handle_early_update_request(argv: list[str]) -> int | None:
+    # Every release executable contains the updater module. A temporary copy of whichever executable initiated the
+    # update enters this hidden mode and performs the installation after the original process exits.
+    if argv[:1] == [UPDATE_INSTALLER_ARGUMENT]:
+        return updater_main(argv[1:])
+    if UPDATE_INSTALLER_ARGUMENT in argv:
+        print("ERROR: Invalid internal updater arguments.", file=sys.stderr)
+        return 1
+
     try:
-        cleanup_temporary_updater()
-        cleanup_stale_temporary_updaters()
+        cleanup_relaunched_update_work()
         cleanup_stale_update_work()
         parser = ErrorArgumentParser()
         add_update_arguments(parser)
@@ -412,7 +420,6 @@ def extract_release_archive(archive_path: Path, destination: Path, release_versi
         "verify_base.exe",
         "make_patch.exe",
         "apply_patch.exe",
-        "updater.exe",
         "README.txt",
         "data/index.json",
         "data/update.json",
@@ -469,19 +476,18 @@ def download_release(release: dict[str, Any], work: Path) -> Path:
     raise RuntimeError(f"Update download failed after {UPDATE_ATTEMPTS} attempts: {last_error}")
 
 
-def _installed_updater_path() -> Path:
-    updater = TOOL_DIR / "updater.exe"
-    if not updater.is_file():
-        raise RuntimeError(f"Updater executable is missing: {updater}")
-    return updater
+def _current_application_path() -> Path:
+    executable = Path(sys.executable).resolve()
+    if not executable.is_file():
+        raise RuntimeError(f"Current Ninja Patch Tool executable is missing: {executable}")
+    return executable
 
 
-def _validate_installed_updater() -> Path:
-    updater = _installed_updater_path()
+def _validate_temporary_updater(executable: Path) -> None:
     expected = f"Ninja Patch Tool v{VERSION}"
     try:
         result = subprocess.run(
-            [str(updater), "--version"],
+            [str(executable), UPDATE_INSTALLER_ARGUMENT, "--version"],
             cwd=TOOL_DIR,
             capture_output=True,
             text=True,
@@ -489,35 +495,39 @@ def _validate_installed_updater() -> Path:
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Updater executable did not respond to --version within 15 seconds: {updater}") from exc
+        raise RuntimeError(
+            f"Temporary Ninja Patch Tool updater did not respond to --version within 15 seconds: {executable}"
+        ) from exc
     except OSError as exc:
-        raise RuntimeError(f"Updater executable could not be started: {updater}: {exc}") from exc
+        raise RuntimeError(f"Temporary Ninja Patch Tool updater could not be started: {executable}: {exc}") from exc
 
     actual = result.stdout.strip()
     if result.returncode != 0:
         detail = result.stderr.strip() or actual or f"exit code {result.returncode}"
-        raise RuntimeError(f"Updater executable failed its version check: {updater}\n{detail}")
+        raise RuntimeError(f"Temporary Ninja Patch Tool updater failed its version check: {executable}\n{detail}")
     if actual != expected:
         raise RuntimeError(
-            "Updater executable version does not match this Ninja Patch Tool release.\n"
+            "Temporary Ninja Patch Tool updater version does not match this release.\n"
             f"Expected: {expected}\n"
             f"Actual: {actual or '(no version output)'}"
         )
-    return updater
 
 
-def _copy_updater_for_launch() -> Path:
-    # Revalidate immediately before handoff in case updater.exe changed after the pre-download check.
-    updater = _validate_installed_updater()
-    temporary = Path(tempfile.gettempdir()) / f"NinjaPatchToolUpdater_{uuid.uuid4().hex}.exe"
-    shutil.copy2(updater, temporary)
+def _copy_application_for_update(work: Path) -> Path:
+    source = _current_application_path()
+    temporary = work / "NinjaPatchToolUpdater.exe"
+    shutil.copy2(source, temporary)
+    _validate_temporary_updater(temporary)
     return temporary
 
 
-def launch_updater(stage: Path, argv: list[str], target_version: str) -> None:
-    temporary_updater = _copy_updater_for_launch()
+def launch_updater(temporary_updater: Path, stage: Path, argv: list[str], target_version: str) -> None:
+    # Revalidate the already-created self-copy immediately before handoff. The copy lives in this update work directory,
+    # so no system temporary directory or separate shipped updater executable is needed.
+    _validate_temporary_updater(temporary_updater)
     command = [
         str(temporary_updater),
+        UPDATE_INSTALLER_ARGUMENT,
         "--install-dir",
         str(TOOL_DIR),
         "--stage-dir",
@@ -533,11 +543,24 @@ def launch_updater(stage: Path, argv: list[str], target_version: str) -> None:
         "--",
         *argv,
     ]
+    subprocess.Popen(command, cwd=TOOL_DIR)
+
+
+def _update_session_is_active(work: Path) -> bool:
+    session = work / UPDATE_SESSION_FILE
+    if not session.is_file() or sys.platform != "win32":
+        return False
     try:
-        subprocess.Popen(command, cwd=TOOL_DIR)
-    except BaseException:
-        temporary_updater.unlink(missing_ok=True)
-        raise
+        state = parse_json(session.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            return False
+        pid = state.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return False
+        return process_matches_identity(pid, state.get("process_identity"))
+    except Exception:
+        # If process inspection itself fails, be conservative and leave the work directory alone.
+        return True
 
 
 def cleanup_stale_update_work(max_age_seconds: int = STALE_UPDATE_AGE_SECONDS) -> None:
@@ -558,68 +581,45 @@ def cleanup_stale_update_work(max_age_seconds: int = STALE_UPDATE_AGE_SECONDS) -
             # A backup means an interrupted/incomplete transaction may need manual recovery. Never remove it here.
             if any(path.name.startswith("backup_") for path in work.iterdir()):
                 continue
+            # A self-updater now runs from inside update_<id>. Never delete its directory while that process is alive.
+            if _update_session_is_active(work):
+                continue
             shutil.rmtree(work)
         except OSError:
             # Startup cleanup is best-effort and must never block normal tool use.
             continue
 
 
-def cleanup_stale_temporary_updaters(max_age_seconds: int = STALE_UPDATE_AGE_SECONDS) -> None:
-    if sys.platform != "win32" or max_age_seconds < 0:
-        return
-    try:
-        temp_dir = Path(tempfile.gettempdir()).resolve()
-        cutoff = time.time() - max_age_seconds
-        candidates = list(temp_dir.glob("NinjaPatchToolUpdater_*.exe"))
-    except OSError:
-        return
-
-    for path in candidates:
-        try:
-            if path.is_symlink() or not path.is_file() or path.stat().st_mtime > cutoff:
-                continue
-            # Windows will refuse deletion while an executable is still mapped by a running updater process.
-            path.unlink(missing_ok=True)
-        except OSError:
-            continue
-
-
-def _schedule_delete_on_reboot(path: Path) -> None:
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.MoveFileExW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
-        kernel32.MoveFileExW.restype = ctypes.c_int
-        # Optional best-effort fallback only; normal retries and later stale cleanup are the primary cleanup paths.
-        kernel32.MoveFileExW(str(path), None, 0x4)  # MOVEFILE_DELAY_UNTIL_REBOOT
-    except Exception:
-        pass
-
-
-def cleanup_temporary_updater() -> None:
-    value = os.environ.pop("NPT_UPDATER_CLEANUP", None)
+def cleanup_relaunched_update_work() -> None:
+    value = os.environ.pop("NPT_UPDATE_WORK_CLEANUP", None)
     if not value:
         return
-    path = Path(value)
+
+    raw_work = Path(value)
     try:
-        expected_parent = Path(tempfile.gettempdir()).resolve()
-        resolved = path.resolve()
+        if raw_work.is_symlink():
+            return
+        expected_parent = TEMP_ROOT.resolve()
+        work = raw_work.resolve()
     except OSError:
         return
-    if resolved.parent != expected_parent or not resolved.name.startswith("NinjaPatchToolUpdater_") or resolved.suffix.lower() != ".exe":
+    if work.parent != expected_parent or not work.name.startswith("update_") or not work.is_dir():
         return
-    for _ in range(30):
+
+    # This environment variable is set only after a successful handoff or after a successful rollback. An incomplete
+    # rollback never relaunches with cleanup enabled, so any transient backup still present here is safe to remove.
+    # The relaunched process can race the final few milliseconds of the temporary updater shutting down. Retry briefly
+    # until Windows releases the mapped self-copy, then leave any stubborn directory for normal stale cleanup later.
+    for _ in range(50):
         try:
-            resolved.unlink(missing_ok=True)
-            return
+            shutil.rmtree(work)
+            break
+        except FileNotFoundError:
+            break
         except OSError:
             time.sleep(0.1)
     try:
-        if resolved.exists():
-            _schedule_delete_on_reboot(resolved)
+        TEMP_ROOT.rmdir()
     except OSError:
         pass
 
@@ -651,16 +651,16 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
         if release is None:
             _record_update_check_result("success")
             return None
-        _validate_installed_updater()
-        _record_update_check_result("update_available")
-        print(f"[Update] Ninja Patch Tool v{release['version']} is available (current: v{VERSION}).")
         TEMP_ROOT.mkdir(parents=True, exist_ok=True)
         work = TEMP_ROOT / f"update_{uuid.uuid4().hex}"
         work.mkdir()
+        temporary_updater = _copy_application_for_update(work)
+        _record_update_check_result("update_available")
+        print(f"[Update] Ninja Patch Tool v{release['version']} is available (current: v{VERSION}).")
         archive = download_release(release, work)
         stage = extract_release_archive(archive, work / "stage", release["version"])
-        launch_updater(stage, argv, release["version"])
-        print("[Update] Update verified. Restarting through the updater...")
+        launch_updater(temporary_updater, stage, argv, release["version"])
+        print("[Update] Update verified. Restarting to install...")
         return 0
     except KeyboardInterrupt:
         print("\nUpdate cancelled.", file=sys.stderr)

@@ -26,7 +26,6 @@ ENTRY_SCRIPTS = {
     "verify_base.py": "Verify Base - Ninja Patch Tool",
     "make_patch.py": "Make Patch - Ninja Patch Tool",
     "apply_patch.py": "Apply Patch - Ninja Patch Tool",
-    "updater.py": "Updater - Ninja Patch Tool",
 }
 RELEASE_DATA_FILES = ("index.json", "update.json", "hdiffz.exe", "hpatchz.exe")
 THIRD_PARTY_LICENSE_FILES = ("Python_LICENSE.txt", "HDiffPatch_LICENSE.txt")
@@ -186,7 +185,7 @@ def validate_build_environment() -> list[Path]:
     validate_pyinstaller_version(pyinstaller_version)
 
     required = [ROOT / script for script in ENTRY_SCRIPTS]
-    required.extend([ROOT / "common.py", ROOT / "update.py", ROOT / "README.md", FAVICON])
+    required.extend([ROOT / "common.py", ROOT / "update.py", ROOT / "updater.py", ROOT / "README.md", FAVICON])
     required.extend(DATA_DIR / name for name in RELEASE_DATA_FILES)
     required.extend(LICENSES_DIR / name for name in THIRD_PARTY_LICENSE_FILES)
     missing = [path for path in required if not path.is_file()]
@@ -331,6 +330,21 @@ def smoke_test_executables(dist: Path) -> None:
         if version_result.returncode != 0 or version_result.stdout.strip() != f"Ninja Patch Tool v{VERSION}":
             details = version_result.stderr.strip() or version_result.stdout.strip() or "No output was produced."
             raise RuntimeError(f"Standalone executable version test failed for {executable.name}:\n{details}")
+
+        try:
+            updater_result = subprocess.run(
+                [str(executable), "--update-installer", "--version"],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"Internal updater smoke test timed out: {executable.name}") from exc
+        if updater_result.returncode != 0 or updater_result.stdout.strip() != f"Ninja Patch Tool v{VERSION}":
+            details = updater_result.stderr.strip() or updater_result.stdout.strip() or "No output was produced."
+            raise RuntimeError(f"Internal updater smoke test failed for {executable.name}:\n{details}")
 
 def populate_release(stage: Path, dist: Path, project_licenses: list[Path]) -> None:
     stage.mkdir(parents=True)
