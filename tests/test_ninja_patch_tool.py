@@ -1394,14 +1394,53 @@ This should not be included.
                 update.cleanup_relaunched_update_work()
             self.assertFalse(work.exists())
 
+    def test_legacy_updater_cleanup_removes_old_release_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tool_dir = Path(tmp)
+            legacy_updater = tool_dir / "updater.exe"
+            legacy_updater.write_bytes(b"legacy")
+            with (
+                mock.patch.object(update, "TOOL_DIR", tool_dir),
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update.sys, "frozen", True, create=True),
+                mock.patch.object(update.sys, "executable", str(tool_dir / "make_patch.exe")),
+            ):
+                update.cleanup_legacy_updater_executable()
+            self.assertFalse(legacy_updater.exists())
+
+    def test_legacy_updater_cleanup_is_release_only_and_best_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tool_dir = Path(tmp)
+            legacy_updater = tool_dir / "updater.exe"
+            legacy_updater.write_bytes(b"legacy")
+
+            with (
+                mock.patch.object(update, "TOOL_DIR", tool_dir),
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update.sys, "frozen", False, create=True),
+            ):
+                update.cleanup_legacy_updater_executable()
+            self.assertTrue(legacy_updater.exists())
+
+            with (
+                mock.patch.object(update, "TOOL_DIR", tool_dir),
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update.sys, "frozen", True, create=True),
+                mock.patch.object(update.sys, "executable", str(tool_dir / "make_patch.exe")),
+                mock.patch.object(Path, "unlink", side_effect=PermissionError("locked")),
+            ):
+                update.cleanup_legacy_updater_executable()
+
     def test_update_installer_internal_mode_dispatches_before_startup_cleanup(self) -> None:
         with (
             mock.patch.object(update, "updater_main", return_value=7) as installer,
+            mock.patch.object(update, "cleanup_legacy_updater_executable") as legacy_cleanup,
             mock.patch.object(update, "cleanup_relaunched_update_work") as cleanup,
             mock.patch.object(update, "cleanup_stale_update_work") as stale,
         ):
             self.assertEqual(update.handle_early_update_request(["--update-installer", "--version"]), 7)
         installer.assert_called_once_with(["--version"])
+        legacy_cleanup.assert_not_called()
         cleanup.assert_not_called()
         stale.assert_not_called()
 

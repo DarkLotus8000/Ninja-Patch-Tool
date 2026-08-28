@@ -286,6 +286,22 @@ def check_update_only() -> int:
         return 1
 
 
+def cleanup_legacy_updater_executable() -> None:
+    # v1.4 shipped a separate updater.exe. v1.4.1 and later use a temporary self-copy instead, so remove the obsolete
+    # helper on the first normal launch after an in-place/automatic update. Source runs never touch release files.
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+
+    legacy_updater = TOOL_DIR / "updater.exe"
+    try:
+        if legacy_updater.resolve() == Path(sys.executable).resolve():
+            return
+        legacy_updater.unlink(missing_ok=True)
+    except OSError:
+        # Migration cleanup is best-effort. A locked or otherwise undeletable legacy helper must never block NPT.
+        pass
+
+
 def handle_early_update_request(argv: list[str]) -> int | None:
     # Every release executable contains the updater module. A temporary copy of whichever executable initiated the
     # update enters this hidden mode and performs the installation after the original process exits.
@@ -296,6 +312,7 @@ def handle_early_update_request(argv: list[str]) -> int | None:
         return 1
 
     try:
+        cleanup_legacy_updater_executable()
         cleanup_relaunched_update_work()
         cleanup_stale_update_work()
         parser = ErrorArgumentParser()
