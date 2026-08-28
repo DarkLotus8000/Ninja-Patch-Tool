@@ -481,11 +481,11 @@ def _validate_installed_updater() -> Path:
             cwd=TOOL_DIR,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=15,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Updater executable did not respond to --version within 5 seconds: {updater}") from exc
+        raise RuntimeError(f"Updater executable did not respond to --version within 15 seconds: {updater}") from exc
     except OSError as exc:
         raise RuntimeError(f"Updater executable could not be started: {updater}: {exc}") from exc
 
@@ -503,7 +503,8 @@ def _validate_installed_updater() -> Path:
 
 
 def _copy_updater_for_launch() -> Path:
-    updater = _installed_updater_path()
+    # Revalidate immediately before handoff in case updater.exe changed after the pre-download check.
+    updater = _validate_installed_updater()
     temporary = Path(tempfile.gettempdir()) / f"NinjaPatchToolUpdater_{uuid.uuid4().hex}.exe"
     shutil.copy2(updater, temporary)
     return temporary

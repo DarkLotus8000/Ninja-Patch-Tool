@@ -810,9 +810,25 @@ This should not be included.
             cwd=update.TOOL_DIR,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=15,
             check=False,
         )
+
+    def test_copy_updater_revalidates_immediately_before_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            updater_path = root / "updater.exe"
+            updater_path.write_bytes(b"updater")
+            temp_dir = root / "temp"
+            temp_dir.mkdir()
+            with (
+                mock.patch.object(update, "_validate_installed_updater", return_value=updater_path) as validate,
+                mock.patch.object(update.tempfile, "gettempdir", return_value=str(temp_dir)),
+            ):
+                copied = update._copy_updater_for_launch()
+            validate.assert_called_once_with()
+            self.assertEqual(copied.read_bytes(), b"updater")
+            self.assertEqual(copied.parent, temp_dir)
 
     def test_wrong_updater_version_is_rejected_before_update_download(self) -> None:
         args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
@@ -1093,7 +1109,7 @@ This should not be included.
             with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "Unsafe update archive path"):
                 update._safe_archive_parts(name)
 
-    def test_updater_preserves_mutable_data_and_replaces_release_files(self) -> None:
+    def test_updater_merges_release_index_preserves_update_config_and_replaces_release_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             install = root / "install"
@@ -1102,8 +1118,14 @@ This should not be included.
             (stage / "data" / "licenses").mkdir(parents=True)
             (install / "make_patch.exe").write_bytes(b"old")
             (stage / "make_patch.exe").write_bytes(b"new")
-            (install / "data" / "index.json").write_text('{"custom": 1}', encoding="utf-8")
-            (stage / "data" / "index.json").write_text('{"new": 1}', encoding="utf-8")
+            installed_index = {
+                "LocalBase": {"steam_manifest_id": 1, "sha256": "1" * 64, "file_count": 10}
+            }
+            release_index = {
+                "U44": {"steam_manifest_id": 2, "sha256": "2" * 64, "file_count": 20}
+            }
+            (install / "data" / "index.json").write_text(json.dumps(installed_index), encoding="utf-8")
+            (stage / "data" / "index.json").write_text(json.dumps(release_index), encoding="utf-8")
             (install / "data" / "update.json").write_text('{"auto_update": false}', encoding="utf-8")
             (stage / "data" / "update.json").write_text('{"auto_update": true}', encoding="utf-8")
             (install / "data" / "licenses" / "old.txt").write_text("old", encoding="utf-8")
@@ -1113,10 +1135,36 @@ This should not be included.
             backup, _ = updater.install_staged_release(stage, install)
             self.assertTrue(backup.is_dir())
             self.assertEqual((install / "make_patch.exe").read_bytes(), b"new")
-            self.assertEqual((install / "data" / "index.json").read_text(encoding="utf-8"), '{"custom": 1}')
+            self.assertEqual(
+                json.loads((install / "data" / "index.json").read_text(encoding="utf-8")),
+                {**installed_index, **release_index},
+            )
             self.assertEqual((install / "data" / "update.json").read_text(encoding="utf-8"), '{"auto_update": false}')
             self.assertEqual({path.name for path in (install / "data" / "licenses").iterdir()}, {"new.txt"})
             self.assertEqual((install / "data" / "hdiffz.exe").read_bytes(), b"new hdiff")
+
+    def test_updater_release_index_replaces_conflicting_local_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            (install / "data").mkdir(parents=True)
+            (stage / "data").mkdir(parents=True)
+            installed_index = {
+                "CustomAlias": {"steam_manifest_id": 10, "sha256": "a" * 64, "file_count": 1},
+                "KeepMe": {"steam_manifest_id": 11, "sha256": "b" * 64, "file_count": 2},
+            }
+            release_index = {
+                "U44.1": {"steam_manifest_id": 10, "sha256": "a" * 64, "file_count": 3}
+            }
+            (install / "data" / "index.json").write_text(json.dumps(installed_index), encoding="utf-8")
+            (stage / "data" / "index.json").write_text(json.dumps(release_index), encoding="utf-8")
+
+            updater.install_staged_release(stage, install)
+            merged = json.loads((install / "data" / "index.json").read_text(encoding="utf-8"))
+            self.assertNotIn("CustomAlias", merged)
+            self.assertEqual(merged["U44.1"], release_index["U44.1"])
+            self.assertEqual(merged["KeepMe"], installed_index["KeepMe"])
 
     def test_updater_rolls_back_replaced_files_on_install_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

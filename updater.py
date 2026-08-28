@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import signal
@@ -12,9 +13,8 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from common import ErrorArgumentParser, compare_versions, parse_version
+from common import ErrorArgumentParser, compare_versions, natural_sort_key, parse_json, parse_version, validate_index
 
-MUTABLE_DATA_FILES = {"index.json", "update.json"}
 UPDATER_LOCK_TIMEOUT_SECONDS = 120
 
 
@@ -104,6 +104,41 @@ def _copy_item(source: Path, destination: Path) -> None:
         shutil.copy2(source, destination)
 
 
+def _read_index(path: Path, label: str) -> dict:
+    try:
+        index = parse_json(path.read_text(encoding="utf-8"))
+        validate_index(index)
+        return index
+    except Exception as exc:
+        raise RuntimeError(f"{label} index.json is invalid: {exc}") from exc
+
+
+def _write_merged_index(release_path: Path, installed_path: Path, output_path: Path) -> None:
+    release_index = _read_index(release_path, "Release")
+    installed_index = _read_index(installed_path, "Installed")
+
+    merged = dict(installed_index)
+    for release_name, release_entry in release_index.items():
+        release_name_folded = release_name.casefold()
+        release_manifest_id = release_entry["steam_manifest_id"]
+        release_hash = release_entry["sha256"].casefold()
+
+        # The release index is authoritative for bases it knows about. Remove a local duplicate/older entry identified
+        # by name, Steam manifest ID, or root hash, while preserving unrelated locally added bases.
+        for installed_name, installed_entry in list(merged.items()):
+            if (
+                installed_name.casefold() == release_name_folded
+                or installed_entry["steam_manifest_id"] == release_manifest_id
+                or installed_entry["sha256"].casefold() == release_hash
+            ):
+                del merged[installed_name]
+        merged[release_name] = release_entry
+
+    validate_index(merged)
+    sorted_index = {name: merged[name] for name in sorted(merged, key=natural_sort_key)}
+    output_path.write_text(json.dumps(sorted_index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+
+
 def rollback_staged_release(changes: list[tuple[Path, Path | None]], backup: Path) -> None:
     rollback_errors: list[str] = []
     for destination, saved in reversed(changes):
@@ -152,7 +187,13 @@ def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[t
             destination_data.mkdir(parents=True, exist_ok=True)
             for data_source in sorted(source.iterdir(), key=lambda path: path.name.casefold()):
                 data_destination = destination_data / data_source.name
-                if data_source.name.casefold() in MUTABLE_DATA_FILES and data_destination.exists():
+                data_name = data_source.name.casefold()
+                if data_name == "update.json" and data_destination.exists():
+                    continue
+                if data_name == "index.json" and data_destination.exists():
+                    merged_index = backup / "merged_index.json"
+                    _write_merged_index(data_source, data_destination, merged_index)
+                    replace(merged_index, data_destination, Path("data") / data_source.name)
                     continue
                 replace(data_source, data_destination, Path("data") / data_source.name)
     except BaseException as install_error:
