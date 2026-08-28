@@ -746,7 +746,14 @@ def apply_and_verify(
     print(f"Patch operations: {format_duration(patch_duration)}")
     return patch_duration
 
-def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool) -> int:
+def run_locked_apply(
+    base: Path,
+    patch: Path,
+    destination: Path,
+    in_place: bool,
+    update_args=None,
+    update_argv: list[str] | None = None,
+) -> int:
     try:
         completed_state = recover_interrupted_operations(base, destination)
     except KeyboardInterrupt:
@@ -784,6 +791,11 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
     if not HPATCHZ.is_file():
         print(f"ERROR: hpatchz.exe was not found in the data folder:\n{HPATCHZ}", file=sys.stderr)
         return 1
+
+    if update_args is not None:
+        update_result = handle_automatic_update(update_args, [] if update_argv is None else update_argv)
+        if update_result is not None:
+            return update_result
 
     work = None
     keep_work = False
@@ -982,10 +994,6 @@ def main() -> int:
     parser.add_help_argument()
     args = parser.parse_args(argv)
 
-    update_result = handle_automatic_update(args, argv)
-    if update_result is not None:
-        return update_result
-
     base = args.base.resolve()
     patch = resolve_patch_path(args.patch)
 
@@ -1009,9 +1017,9 @@ def main() -> int:
     try:
         with operation_lock("installation", base, "operation using this installation"):
             if destination == base:
-                return run_locked_apply(base, patch, destination, args.in_place)
+                return run_locked_apply(base, patch, destination, args.in_place, args, argv)
             with operation_lock("installation", destination, "operation using this installation"):
-                return run_locked_apply(base, patch, destination, args.in_place)
+                return run_locked_apply(base, patch, destination, args.in_place, args, argv)
     except KeyboardInterrupt:
         print("\nPatch application cancelled.", file=sys.stderr)
         return 130

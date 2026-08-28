@@ -25,6 +25,7 @@ import common
 import make_patch
 import update
 import updater
+import verify_base
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -796,6 +797,49 @@ This should not be included.
         record.assert_called_once_with("failure")
         self.assertIn("Updater executable is missing", stderr.getvalue())
 
+    def test_installed_updater_version_check_accepts_matching_version(self) -> None:
+        updater_path = Path("updater.exe")
+        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.4\n", stderr="")
+        with (
+            mock.patch.object(update, "_installed_updater_path", return_value=updater_path),
+            mock.patch.object(update.subprocess, "run", return_value=result) as run,
+        ):
+            self.assertEqual(update._validate_installed_updater(), updater_path)
+        run.assert_called_once_with(
+            [str(updater_path), "--version"],
+            cwd=update.TOOL_DIR,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+
+    def test_wrong_updater_version_is_rejected_before_update_download(self) -> None:
+        args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+        release = {"version": "1.5", "assets": [], "url": "https://example.test/release"}
+        updater_path = Path("updater.exe")
+        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.3.1\n", stderr="")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(update.sys, "frozen", True, create=True),
+            mock.patch.object(update, "automatic_update_check_due", return_value=True),
+            mock.patch.object(update, "check_for_update", return_value=release),
+            mock.patch.object(update, "_installed_updater_path", return_value=updater_path),
+            mock.patch.object(update.subprocess, "run", return_value=result),
+            mock.patch.object(update, "download_release") as download,
+            mock.patch.object(update, "extract_release_archive") as extract,
+            mock.patch.object(update, "launch_updater") as launch,
+            mock.patch.object(update, "_record_update_check_result") as record,
+            mock.patch("sys.stderr", stderr),
+        ):
+            self.assertIsNone(update.handle_automatic_update(args, []))
+
+        download.assert_not_called()
+        extract.assert_not_called()
+        launch.assert_not_called()
+        record.assert_called_once_with("failure")
+        self.assertIn("Updater executable version does not match", stderr.getvalue())
+
     def test_automatic_update_interrupt_exits_cleanly(self) -> None:
         args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
         stderr = io.StringIO()
@@ -820,7 +864,7 @@ This should not be included.
                 mock.patch.object(update, "TEMP_ROOT", temp_root),
                 mock.patch.object(update, "automatic_update_check_due", return_value=True),
                 mock.patch.object(update, "check_for_update", return_value=release),
-                mock.patch.object(update, "_installed_updater_path", return_value=Path("updater.exe")),
+                mock.patch.object(update, "_validate_installed_updater", return_value=Path("updater.exe")),
                 mock.patch.object(update, "_record_update_check_result"),
                 mock.patch.object(update, "download_release", side_effect=KeyboardInterrupt),
                 mock.patch("sys.stderr", io.StringIO()),
@@ -923,6 +967,44 @@ This should not be included.
             scan.assert_called_once()
             write.assert_not_called()
             self.assertIn('Base "U43.5.2" already exists', stderr.getvalue())
+
+    def test_update_handoff_happens_after_cheap_verify_base_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            make_warframe_root(base)
+            entry = {"steam_manifest_id": 123, "sha256": "a" * 64, "file_count": 1}
+            argv = ["verify_base.py", str(base), "U43.5.1", "-a"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(verify_base, "install_termination_handlers"),
+                mock.patch.object(verify_base, "handle_early_update_request", return_value=None),
+                mock.patch.object(verify_base, "load_index", return_value={"U43.5.1": entry}),
+                mock.patch.object(verify_base, "handle_automatic_update", return_value=0) as auto_update,
+                mock.patch.object(verify_base, "scan_tree") as scan,
+            ):
+                self.assertEqual(verify_base.main(), 0)
+            auto_update.assert_called_once()
+            scan.assert_not_called()
+
+    def test_verify_base_missing_index_entry_is_rejected_before_update_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            make_warframe_root(base)
+            argv = ["verify_base.py", str(base), "U43.5.1"]
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(verify_base, "install_termination_handlers"),
+                mock.patch.object(verify_base, "handle_early_update_request", return_value=None),
+                mock.patch.object(verify_base, "load_index", return_value={}),
+                mock.patch.object(verify_base, "handle_automatic_update") as auto_update,
+                mock.patch.object(verify_base, "scan_tree") as scan,
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(verify_base.main(), 1)
+            auto_update.assert_not_called()
+            scan.assert_not_called()
+            self.assertIn('Base "U43.5.1" is not present', stderr.getvalue())
 
     def test_shared_version_comparison_handles_short_feature_versions(self) -> None:
         self.assertGreater(common.compare_versions("1.4", "1.3.1.2"), 0)
@@ -1456,6 +1538,32 @@ class MakePatchTests(unittest.TestCase):
                 self.assertFalse(make_patch.should_store_full_file(diff, info, "high", root, "x"))
                 measure.assert_not_called()
 
+    def test_update_handoff_happens_after_cheap_make_patch_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, new = root / "base", root / "new"
+            make_warframe_root(base)
+            make_warframe_root(new)
+            output = root / "out.patch"
+            hdiffz = root / "hdiffz.exe"
+            hdiffz.write_bytes(b"fake")
+            entry = {"steam_manifest_id": 1, "sha256": "a" * 64, "file_count": 1}
+            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.1", "-a"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(make_patch, "HDIFFZ", hdiffz),
+                mock.patch.object(make_patch, "install_termination_handlers"),
+                mock.patch.object(make_patch, "handle_early_update_request", return_value=None),
+                mock.patch.object(make_patch, "load_index", return_value={"U43.5.1": entry}),
+                mock.patch.object(make_patch, "handle_automatic_update", return_value=0) as auto_update,
+                mock.patch.object(make_patch, "operation_lock") as operation_lock,
+                mock.patch.object(make_patch, "scan_tree") as scan,
+            ):
+                self.assertEqual(make_patch.main(), 0)
+            auto_update.assert_called_once()
+            operation_lock.assert_not_called()
+            scan.assert_not_called()
+
     def test_make_main_locks_output_and_installations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1479,7 +1587,14 @@ class MakePatchTests(unittest.TestCase):
                 mock.patch.object(make_patch, "HDIFFZ", hdiffz),
                 mock.patch.object(make_patch, "operation_lock", side_effect=fake_lock),
                 mock.patch.object(make_patch, "cleanup_stale_make_patch_work"),
-                mock.patch.object(make_patch, "load_index", side_effect=RuntimeError("stop")),
+                mock.patch.object(
+                    make_patch,
+                    "load_index",
+                    side_effect=[
+                        {"U43.5.1": {"steam_manifest_id": 1, "sha256": "a" * 64, "file_count": 1}},
+                        RuntimeError("stop"),
+                    ],
+                ),
                 mock.patch.object(make_patch, "install_termination_handlers"),
             ):
                 self.assertEqual(make_patch.main(), 1)
@@ -1520,9 +1635,11 @@ class MakePatchTests(unittest.TestCase):
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(make_patch, "install_termination_handlers"),
+                mock.patch.object(make_patch, "handle_automatic_update") as auto_update,
                 mock.patch("sys.stderr", stderr),
             ):
                 self.assertEqual(make_patch.main(), 1)
+            auto_update.assert_not_called()
             self.assertIn("Patch output must not be inside", stderr.getvalue())
 
     def test_make_rejects_different_paths_with_identical_contents(self) -> None:
@@ -1628,6 +1745,51 @@ class MakePatchTests(unittest.TestCase):
             self.assertFalse(output.exists())
 
 class ApplyPatchTests(unittest.TestCase):
+    def test_update_handoff_happens_after_cheap_apply_patch_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base"
+            make_warframe_root(base)
+            patch = root / "test.patch"
+            patch.write_bytes(b"not read before update handoff")
+            hpatchz = root / "hpatchz.exe"
+            hpatchz.write_bytes(b"fake")
+            argv = ["apply_patch.py", str(base), str(patch), "-a"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(apply_patch, "HPATCHZ", hpatchz),
+                mock.patch.object(apply_patch, "install_termination_handlers"),
+                mock.patch.object(apply_patch, "handle_early_update_request", return_value=None),
+                mock.patch.object(apply_patch, "operation_lock", side_effect=lambda *args: nullcontext()),
+                mock.patch.object(apply_patch, "recover_interrupted_operations", return_value=None),
+                mock.patch.object(apply_patch, "handle_automatic_update", return_value=0) as auto_update,
+                mock.patch.object(apply_patch.zipfile, "ZipFile") as zip_file,
+            ):
+                self.assertEqual(apply_patch.main(), 0)
+            auto_update.assert_called_once()
+            zip_file.assert_not_called()
+
+    def test_apply_missing_patch_is_rejected_before_update_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base"
+            make_warframe_root(base)
+            patch = root / "missing.patch"
+            argv = ["apply_patch.py", str(base), str(patch)]
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(apply_patch, "install_termination_handlers"),
+                mock.patch.object(apply_patch, "handle_early_update_request", return_value=None),
+                mock.patch.object(apply_patch, "operation_lock", side_effect=lambda *args: nullcontext()),
+                mock.patch.object(apply_patch, "recover_interrupted_operations", return_value=None),
+                mock.patch.object(apply_patch, "handle_automatic_update") as auto_update,
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(apply_patch.main(), 1)
+            auto_update.assert_not_called()
+            self.assertIn("Patch file does not exist", stderr.getvalue())
+
     def minimal_manifest(self, operation: dict, old_count: int = 0, new_count: int = 1) -> dict:
         return {
             "version": 1,

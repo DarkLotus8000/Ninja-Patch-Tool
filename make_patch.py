@@ -334,10 +334,6 @@ def main() -> int:
     parser.add_help_argument()
     args = parser.parse_args(argv)
 
-    update_result = handle_automatic_update(args, argv)
-    if update_result is not None:
-        return update_result
-
     base = args.base.resolve()
     new = args.new.resolve()
     output = resolve_patch_path(args.output)
@@ -361,6 +357,30 @@ def main() -> int:
     if not HDIFFZ.is_file():
         print(f"ERROR: hdiffz.exe was not found in the data folder:\n{HDIFFZ}", file=sys.stderr)
         return 1
+    if output.exists():
+        print(
+            f"ERROR: Patch output already exists:\n{output}\n"
+            "Choose a different output name or remove the existing patch first.\n"
+            "No patch was generated.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        resolve_base_name(load_index(), args.base_name)
+    except KeyError:
+        print(f'ERROR: Base "{args.base_name}" is not present in data/index.json.', file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nPatch creation cancelled.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    update_result = handle_automatic_update(args, argv)
+    if update_result is not None:
+        return update_result
 
     work = None
     locks = ExitStack()

@@ -472,6 +472,36 @@ def _installed_updater_path() -> Path:
     return updater
 
 
+def _validate_installed_updater() -> Path:
+    updater = _installed_updater_path()
+    expected = f"Ninja Patch Tool v{VERSION}"
+    try:
+        result = subprocess.run(
+            [str(updater), "--version"],
+            cwd=TOOL_DIR,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Updater executable did not respond to --version within 5 seconds: {updater}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Updater executable could not be started: {updater}: {exc}") from exc
+
+    actual = result.stdout.strip()
+    if result.returncode != 0:
+        detail = result.stderr.strip() or actual or f"exit code {result.returncode}"
+        raise RuntimeError(f"Updater executable failed its version check: {updater}\n{detail}")
+    if actual != expected:
+        raise RuntimeError(
+            "Updater executable version does not match this Ninja Patch Tool release.\n"
+            f"Expected: {expected}\n"
+            f"Actual: {actual or '(no version output)'}"
+        )
+    return updater
+
+
 def _copy_updater_for_launch() -> Path:
     updater = _installed_updater_path()
     temporary = Path(tempfile.gettempdir()) / f"NinjaPatchToolUpdater_{uuid.uuid4().hex}.exe"
@@ -616,7 +646,7 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
         if release is None:
             _record_update_check_result("success")
             return None
-        _installed_updater_path()
+        _validate_installed_updater()
         _record_update_check_result("update_available")
         print(f"[Update] Ninja Patch Tool v{release['version']} is available (current: v{VERSION}).")
         TEMP_ROOT.mkdir(parents=True, exist_ok=True)

@@ -29,10 +29,6 @@ def main() -> int:
     parser.add_help_argument()
     args = parser.parse_args(argv)
 
-    update_result = handle_automatic_update(args, argv)
-    if update_result is not None:
-        return update_result
-
     base = args.path.resolve()
 
     if not base.is_dir():
@@ -45,6 +41,10 @@ def main() -> int:
         index = load_index()
         canonical_name = resolve_base_name(index, args.name)
         expected = index[canonical_name]
+
+        update_result = handle_automatic_update(args, argv)
+        if update_result is not None:
+            return update_result
 
         print(f'Verifying base "{canonical_name}"...\n' "Calculating installation SHA-256...")
 
