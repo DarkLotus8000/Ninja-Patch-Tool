@@ -102,28 +102,92 @@ def _create_default_update_config() -> None:
         temporary.unlink(missing_ok=True)
 
 
-def load_auto_update_setting() -> bool:
+def _read_update_config() -> dict[str, Any]:
     if not UPDATE_CONFIG_FILE.exists():
-        try:
-            _create_default_update_config()
-        except OSError as exc:
-            print(
-                f"[Update] Warning: Could not create {UPDATE_CONFIG_FILE}; automatic updating is disabled for this run: {exc}",
-                file=sys.stderr,
-            )
-            return False
+        _create_default_update_config()
+    config = parse_json(UPDATE_CONFIG_FILE.read_text(encoding="utf-8"))
+    if not isinstance(config, dict) or not isinstance(config.get("auto_update"), bool):
+        raise ValueError('Expected a JSON object containing boolean "auto_update".')
+    return config
 
+
+def _write_update_config(config: dict[str, Any]) -> None:
+    UPDATE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = UPDATE_CONFIG_FILE.with_name(f"{UPDATE_CONFIG_FILE.name}.{uuid.uuid4().hex}.tmp")
     try:
-        config = parse_json(UPDATE_CONFIG_FILE.read_text(encoding="utf-8"))
-        if not isinstance(config, dict) or not isinstance(config.get("auto_update"), bool):
-            raise ValueError('Expected a JSON object containing boolean "auto_update".')
-        return config["auto_update"]
-    except (OSError, ValueError) as exc:
+        with temporary.open("x", encoding="utf-8", newline="\n") as file:
+            file.write(json.dumps(config, indent=2) + "\n")
+        temporary.replace(UPDATE_CONFIG_FILE)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_auto_update_setting() -> bool:
+    try:
+        return _read_update_config()["auto_update"]
+    except OSError as exc:
+        message = "Could not create" if not UPDATE_CONFIG_FILE.exists() else "Could not read"
+        print(
+            f"[Update] Warning: {message} {UPDATE_CONFIG_FILE}; automatic updating is disabled for this run: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    except ValueError as exc:
         print(
             f"[Update] Warning: Invalid update configuration; automatic updating is disabled for this run: {exc}",
             file=sys.stderr,
         )
         return False
+
+
+def _stored_check_time(config: dict[str, Any], key: str) -> int | None:
+    value = config.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def automatic_update_check_due(now: float | None = None) -> bool:
+    # Cooldown state is best-effort. A damaged/unreadable config must not create a second failure mode here; the normal
+    # auto-update setting validation already decides whether automatic updating itself is allowed.
+    try:
+        config = _read_update_config()
+    except (OSError, ValueError):
+        return True
+
+    current = time.time() if now is None else now
+    successful = _stored_check_time(config, "last_successful_check")
+    failed = _stored_check_time(config, "last_failed_check")
+
+    if failed is not None and (successful is None or failed >= successful):
+        age = current - failed
+        return age < 0 or age >= 15 * 60
+    if successful is not None:
+        age = current - successful
+        return age < 0 or age >= 24 * 60 * 60
+    return True
+
+
+def _record_update_check_result(result: str, now: float | None = None) -> None:
+    # State persistence must never turn an otherwise successful update check into a user-visible failure.
+    try:
+        config = _read_update_config()
+        timestamp = int(time.time() if now is None else now)
+        if result == "success":
+            config["last_successful_check"] = timestamp
+            config.pop("last_failed_check", None)
+        elif result == "failure":
+            config["last_failed_check"] = timestamp
+            config.pop("last_successful_check", None)
+        elif result == "update_available":
+            # Do not let an earlier no-update cooldown suppress installation after an explicit check discovers a release.
+            config.pop("last_successful_check", None)
+            config.pop("last_failed_check", None)
+        else:
+            raise ValueError(f"Unknown update check result: {result}")
+        _write_update_config(config)
+    except (OSError, ValueError):
+        pass
 
 
 def _request(url: str, timeout: float):
@@ -191,13 +255,16 @@ def check_update_only() -> int:
         release = latest_release()
         comparison = compare_versions(release["version"], VERSION)
         if comparison < 0:
+            _record_update_check_result("success")
             print(
                 f"[Update] Local Ninja Patch Tool v{VERSION} is newer than the latest release "
                 f"v{release['version']}."
             )
         elif comparison == 0:
+            _record_update_check_result("success")
             print(f"[Update] Ninja Patch Tool v{VERSION} is up to date.")
         else:
+            _record_update_check_result("update_available")
             print(
                 f"[Update] Ninja Patch Tool v{release['version']} is available.\n"
                 f"Current version: v{VERSION}\n"
@@ -208,6 +275,7 @@ def check_update_only() -> int:
         print("\nUpdate check cancelled.", file=sys.stderr)
         return 130
     except Exception as exc:
+        _record_update_check_result("failure")
         print(f"ERROR: Update check failed: {exc}", file=sys.stderr)
         return 1
 
@@ -534,11 +602,16 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
             print("[Update] Automatic installation is only available in the Windows release executables.", file=sys.stderr)
         return None
 
+    if not automatic_update_check_due():
+        return None
+
     work: Path | None = None
     try:
         release = check_for_update()
         if release is None:
+            _record_update_check_result("success")
             return None
+        _record_update_check_result("update_available")
         print(f"[Update] Ninja Patch Tool v{release['version']} is available (current: v{VERSION}).")
         TEMP_ROOT.mkdir(parents=True, exist_ok=True)
         work = TEMP_ROOT / f"update_{uuid.uuid4().hex}"
@@ -554,6 +627,7 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
             shutil.rmtree(work, ignore_errors=True)
         return 130
     except Exception as exc:
+        _record_update_check_result("failure")
         print(f"[Update] Warning: Automatic update failed; continuing with v{VERSION}: {exc}", file=sys.stderr)
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)

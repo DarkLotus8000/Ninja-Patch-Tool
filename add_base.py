@@ -18,6 +18,22 @@ from common import (
 )
 from update import add_update_arguments, handle_automatic_update, handle_early_update_request
 
+
+def _existing_base_conflict(index: dict, name: str, manifest_id: int) -> str | None:
+    try:
+        existing_name = resolve_base_name(index, name)
+    except KeyError:
+        existing_name = None
+
+    if existing_name is not None:
+        return f'Base "{existing_name}" already exists in the index.'
+
+    for existing_name, entry in index.items():
+        if entry["steam_manifest_id"] == manifest_id:
+            return f'Steam manifest ID {manifest_id} is already indexed as "{existing_name}".'
+    return None
+
+
 def main() -> int:
     install_termination_handlers()
     argv = sys.argv[1:]
@@ -32,10 +48,6 @@ def main() -> int:
     parser.add_version_argument()
     parser.add_help_argument()
     args = parser.parse_args(argv)
-
-    update_result = handle_automatic_update(args, argv)
-    if update_result is not None:
-        return update_result
 
     base = args.path.resolve()
     name = args.name.strip()
@@ -55,6 +67,18 @@ def main() -> int:
         return 1
 
     try:
+        # Reject conflicts that can be determined from the index before doing a potentially very expensive full-tree hash.
+        # The same checks are repeated after hashing because another add_base process may update the index meanwhile.
+        with operation_lock("index", INDEX_FILE, "base index update"):
+            conflict = _existing_base_conflict(load_index(), name, manifest_id)
+        if conflict is not None:
+            print(f"ERROR: {conflict}\nNo changes were made.", file=sys.stderr)
+            return 1
+
+        update_result = handle_automatic_update(args, argv)
+        if update_result is not None:
+            return update_result
+
         with operation_lock("installation", base, "operation using this installation"):
             print(f'Hashing base "{name}"...\n' "This may take a while for large installations.")
             files, root_hash = scan_tree(base, "Hashing base")
@@ -62,26 +86,17 @@ def main() -> int:
             # Keep the installation locked until its verified identity is committed to the index.
             with operation_lock("index", INDEX_FILE, "base index update"):
                 index = load_index()
-
-                try:
-                    existing_name = resolve_base_name(index, name)
-                except KeyError:
-                    existing_name = None
-
-                if existing_name is not None:
-                    print(f'ERROR: Base "{existing_name}" already exists in the index.\n' "No changes were made.", file=sys.stderr)
+                conflict = _existing_base_conflict(index, name, manifest_id)
+                if conflict is not None:
+                    print(f"ERROR: {conflict}\nNo changes were made.", file=sys.stderr)
                     return 1
 
                 for existing_name, entry in index.items():
-                    if entry["steam_manifest_id"] == manifest_id:
+                    if entry["sha256"].lower() == root_hash.lower():
                         print(
-                            f'ERROR: Steam manifest ID {manifest_id} is already indexed as "{existing_name}".\n'
-                            "No changes were made.",
+                            f'ERROR: This exact base is already indexed as "{existing_name}".\nNo changes were made.',
                             file=sys.stderr,
                         )
-                        return 1
-                    if entry["sha256"].lower() == root_hash.lower():
-                        print(f'ERROR: This exact base is already indexed as ' f'"{existing_name}".\n' "No changes were made.", file=sys.stderr)
                         return 1
 
                 index[name] = {"steam_manifest_id": manifest_id, "sha256": root_hash, "file_count": len(files)}
@@ -101,6 +116,7 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

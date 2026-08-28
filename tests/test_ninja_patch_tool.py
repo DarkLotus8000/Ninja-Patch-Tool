@@ -537,11 +537,13 @@ This should not be included.
         with (
             mock.patch.object(update, "check_update_only", return_value=0) as check,
             mock.patch.object(update, "load_auto_update_setting") as load_config,
+            mock.patch.object(update, "automatic_update_check_due") as cooldown,
             mock.patch.object(update, "cleanup_temporary_updater"),
         ):
             self.assertEqual(update.handle_early_update_request(["-u"]), 0)
         check.assert_called_once_with()
         load_config.assert_not_called()
+        cooldown.assert_not_called()
 
         with mock.patch.object(update, "cleanup_temporary_updater"), mock.patch("sys.stderr", io.StringIO()):
             with self.assertRaises(SystemExit) as raised:
@@ -551,8 +553,13 @@ This should not be included.
     def test_check_update_reports_local_version_newer_than_latest_release(self) -> None:
         stdout = io.StringIO()
         release = {"version": "1.3.1", "url": "https://example.test/release"}
-        with mock.patch.object(update, "latest_release", return_value=release), mock.patch("sys.stdout", stdout):
+        with (
+            mock.patch.object(update, "latest_release", return_value=release),
+            mock.patch.object(update, "_record_update_check_result") as record,
+            mock.patch("sys.stdout", stdout),
+        ):
             self.assertEqual(update.check_update_only(), 0)
+        record.assert_called_once_with("success")
         self.assertEqual(
             stdout.getvalue(),
             "[Update] Local Ninja Patch Tool v1.4 is newer than the latest release v1.3.1.\n",
@@ -561,15 +568,25 @@ This should not be included.
     def test_check_update_reports_equal_version_as_up_to_date(self) -> None:
         stdout = io.StringIO()
         release = {"version": "1.4", "url": "https://example.test/release"}
-        with mock.patch.object(update, "latest_release", return_value=release), mock.patch("sys.stdout", stdout):
+        with (
+            mock.patch.object(update, "latest_release", return_value=release),
+            mock.patch.object(update, "_record_update_check_result") as record,
+            mock.patch("sys.stdout", stdout),
+        ):
             self.assertEqual(update.check_update_only(), 0)
+        record.assert_called_once_with("success")
         self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4 is up to date.\n")
 
     def test_check_update_reports_newer_release(self) -> None:
         stdout = io.StringIO()
         release = {"version": "1.5", "url": "https://example.test/release"}
-        with mock.patch.object(update, "latest_release", return_value=release), mock.patch("sys.stdout", stdout):
+        with (
+            mock.patch.object(update, "latest_release", return_value=release),
+            mock.patch.object(update, "_record_update_check_result") as record,
+            mock.patch("sys.stdout", stdout),
+        ):
             self.assertEqual(update.check_update_only(), 0)
+        record.assert_called_once_with("update_available")
         self.assertEqual(
             stdout.getvalue(),
             "[Update] Ninja Patch Tool v1.5 is available.\n"
@@ -579,9 +596,25 @@ This should not be included.
 
     def test_update_check_interrupt_exits_cleanly(self) -> None:
         stderr = io.StringIO()
-        with mock.patch.object(update, "latest_release", side_effect=KeyboardInterrupt), mock.patch("sys.stderr", stderr):
+        with (
+            mock.patch.object(update, "latest_release", side_effect=KeyboardInterrupt),
+            mock.patch.object(update, "_record_update_check_result") as record,
+            mock.patch("sys.stderr", stderr),
+        ):
             self.assertEqual(update.check_update_only(), 130)
+        record.assert_not_called()
         self.assertIn("Update check cancelled", stderr.getvalue())
+
+    def test_failed_explicit_update_check_records_retry_cooldown(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(update, "latest_release", side_effect=OSError("offline")),
+            mock.patch.object(update, "_record_update_check_result") as record,
+            mock.patch("sys.stderr", stderr),
+        ):
+            self.assertEqual(update.check_update_only(), 1)
+        record.assert_called_once_with("failure")
+        self.assertIn("Update check failed", stderr.getvalue())
 
     def test_startup_cleanup_interrupt_exits_cleanly(self) -> None:
         stderr = io.StringIO()
@@ -653,6 +686,73 @@ This should not be included.
                 self.assertFalse(update.load_auto_update_setting())
             self.assertIn("automatic updating is disabled for this run", stderr.getvalue())
 
+    def test_successful_update_check_cooldown_is_24_hours(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "update.json"
+            config.write_text('{"auto_update": true, "last_successful_check": 1000}\n', encoding="utf-8")
+            with mock.patch.object(update, "UPDATE_CONFIG_FILE", config):
+                self.assertFalse(update.automatic_update_check_due(1000 + 24 * 60 * 60 - 1))
+                self.assertTrue(update.automatic_update_check_due(1000 + 24 * 60 * 60))
+
+    def test_failed_update_check_cooldown_is_15_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "update.json"
+            config.write_text('{"auto_update": true, "last_failed_check": 1000}\n', encoding="utf-8")
+            with mock.patch.object(update, "UPDATE_CONFIG_FILE", config):
+                self.assertFalse(update.automatic_update_check_due(1000 + 15 * 60 - 1))
+                self.assertTrue(update.automatic_update_check_due(1000 + 15 * 60))
+
+    def test_future_update_check_timestamp_does_not_suppress_checks_indefinitely(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "update.json"
+            config.write_text('{"auto_update": true, "last_successful_check": 2000}\n', encoding="utf-8")
+            with mock.patch.object(update, "UPDATE_CONFIG_FILE", config):
+                self.assertTrue(update.automatic_update_check_due(1000))
+
+    def test_recording_update_available_clears_existing_cooldowns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "update.json"
+            config.write_text(
+                '{"auto_update": true, "last_successful_check": 1000, "last_failed_check": 2000}\n',
+                encoding="utf-8",
+            )
+            with mock.patch.object(update, "UPDATE_CONFIG_FILE", config):
+                update._record_update_check_result("update_available", now=3000)
+            self.assertEqual(json.loads(config.read_text(encoding="utf-8")), {"auto_update": True})
+
+    def test_automatic_update_skips_github_during_success_cooldown(self) -> None:
+        args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+        with (
+            mock.patch.object(update.sys, "frozen", True, create=True),
+            mock.patch.object(update, "automatic_update_check_due", return_value=False),
+            mock.patch.object(update, "check_for_update") as check,
+        ):
+            self.assertIsNone(update.handle_automatic_update(args, []))
+        check.assert_not_called()
+
+    def test_automatic_no_update_records_successful_check(self) -> None:
+        args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+        with (
+            mock.patch.object(update.sys, "frozen", True, create=True),
+            mock.patch.object(update, "automatic_update_check_due", return_value=True),
+            mock.patch.object(update, "check_for_update", return_value=None),
+            mock.patch.object(update, "_record_update_check_result") as record,
+        ):
+            self.assertIsNone(update.handle_automatic_update(args, []))
+        record.assert_called_once_with("success")
+
+    def test_automatic_update_failure_records_short_retry_cooldown(self) -> None:
+        args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+        with (
+            mock.patch.object(update.sys, "frozen", True, create=True),
+            mock.patch.object(update, "automatic_update_check_due", return_value=True),
+            mock.patch.object(update, "check_for_update", side_effect=OSError("offline")),
+            mock.patch.object(update, "_record_update_check_result") as record,
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            self.assertIsNone(update.handle_automatic_update(args, []))
+        record.assert_called_once_with("failure")
+
     def test_explicit_auto_update_options_bypass_config(self) -> None:
         with (
             mock.patch.object(update.sys, "frozen", False, create=True),
@@ -673,10 +773,13 @@ This should not be included.
         stderr = io.StringIO()
         with (
             mock.patch.object(update.sys, "frozen", True, create=True),
+            mock.patch.object(update, "automatic_update_check_due", return_value=True),
             mock.patch.object(update, "check_for_update", side_effect=KeyboardInterrupt),
+            mock.patch.object(update, "_record_update_check_result") as record,
             mock.patch("sys.stderr", stderr),
         ):
             self.assertEqual(update.handle_automatic_update(args, []), 130)
+        record.assert_not_called()
         self.assertIn("Update cancelled", stderr.getvalue())
 
     def test_automatic_update_interrupt_cleans_partial_work(self) -> None:
@@ -687,7 +790,9 @@ This should not be included.
             with (
                 mock.patch.object(update.sys, "frozen", True, create=True),
                 mock.patch.object(update, "TEMP_ROOT", temp_root),
+                mock.patch.object(update, "automatic_update_check_due", return_value=True),
                 mock.patch.object(update, "check_for_update", return_value=release),
+                mock.patch.object(update, "_record_update_check_result"),
                 mock.patch.object(update, "download_release", side_effect=KeyboardInterrupt),
                 mock.patch("sys.stderr", io.StringIO()),
             ):
@@ -705,18 +810,90 @@ This should not be included.
             self.assertNotIn("NPT_SKIP_UPDATE_CHECK_ONCE", update.os.environ)
         check.assert_not_called()
 
-    def test_update_handoff_stops_operation_until_restarted(self) -> None:
-        argv = ["add_base.py", "missing", "U1", "1", "-a"]
-        with (
-            mock.patch.object(sys, "argv", argv),
-            mock.patch.object(add_base, "install_termination_handlers"),
-            mock.patch.object(add_base, "handle_early_update_request", return_value=None),
-            mock.patch.object(add_base, "handle_automatic_update", return_value=0) as auto_update,
-            mock.patch.object(add_base, "validate_warframe_installation") as validate,
-        ):
-            self.assertEqual(add_base.main(), 0)
-        auto_update.assert_called_once()
-        validate.assert_not_called()
+    def test_update_handoff_happens_after_cheap_add_base_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            make_warframe_root(base)
+            argv = ["add_base.py", str(base), "U1", "1", "-a"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(add_base, "install_termination_handlers"),
+                mock.patch.object(add_base, "handle_early_update_request", return_value=None),
+                mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
+                mock.patch.object(add_base, "load_index", return_value={}),
+                mock.patch.object(add_base, "handle_automatic_update", return_value=0) as auto_update,
+                mock.patch.object(add_base, "scan_tree") as scan,
+            ):
+                self.assertEqual(add_base.main(), 0)
+            auto_update.assert_called_once()
+            scan.assert_not_called()
+
+    def test_add_base_existing_name_is_rejected_before_hash_or_update_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            make_warframe_root(base)
+            entry = {"steam_manifest_id": 123, "sha256": "a" * 64, "file_count": 1}
+            argv = ["add_base.py", str(base), "U43.5.1", "456"]
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(add_base, "install_termination_handlers"),
+                mock.patch.object(add_base, "handle_early_update_request", return_value=None),
+                mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
+                mock.patch.object(add_base, "load_index", return_value={"U43.5.1": entry}),
+                mock.patch.object(add_base, "handle_automatic_update") as auto_update,
+                mock.patch.object(add_base, "scan_tree") as scan,
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(add_base.main(), 1)
+            auto_update.assert_not_called()
+            scan.assert_not_called()
+            self.assertIn('Base "U43.5.1" already exists', stderr.getvalue())
+
+    def test_add_base_existing_manifest_is_rejected_before_hash_or_update_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            make_warframe_root(base)
+            entry = {"steam_manifest_id": 456, "sha256": "a" * 64, "file_count": 1}
+            argv = ["add_base.py", str(base), "U43.5.2", "456"]
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(add_base, "install_termination_handlers"),
+                mock.patch.object(add_base, "handle_early_update_request", return_value=None),
+                mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
+                mock.patch.object(add_base, "load_index", return_value={"U43.5.1": entry}),
+                mock.patch.object(add_base, "handle_automatic_update") as auto_update,
+                mock.patch.object(add_base, "scan_tree") as scan,
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(add_base.main(), 1)
+            auto_update.assert_not_called()
+            scan.assert_not_called()
+            self.assertIn('Steam manifest ID 456 is already indexed as "U43.5.1"', stderr.getvalue())
+
+    def test_add_base_rechecks_index_after_hash_to_close_race(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            make_warframe_root(base)
+            entry = {"steam_manifest_id": 999, "sha256": "b" * 64, "file_count": 1}
+            argv = ["add_base.py", str(base), "U43.5.2", "456"]
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(add_base, "install_termination_handlers"),
+                mock.patch.object(add_base, "handle_early_update_request", return_value=None),
+                mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
+                mock.patch.object(add_base, "load_index", side_effect=[{}, {"U43.5.2": entry}]),
+                mock.patch.object(add_base, "handle_automatic_update", return_value=None),
+                mock.patch.object(add_base, "scan_tree", return_value=({}, "a" * 64)) as scan,
+                mock.patch.object(add_base, "write_index") as write,
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(add_base.main(), 1)
+            scan.assert_called_once()
+            write.assert_not_called()
+            self.assertIn('Base "U43.5.2" already exists', stderr.getvalue())
 
     def test_shared_version_comparison_handles_short_feature_versions(self) -> None:
         self.assertGreater(common.compare_versions("1.4", "1.3.1.2"), 0)
