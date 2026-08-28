@@ -23,6 +23,8 @@ import apply_patch
 import build_release
 import common
 import make_patch
+import update
+import updater
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -228,15 +230,20 @@ This should not be included.
 
     def test_project_readme_uses_release_executable_commands(self) -> None:
         readme = (build_release.ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("add_base path name manifest_id", readme)
-        self.assertIn("verify_base path name", readme)
-        self.assertIn("make_patch base new output base_name [-c PRESET]", readme)
-        self.assertIn("apply_patch base patch [-o OUTPUT | -i]", readme)
+        self.assertIn("add_base path name manifest_id [-a | -n]", readme)
+        self.assertIn("verify_base path name [-a | -n]", readme)
+        self.assertIn("make_patch base new output base_name [-c PRESET] [-a | -n]", readme)
+        self.assertIn("apply_patch base patch [-o OUTPUT | -i] [-a | -n]", readme)
         self.assertIn("When running from source, use the corresponding `.py` script with Python 3.14 instead.", readme)
         self.assertNotIn("py add_base.py path name manifest_id", readme)
         self.assertNotIn("py verify_base.py path name", readme)
         self.assertNotIn("py make_patch.py base new output base_name [-c PRESET]", readme)
         self.assertNotIn("py apply_patch.py base patch [-o OUTPUT | -i]", readme)
+        self.assertIn("-a, --auto-update", readme)
+        self.assertIn("-n, --no-auto-update", readme)
+        self.assertIn("-u, --check-update", readme)
+        self.assertNotIn("## Automatic updates", readme)
+        self.assertIn(".sha256", readme)
         for technical in ("HDiff payloads", "DEFLATE", "LZMA", "ZIP compression"):
             self.assertNotIn(technical, readme)
         self.assertIn("Ninja Capture Tool", readme)
@@ -256,6 +263,7 @@ This should not be included.
         self.assertEqual(build_release.DATA_DIR, build_release.ROOT / "data")
         self.assertEqual(build_release.FAVICON, build_release.DATA_DIR / "favicon.ico")
         self.assertEqual(build_release.LICENSES_DIR, build_release.DATA_DIR / "licenses")
+        self.assertEqual(update.UPDATE_CONFIG_FILE, common.DATA_DIR / "update.json")
 
     def test_release_temp_directory_is_separate_from_patch_temp(self) -> None:
         self.assertEqual(build_release.RELEASE_TEMP_DIR, build_release.ROOT / "release_temp")
@@ -294,12 +302,13 @@ This should not be included.
             data.mkdir()
             dist.mkdir()
 
-            expected_data = {"index.json", "hdiffz.exe", "hpatchz.exe"}
+            expected_data = {"index.json", "update.json", "hdiffz.exe", "hpatchz.exe"}
             expected_licenses = {"Python_LICENSE.txt", "HDiffPatch_LICENSE.txt", "LICENSE"}
             self.assertEqual(set(build_release.RELEASE_DATA_FILES), expected_data)
             self.assertEqual(set(build_release.THIRD_PARTY_LICENSE_FILES), {"Python_LICENSE.txt", "HDiffPatch_LICENSE.txt"})
+            self.assertIn("updater.py", build_release.ENTRY_SCRIPTS)
             for name in expected_data:
-                (data / name).write_bytes(b"{}" if name == "index.json" else name.encode("ascii"))
+                (data / name).write_bytes(b"{}" if name in {"index.json", "update.json"} else name.encode("ascii"))
 
             licenses = data / "licenses"
             licenses.mkdir()
@@ -501,6 +510,508 @@ This should not be included.
                 build_release.release_checksum_path().write_text("existing", encoding="ascii")
                 with self.assertRaisesRegex(FileExistsError, "already exists"):
                     build_release.validate_release_output_available()
+
+    def test_version_14_maps_to_windows_four_part_version(self) -> None:
+        self.assertEqual(common.VERSION, "1.4")
+        self.assertEqual(build_release.version_tuple(), (1, 4, 0, 0))
+
+    def test_update_arguments_reject_duplicate_aliases_and_conflicts(self) -> None:
+        invalid = (
+            ["-a", "--auto-update"],
+            ["-n", "--no-auto-update"],
+            ["-u", "--check-update"],
+            ["-a", "-a"],
+            ["-a", "-n"],
+            ["--auto-update", "--check-update"],
+            ["--no-auto-update", "-u"],
+        )
+        for argv in invalid:
+            with self.subTest(argv=argv):
+                parser = common.ErrorArgumentParser()
+                update.add_update_arguments(parser)
+                with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as raised:
+                    parser.parse_args(argv)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_check_update_is_standalone_and_does_not_read_config(self) -> None:
+        with (
+            mock.patch.object(update, "check_update_only", return_value=0) as check,
+            mock.patch.object(update, "load_auto_update_setting") as load_config,
+            mock.patch.object(update, "cleanup_temporary_updater"),
+        ):
+            self.assertEqual(update.handle_early_update_request(["-u"]), 0)
+        check.assert_called_once_with()
+        load_config.assert_not_called()
+
+        with mock.patch.object(update, "cleanup_temporary_updater"), mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                update.handle_early_update_request(["--check-update", "base"])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_check_update_reports_local_version_newer_than_latest_release(self) -> None:
+        stdout = io.StringIO()
+        release = {"version": "1.3.1", "url": "https://example.test/release"}
+        with mock.patch.object(update, "latest_release", return_value=release), mock.patch("sys.stdout", stdout):
+            self.assertEqual(update.check_update_only(), 0)
+        self.assertEqual(
+            stdout.getvalue(),
+            "[Update] Local Ninja Patch Tool v1.4 is newer than the latest release v1.3.1.\n",
+        )
+
+    def test_check_update_reports_equal_version_as_up_to_date(self) -> None:
+        stdout = io.StringIO()
+        release = {"version": "1.4", "url": "https://example.test/release"}
+        with mock.patch.object(update, "latest_release", return_value=release), mock.patch("sys.stdout", stdout):
+            self.assertEqual(update.check_update_only(), 0)
+        self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4 is up to date.\n")
+
+    def test_check_update_reports_newer_release(self) -> None:
+        stdout = io.StringIO()
+        release = {"version": "1.5", "url": "https://example.test/release"}
+        with mock.patch.object(update, "latest_release", return_value=release), mock.patch("sys.stdout", stdout):
+            self.assertEqual(update.check_update_only(), 0)
+        self.assertEqual(
+            stdout.getvalue(),
+            "[Update] Ninja Patch Tool v1.5 is available.\n"
+            "Current version: v1.4\n"
+            "Release: https://example.test/release\n",
+        )
+
+    def test_update_check_interrupt_exits_cleanly(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(update, "latest_release", side_effect=KeyboardInterrupt), mock.patch("sys.stderr", stderr):
+            self.assertEqual(update.check_update_only(), 130)
+        self.assertIn("Update check cancelled", stderr.getvalue())
+
+    def test_startup_cleanup_interrupt_exits_cleanly(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(update, "cleanup_temporary_updater", side_effect=KeyboardInterrupt), mock.patch("sys.stderr", stderr):
+            self.assertEqual(update.handle_early_update_request([]), 130)
+        self.assertIn("Startup cancelled", stderr.getvalue())
+
+    def test_missing_update_config_is_created_with_auto_update_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "data" / "update.json"
+            with mock.patch.object(update, "UPDATE_CONFIG_FILE", config):
+                self.assertTrue(update.load_auto_update_setting())
+            self.assertEqual(json.loads(config.read_text(encoding="utf-8")), {"auto_update": True})
+
+    def test_simultaneous_update_config_creation_uses_existing_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "data" / "update.json"
+
+            def competing_create(source, destination) -> None:
+                Path(destination).write_text('{"auto_update": false}\n', encoding="utf-8")
+                raise FileExistsError("another process created the config first")
+
+            with (
+                mock.patch.object(update, "UPDATE_CONFIG_FILE", config),
+                mock.patch.object(update.os, "link", side_effect=competing_create),
+            ):
+                self.assertFalse(update.load_auto_update_setting())
+            self.assertEqual(json.loads(config.read_text(encoding="utf-8")), {"auto_update": False})
+            self.assertEqual(list(config.parent.glob("update.json.*.tmp")), [])
+
+    def test_update_config_creation_falls_back_when_hard_links_are_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "data" / "update.json"
+
+            def fake_move(source: Path, destination: Path) -> None:
+                source.rename(destination)
+
+            with (
+                mock.patch.object(update, "UPDATE_CONFIG_FILE", config),
+                mock.patch.object(update.os, "link", side_effect=OSError("hard links unsupported")),
+                mock.patch.object(update, "_move_file_if_absent_windows", side_effect=fake_move) as move_fallback,
+            ):
+                update._create_default_update_config()
+
+            self.assertEqual(json.loads(config.read_text(encoding="utf-8")), {"auto_update": True})
+            move_fallback.assert_called_once()
+            self.assertEqual(list(config.parent.glob("update.json.*.tmp")), [])
+
+    def test_invalid_update_config_is_not_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "update.json"
+            original = '{"auto_update": "invalid"}\n'
+            config.write_text(original, encoding="utf-8")
+            stderr = io.StringIO()
+            with mock.patch.object(update, "UPDATE_CONFIG_FILE", config), mock.patch("sys.stderr", stderr):
+                self.assertFalse(update.load_auto_update_setting())
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+            self.assertIn("automatic updating is disabled for this run", stderr.getvalue())
+
+    def test_update_config_creation_failure_disables_auto_update_for_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "data" / "update.json"
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(update, "UPDATE_CONFIG_FILE", config),
+                mock.patch.object(update, "_create_default_update_config", side_effect=OSError("read-only")),
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertFalse(update.load_auto_update_setting())
+            self.assertIn("automatic updating is disabled for this run", stderr.getvalue())
+
+    def test_explicit_auto_update_options_bypass_config(self) -> None:
+        with (
+            mock.patch.object(update.sys, "frozen", False, create=True),
+            mock.patch.object(update, "load_auto_update_setting") as load_config,
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+            self.assertIsNone(update.handle_automatic_update(args, []))
+            load_config.assert_not_called()
+
+        with mock.patch.object(update, "load_auto_update_setting") as load_config:
+            args = SimpleNamespace(auto_update=False, no_auto_update=True, check_update=False)
+            self.assertIsNone(update.handle_automatic_update(args, []))
+            load_config.assert_not_called()
+
+    def test_automatic_update_interrupt_exits_cleanly(self) -> None:
+        args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(update.sys, "frozen", True, create=True),
+            mock.patch.object(update, "check_for_update", side_effect=KeyboardInterrupt),
+            mock.patch("sys.stderr", stderr),
+        ):
+            self.assertEqual(update.handle_automatic_update(args, []), 130)
+        self.assertIn("Update cancelled", stderr.getvalue())
+
+    def test_automatic_update_interrupt_cleans_partial_work(self) -> None:
+        args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+        release = {"version": "1.5", "assets": [], "url": "https://example.test/release"}
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp) / "temp"
+            with (
+                mock.patch.object(update.sys, "frozen", True, create=True),
+                mock.patch.object(update, "TEMP_ROOT", temp_root),
+                mock.patch.object(update, "check_for_update", return_value=release),
+                mock.patch.object(update, "download_release", side_effect=KeyboardInterrupt),
+                mock.patch("sys.stderr", io.StringIO()),
+            ):
+                self.assertEqual(update.handle_automatic_update(args, []), 130)
+            self.assertTrue(temp_root.is_dir())
+            self.assertEqual(list(temp_root.iterdir()), [])
+
+    def test_restarted_update_session_skips_exactly_one_update_check(self) -> None:
+        args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+        with (
+            mock.patch.dict(update.os.environ, {"NPT_SKIP_UPDATE_CHECK_ONCE": "1"}, clear=False),
+            mock.patch.object(update, "check_for_update") as check,
+        ):
+            self.assertIsNone(update.handle_automatic_update(args, ["-a"]))
+            self.assertNotIn("NPT_SKIP_UPDATE_CHECK_ONCE", update.os.environ)
+        check.assert_not_called()
+
+    def test_update_handoff_stops_operation_until_restarted(self) -> None:
+        argv = ["add_base.py", "missing", "U1", "1", "-a"]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(add_base, "install_termination_handlers"),
+            mock.patch.object(add_base, "handle_early_update_request", return_value=None),
+            mock.patch.object(add_base, "handle_automatic_update", return_value=0) as auto_update,
+            mock.patch.object(add_base, "validate_warframe_installation") as validate,
+        ):
+            self.assertEqual(add_base.main(), 0)
+        auto_update.assert_called_once()
+        validate.assert_not_called()
+
+    def test_shared_version_comparison_handles_short_feature_versions(self) -> None:
+        self.assertGreater(common.compare_versions("1.4", "1.3.1.2"), 0)
+        self.assertEqual(common.compare_versions("1.4", "1.4.0.0"), 0)
+        self.assertLess(common.compare_versions("1.4", "1.4.1"), 0)
+        self.assertEqual(common.parse_version("v1.4"), (1, 4))
+        with self.assertRaises(ValueError):
+            common.compare_versions("1.4-beta", "1.4")
+
+    def test_update_download_retries_and_verifies_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            payload = b"release archive"
+            digest = hashlib.sha256(payload).hexdigest()
+            version = "1.5"
+            archive_name = f"NinjaPatchTool-v{version}-Windows-x64.zip"
+            checksum_name = archive_name + ".sha256"
+            release = {
+                "version": version,
+                "assets": [
+                    {"name": archive_name, "browser_download_url": "https://example.test/release.zip", "size": len(payload)},
+                    {"name": checksum_name, "browser_download_url": "https://example.test/release.sha256", "size": len(f"{digest}  {archive_name}\n")},
+                ],
+            }
+            calls = 0
+
+            def fake_download(url: str, destination: Path, expected_size=None, progress_label=None) -> None:
+                nonlocal calls
+                calls += 1
+                if calls <= 2:
+                    raise OSError("temporary failure")
+                if destination.name.endswith(".sha256"):
+                    destination.write_text(f"{digest}  {archive_name}\n", encoding="ascii")
+                else:
+                    destination.write_bytes(payload)
+
+            with mock.patch.object(update, "_download_file", side_effect=fake_download), mock.patch.object(update.time, "sleep"):
+                archive = update.download_release(release, work)
+            self.assertEqual(archive.read_bytes(), payload)
+            self.assertEqual(calls, 4)
+
+    def test_update_archive_validation_and_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "release.zip"
+            release_root = "NinjaPatchTool-v1.5"
+            files = {
+                "add_base.exe": b"exe",
+                "verify_base.exe": b"exe",
+                "make_patch.exe": b"exe",
+                "apply_patch.exe": b"exe",
+                "updater.exe": b"exe",
+                "README.txt": b"readme",
+                "data/index.json": b"{}",
+                "data/update.json": b'{"auto_update": true}',
+                "data/hdiffz.exe": b"exe",
+                "data/hpatchz.exe": b"exe",
+                "data/licenses/LICENSE": b"license",
+            }
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for name, payload in files.items():
+                    archive.writestr(f"{release_root}/{name}", payload)
+            stage = update.extract_release_archive(archive_path, root / "stage", "1.5")
+            self.assertEqual((stage / "README.txt").read_bytes(), b"readme")
+            self.assertTrue((stage / "data" / "licenses" / "LICENSE").is_file())
+
+    def test_update_archive_rejects_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "bad.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("NinjaPatchTool-v1.5/../outside.txt", b"bad")
+            with self.assertRaisesRegex(RuntimeError, "Unsafe update archive path"):
+                update.extract_release_archive(archive_path, root / "stage", "1.5")
+
+    def test_update_archive_rejects_windows_unsafe_paths(self) -> None:
+        unsafe = (
+            "NinjaPatchTool-v1.5/CON",
+            "NinjaPatchTool-v1.5/data/COM1.txt",
+            "NinjaPatchTool-v1.5/data/file.txt:stream",
+            "NinjaPatchTool-v1.5/data/trailing.",
+            "NinjaPatchTool-v1.5/data/trailing ",
+            "NinjaPatchTool-v1.5/data/bad?.txt",
+        )
+        for name in unsafe:
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "Unsafe update archive path"):
+                update._safe_archive_parts(name)
+
+    def test_updater_preserves_mutable_data_and_replaces_release_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            (install / "data" / "licenses").mkdir(parents=True)
+            (stage / "data" / "licenses").mkdir(parents=True)
+            (install / "make_patch.exe").write_bytes(b"old")
+            (stage / "make_patch.exe").write_bytes(b"new")
+            (install / "data" / "index.json").write_text('{"custom": 1}', encoding="utf-8")
+            (stage / "data" / "index.json").write_text('{"new": 1}', encoding="utf-8")
+            (install / "data" / "update.json").write_text('{"auto_update": false}', encoding="utf-8")
+            (stage / "data" / "update.json").write_text('{"auto_update": true}', encoding="utf-8")
+            (install / "data" / "licenses" / "old.txt").write_text("old", encoding="utf-8")
+            (stage / "data" / "licenses" / "new.txt").write_text("new", encoding="utf-8")
+            (stage / "data" / "hdiffz.exe").write_bytes(b"new hdiff")
+
+            backup, _ = updater.install_staged_release(stage, install)
+            self.assertTrue(backup.is_dir())
+            self.assertEqual((install / "make_patch.exe").read_bytes(), b"new")
+            self.assertEqual((install / "data" / "index.json").read_text(encoding="utf-8"), '{"custom": 1}')
+            self.assertEqual((install / "data" / "update.json").read_text(encoding="utf-8"), '{"auto_update": false}')
+            self.assertEqual({path.name for path in (install / "data" / "licenses").iterdir()}, {"new.txt"})
+            self.assertEqual((install / "data" / "hdiffz.exe").read_bytes(), b"new hdiff")
+
+    def test_updater_rolls_back_replaced_files_on_install_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            install.mkdir(parents=True)
+            stage.mkdir(parents=True)
+            (install / "a.exe").write_bytes(b"old a")
+            (install / "b.exe").write_bytes(b"old b")
+            (stage / "a.exe").write_bytes(b"new a")
+            (stage / "b.exe").write_bytes(b"new b")
+            original_copy = updater._copy_item
+
+            def fail_on_b(source: Path, destination: Path) -> None:
+                if source.name == "b.exe":
+                    raise OSError("copy failed")
+                original_copy(source, destination)
+
+            with mock.patch.object(updater, "_copy_item", side_effect=fail_on_b):
+                with self.assertRaisesRegex(OSError, "copy failed"):
+                    updater.install_staged_release(stage, install)
+            self.assertEqual((install / "a.exe").read_bytes(), b"old a")
+            self.assertEqual((install / "b.exe").read_bytes(), b"old b")
+
+    def test_updater_can_roll_back_after_post_install_validation_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            install.mkdir(parents=True)
+            stage.mkdir(parents=True)
+            (install / "make_patch.exe").write_bytes(b"old")
+            (stage / "make_patch.exe").write_bytes(b"new")
+
+            backup, changes = updater.install_staged_release(stage, install)
+            self.assertEqual((install / "make_patch.exe").read_bytes(), b"new")
+            updater.rollback_staged_release(changes, backup)
+            self.assertEqual((install / "make_patch.exe").read_bytes(), b"old")
+
+    def test_updater_failed_work_cleanup_removes_work_after_successful_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "update_work"
+            (work / "stage").mkdir(parents=True)
+            (work / "release.zip").write_bytes(b"zip")
+            updater.cleanup_update_work(work)
+            self.assertFalse(work.exists())
+
+    def test_updater_failed_work_cleanup_preserves_incomplete_rollback_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "update_work"
+            (work / "stage").mkdir(parents=True)
+            backup = work / "backup_deadbeef"
+            backup.mkdir()
+            (backup / "make_patch.exe").write_bytes(b"old")
+            updater.cleanup_update_work(work)
+            self.assertTrue(work.is_dir())
+            self.assertTrue((backup / "make_patch.exe").is_file())
+
+    def test_updater_install_lock_times_out_instead_of_waiting_forever(self) -> None:
+        import ctypes
+
+        kernel32 = SimpleNamespace(
+            CreateMutexW=mock.MagicMock(return_value=123),
+            WaitForSingleObject=mock.MagicMock(return_value=0x102),
+            ReleaseMutex=mock.MagicMock(),
+            CloseHandle=mock.MagicMock(),
+        )
+        with mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel32):
+            with self.assertRaisesRegex(RuntimeError, "Timed out waiting for another Ninja Patch Tool update"):
+                with updater.updater_install_lock(Path("C:/NPT"), timeout_seconds=2):
+                    pass
+
+        kernel32.WaitForSingleObject.assert_called_once_with(123, 2000)
+        kernel32.ReleaseMutex.assert_not_called()
+        kernel32.CloseHandle.assert_called_once_with(123)
+
+    def test_updater_queued_target_is_satisfied_by_equal_or_newer_installation(self) -> None:
+        executable = Path("tool.exe")
+        cwd = Path(".")
+        with mock.patch.object(updater, "_read_installed_version", return_value="1.5"):
+            self.assertEqual(updater.installed_executable_satisfies_target(executable, "1.5", cwd), "1.5")
+        with mock.patch.object(updater, "_read_installed_version", return_value="1.6"):
+            self.assertEqual(updater.installed_executable_satisfies_target(executable, "1.5", cwd), "1.6")
+        with mock.patch.object(updater, "_read_installed_version", return_value="1.5.0"):
+            self.assertEqual(updater.installed_executable_satisfies_target(executable, "1.5", cwd), "1.5.0")
+        with mock.patch.object(updater, "_read_installed_version", return_value="1.4.9"):
+            self.assertIsNone(updater.installed_executable_satisfies_target(executable, "1.5", cwd))
+        with mock.patch.object(updater, "_read_installed_version", side_effect=RuntimeError("not runnable")):
+            self.assertIsNone(updater.installed_executable_satisfies_target(executable, "1.5", cwd))
+
+    def test_updater_post_install_validation_still_requires_exact_target_text(self) -> None:
+        with mock.patch.object(updater, "_read_installed_version", return_value="1.6"):
+            with self.assertRaisesRegex(RuntimeError, "expected v1.5, got v1.6"):
+                updater.validate_installed_executable(Path("tool.exe"), "1.5", Path("."))
+
+    def test_stale_update_work_cleanup_removes_only_safe_old_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp) / "temp"
+            temp_root.mkdir()
+            old = temp_root / "update_old"
+            old.mkdir()
+            (old / "stage").mkdir()
+            protected = temp_root / "update_protected"
+            protected.mkdir()
+            (protected / "backup_deadbeef").mkdir()
+            recent = temp_root / "update_recent"
+            recent.mkdir()
+            unrelated = temp_root / "other_old"
+            unrelated.mkdir()
+
+            now = 2_000_000.0
+            old_time = now - update.STALE_UPDATE_AGE_SECONDS - 1
+            recent_time = now - update.STALE_UPDATE_AGE_SECONDS + 1
+            for path in (old, protected, unrelated):
+                update.os.utime(path, (old_time, old_time))
+            update.os.utime(recent, (recent_time, recent_time))
+
+            with mock.patch.object(update, "TEMP_ROOT", temp_root), mock.patch.object(update.time, "time", return_value=now):
+                update.cleanup_stale_update_work()
+
+            self.assertFalse(old.exists())
+            self.assertTrue(protected.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_stale_temporary_updater_cleanup_removes_old_executables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp)
+            old = temp_dir / "NinjaPatchToolUpdater_old.exe"
+            recent = temp_dir / "NinjaPatchToolUpdater_recent.exe"
+            unrelated = temp_dir / "OtherUpdater_old.exe"
+            for path in (old, recent, unrelated):
+                path.write_bytes(b"exe")
+
+            now = 2_000_000.0
+            old_time = now - update.STALE_UPDATE_AGE_SECONDS - 1
+            recent_time = now - update.STALE_UPDATE_AGE_SECONDS + 1
+            update.os.utime(old, (old_time, old_time))
+            update.os.utime(unrelated, (old_time, old_time))
+            update.os.utime(recent, (recent_time, recent_time))
+
+            with (
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update.tempfile, "gettempdir", return_value=tmp),
+                mock.patch.object(update.time, "time", return_value=now),
+            ):
+                update.cleanup_stale_temporary_updaters()
+
+            self.assertFalse(old.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_temporary_updater_cleanup_falls_back_to_delete_on_reboot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            updater_path = Path(tmp) / "NinjaPatchToolUpdater_deadbeef.exe"
+            updater_path.write_bytes(b"exe")
+            environment = {"NPT_UPDATER_CLEANUP": str(updater_path)}
+            with (
+                mock.patch.object(update.tempfile, "gettempdir", return_value=tmp),
+                mock.patch.dict(update.os.environ, environment, clear=True),
+                mock.patch.object(Path, "unlink", side_effect=OSError("busy")),
+                mock.patch.object(update.time, "sleep"),
+                mock.patch.object(update, "_schedule_delete_on_reboot") as schedule_delete,
+            ):
+                update.cleanup_temporary_updater()
+            schedule_delete.assert_called_once_with(updater_path.resolve())
+
+    def test_updater_relaunch_uses_internal_one_shot_skip_without_changing_args(self) -> None:
+        captured = {}
+
+        def fake_popen(command, cwd=None, env=None):
+            captured["command"] = command
+            captured["cwd"] = cwd
+            captured["env"] = env
+            return SimpleNamespace()
+
+        with mock.patch.object(updater.subprocess, "Popen", side_effect=fake_popen):
+            updater.relaunch(Path("C:/NPT/make_patch.exe"), ["-a", "base", "new", "out", "U1"], Path("C:/work"))
+
+        self.assertEqual(captured["command"][1:], ["-a", "base", "new", "out", "U1"])
+        self.assertEqual(captured["env"]["NPT_SKIP_UPDATE_CHECK_ONCE"], "1")
+        self.assertNotIn("--no-auto-update", captured["command"])
 
     @unittest.skipUnless(sys.platform == "win32", "Windows mutex test")
     def test_operation_lock_rejects_same_target_concurrently(self) -> None:

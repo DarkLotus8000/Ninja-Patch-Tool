@@ -26,8 +26,9 @@ ENTRY_SCRIPTS = {
     "verify_base.py": "Verify Base - Ninja Patch Tool",
     "make_patch.py": "Make Patch - Ninja Patch Tool",
     "apply_patch.py": "Apply Patch - Ninja Patch Tool",
+    "updater.py": "Updater - Ninja Patch Tool",
 }
-RELEASE_DATA_FILES = ("index.json", "hdiffz.exe", "hpatchz.exe")
+RELEASE_DATA_FILES = ("index.json", "update.json", "hdiffz.exe", "hpatchz.exe")
 THIRD_PARTY_LICENSE_FILES = ("Python_LICENSE.txt", "HDiffPatch_LICENSE.txt")
 MIN_PYINSTALLER_VERSION = (6, 15, 0)
 
@@ -73,8 +74,8 @@ def create_release_readme(markdown: str) -> str:
 
 def version_tuple() -> tuple[int, int, int, int]:
     parts = VERSION.split(".")
-    if len(parts) not in {3, 4} or any(not part.isdigit() for part in parts):
-        raise RuntimeError("VERSION must contain three or four numeric components, for example 1.0.0 or 1.0.0.0.")
+    if len(parts) not in {2, 3, 4} or any(not part.isdigit() for part in parts):
+        raise RuntimeError("VERSION must contain two to four numeric components, for example 1.4, 1.4.0, or 1.4.0.0.")
     numbers = [int(part) for part in parts]
     if any(number > 65535 for number in numbers):
         raise RuntimeError("Every VERSION component must be between 0 and 65535 for Windows version resources.")
@@ -185,7 +186,7 @@ def validate_build_environment() -> list[Path]:
     validate_pyinstaller_version(pyinstaller_version)
 
     required = [ROOT / script for script in ENTRY_SCRIPTS]
-    required.extend([ROOT / "common.py", ROOT / "README.md", FAVICON])
+    required.extend([ROOT / "common.py", ROOT / "update.py", ROOT / "README.md", FAVICON])
     required.extend(DATA_DIR / name for name in RELEASE_DATA_FILES)
     required.extend(LICENSES_DIR / name for name in THIRD_PARTY_LICENSE_FILES)
     missing = [path for path in required if not path.is_file()]
@@ -198,6 +199,12 @@ def validate_build_environment() -> list[Path]:
         validate_index(index)
     except Exception as exc:
         raise RuntimeError(f"data/index.json is invalid: {exc}") from exc
+    try:
+        update_config = parse_json((DATA_DIR / "update.json").read_text(encoding="utf-8"))
+        if not isinstance(update_config, dict) or not isinstance(update_config.get("auto_update"), bool):
+            raise ValueError('Expected a JSON object containing boolean "auto_update".')
+    except Exception as exc:
+        raise RuntimeError(f"data/update.json is invalid: {exc}") from exc
     validate_pe_x64(DATA_DIR / "hdiffz.exe")
     validate_pe_x64(DATA_DIR / "hpatchz.exe")
     validate_ico(FAVICON)

@@ -13,15 +13,25 @@ from common import (
     scan_tree,
     validate_warframe_installation,
 )
+from update import add_update_arguments, handle_automatic_update, handle_early_update_request
 
 def main() -> int:
     install_termination_handlers()
+    argv = sys.argv[1:]
+    early_update_result = handle_early_update_request(argv)
+    if early_update_result is not None:
+        return early_update_result
     parser = ErrorArgumentParser(description="Verify a Steam manifest base against its entry in data/index.json.")
     parser.add_argument("path", type=Path, help="Path to the Steam manifest base")
     parser.add_argument("name", help="Indexed Warframe version, for example U43.5.1")
+    add_update_arguments(parser)
     parser.add_version_argument()
     parser.add_help_argument()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    update_result = handle_automatic_update(args, argv)
+    if update_result is not None:
+        return update_result
 
     base = args.path.resolve()
 

@@ -16,12 +16,18 @@ No packages need to be installed to run the tool from source. Building a release
 
 The commands below use the release executables. When running from source, use the corresponding `.py` script with Python 3.14 instead.
 
+Update options available on all main executables:
+
+- `-a, --auto-update` - Enable automatic updating for this run, overriding `data/update.json`
+- `-n, --no-auto-update` - Disable automatic updating for this run, overriding `data/update.json`
+- `-u, --check-update` - Check GitHub Releases for a newer version without installing it; use this option without operation arguments
+
 ## Add a base
 
 Add a clean, unmodified Steam manifest base to `data/index.json`.
 
 ```text
-add_base path name manifest_id
+add_base path name manifest_id [-a | -n]
 ```
 
 - `path` - Path to the clean Steam manifest base
@@ -39,7 +45,7 @@ add_base "D:\WF\U43.5.1" U43.5.1 4895911296145320793
 Verify a Steam manifest base against its entry in `data/index.json`. This is optional before creating a patch because `make_patch` verifies the selected base automatically.
 
 ```text
-verify_base path name
+verify_base path name [-a | -n]
 ```
 
 - `path` - Path to the Steam manifest base
@@ -53,7 +59,7 @@ Before using an installation as `new`, fully download all language files and bot
 Close Warframe and the Warframe Launcher before creating the patch.
 
 ```text
-make_patch base new output base_name [-c PRESET]
+make_patch base new output base_name [-c PRESET] [-a | -n]
 ```
 
 - `base` - Clean indexed Steam manifest base
@@ -75,7 +81,7 @@ An existing patch is never overwritten automatically.
 Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate installation is created next to the base, named after the patch.
 
 ```text
-apply_patch base patch [-o OUTPUT | -i]
+apply_patch base patch [-o OUTPUT | -i] [-a | -n]
 ```
 
 - `base` - Base installation
@@ -101,3 +107,12 @@ Set `VERSION` in `common.py`, then run:
 py -3.14 -m pip install pyinstaller
 py -3.14 build_release.py
 ```
+
+Upload both generated files to the matching GitHub Release (`vVERSION`):
+
+```text
+NinjaPatchTool-vVERSION-Windows-x64.zip
+NinjaPatchTool-vVERSION-Windows-x64.zip.sha256
+```
+
+The updater requires both release assets.

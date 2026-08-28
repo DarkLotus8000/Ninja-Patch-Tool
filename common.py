@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-VERSION = "1.3.1.3"
+VERSION = "1.4"
 
 def get_tool_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -52,6 +52,23 @@ def validate_warframe_installation(path: Path, label: str) -> bool:
 
 def natural_sort_key(value: str):
     return tuple((0, int(part)) if part.isdigit() else (1, part.casefold()) for part in re.split(r"(\d+)", value) if part)
+
+def parse_version(value: str) -> tuple[int, ...]:
+    text = value.strip()
+    if text[:1].lower() == "v":
+        text = text[1:]
+    parts = text.split(".")
+    if len(parts) < 2 or any(not part.isdigit() for part in parts):
+        raise ValueError(f"Invalid version: {value!r}")
+    return tuple(int(part) for part in parts)
+
+def compare_versions(left: str, right: str) -> int:
+    left_parts = parse_version(left)
+    right_parts = parse_version(right)
+    width = max(len(left_parts), len(right_parts))
+    padded_left = left_parts + (0,) * (width - len(left_parts))
+    padded_right = right_parts + (0,) * (width - len(right_parts))
+    return (padded_left > padded_right) - (padded_left < padded_right)
 
 def root_sha256_from_files(files: dict[str, dict[str, Any]]) -> str:
     root_hash = hashlib.sha256()
@@ -224,12 +241,15 @@ def cleanup_work_dir(work: Path) -> None:
         pass
 
 def install_termination_handlers() -> None:
-    # Route SIGTERM through the same KeyboardInterrupt cleanup path where Python receives it normally. Forced Windows
+    # Route termination/break signals through the same KeyboardInterrupt cleanup path as Ctrl+C. Forced Windows
     # termination and console-window closure can bypass Python cleanup, so persistent/stale recovery handles those cases.
-    if hasattr(signal, "SIGTERM"):
-        def handle_sigterm(signum, frame):
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, handle_sigterm)
+    def handle_termination(signum, frame):
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, handle_termination)
 
 def run_child(command: list[str]) -> int:
     # Ensure an interrupted parent does not leave hdiffz/hpatchz running on its own.

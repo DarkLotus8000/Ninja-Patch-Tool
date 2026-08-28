@@ -45,6 +45,7 @@ from common import (
     verify_scanned_tree,
     warn_if_low_disk_space_groups,
 )
+from update import add_update_arguments, handle_automatic_update, handle_early_update_request
 
 HPATCHZ = DATA_DIR / "hpatchz.exe"
 SUPPORTED_VERSIONS = {1, 2}
@@ -946,6 +947,10 @@ def run_locked_apply(base: Path, patch: Path, destination: Path, in_place: bool)
 
 def main() -> int:
     install_termination_handlers()
+    argv = sys.argv[1:]
+    early_update_result = handle_early_update_request(argv)
+    if early_update_result is not None:
+        return early_update_result
     parser = ErrorArgumentParser(
         description=(
             "Apply a Ninja Patch (Diff Patch) from a file. By default, the base is left untouched and a separate "
@@ -972,9 +977,14 @@ def main() -> int:
         action=SingleUseStoreTrueAction,
         help="Modify the base installation instead (cannot be used with --output)",
     )
+    add_update_arguments(parser)
     parser.add_version_argument()
     parser.add_help_argument()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    update_result = handle_automatic_update(args, argv)
+    if update_result is not None:
+        return update_result
 
     base = args.base.resolve()
     patch = resolve_patch_path(args.patch)

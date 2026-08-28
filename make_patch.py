@@ -37,6 +37,7 @@ from common import (
     verify_scanned_tree,
     warn_if_low_disk_space_groups,
 )
+from update import add_update_arguments, handle_automatic_update, handle_early_update_request
 
 HDIFFZ = DATA_DIR / "hdiffz.exe"
 PATCH_VERSION = 2
@@ -306,6 +307,10 @@ def create_patch_archive(work: Path, output: Path, compression: str, full_file_s
 
 def main() -> int:
     install_termination_handlers()
+    argv = sys.argv[1:]
+    early_update_result = handle_early_update_request(argv)
+    if early_update_result is not None:
+        return early_update_result
     parser = ErrorArgumentParser(description="Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.")
     parser.add_argument("base", type=Path, help="Clean indexed Steam manifest base")
     parser.add_argument("new", type=Path, help="Newer installation")
@@ -324,9 +329,14 @@ def main() -> int:
         action=SingleUseStoreAction,
         help="Compression preset (default: normal): normal, high, higher, maximum",
     )
+    add_update_arguments(parser)
     parser.add_version_argument()
     parser.add_help_argument()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    update_result = handle_automatic_update(args, argv)
+    if update_result is not None:
+        return update_result
 
     base = args.base.resolve()
     new = args.new.resolve()
