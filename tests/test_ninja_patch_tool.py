@@ -2310,6 +2310,32 @@ class ApplyPatchTests(unittest.TestCase):
             self.assertEqual((base / "old.bin").read_bytes(), b"original")
             self.assertFalse((base / "added.bin").exists())
 
+    def test_recovery_cleans_abandoned_apply_work_without_recovery_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base"
+            base.mkdir()
+            work = root / "temp" / "apply_patch_12345_deadbeef"
+            (work / "payload").mkdir(parents=True)
+            with mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"), mock.patch.object(common, "TEMP_ROOT", root / "temp"), mock.patch.object(apply_patch, "process_matches_identity", return_value=False):
+                self.assertIsNone(apply_patch.recover_interrupted_operations(base, base))
+            self.assertFalse(work.exists())
+
+    def test_recovery_preserves_orphaned_apply_backup_without_recovery_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base"
+            base.mkdir()
+            work = root / "temp" / "apply_patch_12345_deadbeef"
+            backup = work / "backup"
+            backup.mkdir(parents=True)
+            (backup / "original.bin").write_bytes(b"original")
+            stderr = io.StringIO()
+            with mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"), mock.patch.object(common, "TEMP_ROOT", root / "temp"), mock.patch("sys.stderr", stderr):
+                self.assertIsNone(apply_patch.recover_interrupted_operations(base, base))
+            self.assertTrue(work.exists())
+            self.assertIn("recovery backup data", stderr.getvalue())
+
     def test_recovery_rejects_boolean_recovery_version(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

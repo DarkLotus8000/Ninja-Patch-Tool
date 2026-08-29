@@ -565,8 +565,8 @@ def publish_output_directory(working_destination: Path, destination: Path) -> No
         raise
 
 def recover_interrupted_operations(base: Path, destination: Path) -> dict | None:
-    # Recovery records exist only when an apply operation may need cleanup. Recovery runs before normal patch
-    # prerequisites so missing tools or a temporarily incomplete installation cannot block restoration.
+    # Recovery runs before normal patch prerequisites so missing tools or a temporarily incomplete installation cannot
+    # block restoration. Abandoned work without a finished recovery file is also cleaned when it is safe to do so.
     if not TEMP_ROOT.is_dir():
         return None
 
@@ -574,6 +574,42 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
     for work in sorted(TEMP_ROOT.glob("apply_patch_*")):
         recovery = work / RECOVERY_FILE
         if not recovery.is_file():
+            temporary_recovery = recovery.with_name(recovery.name + ".tmp")
+            if temporary_recovery.is_file():
+                try:
+                    temporary_state = parse_json(temporary_recovery.read_text(encoding="utf-8"))
+                except Exception:
+                    temporary_state = None
+                if isinstance(temporary_state, dict):
+                    pid = temporary_state.get("pid")
+                    if isinstance(pid, int) and pid != os.getpid() and process_matches_identity(pid, temporary_state.get("process_identity")):
+                        continue
+                    try:
+                        os.replace(temporary_recovery, recovery)
+                    except OSError:
+                        pass
+        if not recovery.is_file():
+            backup = work / "backup"
+            try:
+                backup_has_data = backup.is_symlink() or (backup.exists() and (not backup.is_dir() or next(backup.iterdir(), None) is not None))
+            except OSError:
+                backup_has_data = True
+            if backup_has_data:
+                print(f"WARNING: Abandoned Apply Patch work has recovery backup data but no usable recovery state and was left untouched:\n{work}", file=sys.stderr)
+                continue
+            token = work.name.removeprefix("apply_patch_")
+            pid_text, separator, _ = token.partition("_")
+            if separator and pid_text.isdecimal():
+                pid = int(pid_text)
+                if pid != os.getpid() and process_matches_identity(pid, None):
+                    continue
+            else:
+                try:
+                    if time.time() - work.stat().st_mtime < 2:
+                        continue
+                except OSError:
+                    continue
+            cleanup_work_dir(work)
             continue
 
         try:
@@ -847,18 +883,19 @@ def run_locked_apply(
                     (TEMP_ROOT, largest_payload, "temporary patch payload data"),
                 ])
 
-            work = make_work_dir("apply_patch")
-            scratch = work / "payload"
-            scratch.mkdir()
-
             if in_place:
                 check_temporary_paths(base, manifest["operations"])
+
+            work = make_work_dir(f"apply_patch_{os.getpid()}")
+
+            if in_place:
+                write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "preparing"))
+                keep_work = True
+                scratch = work / "payload"
+                scratch.mkdir()
                 backup = work / "backup"
                 backup.mkdir()
                 print("\n--in-place was specified.\nCreating and verifying a temporary backup before modifying the base...")
-
-                keep_work = True
-                write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "preparing"))
                 try:
                     existed = backup_in_place(base, backup, manifest["operations"])
                     write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "prepared", existed))
@@ -903,8 +940,10 @@ def run_locked_apply(
                 working_destination = separate_working_destination(destination, work)
                 if working_destination.exists():
                     raise RuntimeError(f"Temporary output path unexpectedly exists:\n{working_destination}")
-                keep_work = True
                 write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "copying", working_destination=working_destination))
+                keep_work = True
+                scratch = work / "payload"
+                scratch.mkdir()
                 try:
                     print(f"\nCreating separate installation:\n{destination}\nCopying and verifying base installation...")
                     copy_started = time.perf_counter()
