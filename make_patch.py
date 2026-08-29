@@ -42,7 +42,6 @@ from update import add_update_arguments, handle_automatic_update, handle_early_u
 HDIFFZ = DATA_DIR / "hdiffz.exe"
 PATCH_VERSION = 2
 MAKE_SESSION_FILE = "session.json"
-MAKE_SESSION_GRACE_SECONDS = 10
 
 # The regular presets map to one HDiffPatch strategy. "maximum" uses the same common compression as "higher",
 # but tries several matching strategies below and keeps the smallest delta.
@@ -101,7 +100,8 @@ def write_make_session(work: Path, output: Path) -> None:
 
 def cleanup_stale_make_patch_work(output: Path) -> None:
     # Reusing old HDiff candidates would require proving every source hash and setting still matches, so interrupted
-    # creation data is discarded instead.
+    # creation data is discarded instead. New work-directory names include the owner PID so an X-close before the
+    # session marker is published can still be identified as abandoned on the next run.
     active_for_output = False
 
     if TEMP_ROOT.is_dir():
@@ -111,30 +111,45 @@ def cleanup_stale_make_patch_work(output: Path) -> None:
             pid = None
             state = None
 
-            if session.is_file():
+            for candidate in (session, session.with_name(session.name + ".tmp")):
+                if not candidate.is_file():
+                    continue
                 try:
-                    state = parse_json(session.read_text(encoding="utf-8"))
-                    if isinstance(state, dict):
-                        pid = state.get("pid")
-                        raw_output = state.get("output")
-                    else:
-                        raw_output = None
-                    if isinstance(raw_output, str):
-                        session_output = Path(raw_output).resolve()
+                    candidate_state = parse_json(candidate.read_text(encoding="utf-8"))
+                    if not isinstance(candidate_state, dict):
+                        continue
+                    candidate_pid = candidate_state.get("pid")
+                    raw_output = candidate_state.get("output")
+                    if not isinstance(candidate_pid, int) or not isinstance(raw_output, str):
+                        continue
+                    pid = candidate_pid
+                    session_output = Path(raw_output).resolve()
+                    state = candidate_state
+                    break
                 except Exception:
-                    pass
+                    continue
 
-            if isinstance(pid, int) and process_matches_identity(pid, state.get("process_identity") if isinstance(state, dict) else None):
-                active_for_output |= session_output == output
+            if session_output is not None and session_output != output:
                 continue
 
-            if not session.is_file():
-                # Give a just-created folder a moment to receive its atomically written session marker before considering it stale.
-                try:
-                    if time.time() - work.stat().st_mtime < MAKE_SESSION_GRACE_SECONDS:
+            if isinstance(pid, int) and process_matches_identity(pid, state.get("process_identity") if isinstance(state, dict) else None):
+                active_for_output = True
+                continue
+
+            if state is None:
+                suffix = work.name.removeprefix("make_patch_")
+                pid_text, separator, unique = suffix.partition("_")
+                folder_pid = int(pid_text) if separator and pid_text.isdigit() and unique else None
+                if folder_pid is not None:
+                    if process_matches_identity(folder_pid, None):
                         continue
-                except OSError:
-                    continue
+                else:
+                    # Compatibility for work created by older NPT versions that did not put the PID in the folder name.
+                    try:
+                        if time.time() - work.stat().st_mtime < 10:
+                            continue
+                    except OSError:
+                        continue
 
             if session_output is not None:
                 try:
@@ -435,7 +450,7 @@ def main() -> int:
             (output.parent, final_payload_estimate, "the final patch archive"),
         ])
 
-        work = make_work_dir("make_patch")
+        work = make_work_dir(f"make_patch_{os.getpid()}")
         write_make_session(work, output)
         diffs_dir = work / "diffs"
         diffs_dir.mkdir()

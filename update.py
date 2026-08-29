@@ -545,6 +545,15 @@ def _update_session_is_active(work: Path) -> bool:
         # If process inspection itself fails, be conservative and leave the work directory alone.
         return True
 
+def _update_work_has_backup(work: Path) -> bool:
+    try:
+        if not work.is_dir():
+            return False
+        return any(path.name.startswith("backup_") for path in work.iterdir())
+    except OSError:
+        # If an existing work directory cannot be inspected, preserve it rather than risking recovery data.
+        return True
+
 def cleanup_stale_update_work(max_age_seconds: int = STALE_UPDATE_AGE_SECONDS) -> None:
     if max_age_seconds < 0 or not TEMP_ROOT.is_dir():
         return
@@ -561,7 +570,7 @@ def cleanup_stale_update_work(max_age_seconds: int = STALE_UPDATE_AGE_SECONDS) -
             if work.is_symlink() or not work.is_dir() or work.stat().st_mtime > cutoff:
                 continue
             # A backup means an interrupted/incomplete transaction may need manual recovery. Never remove it here.
-            if any(path.name.startswith("backup_") for path in work.iterdir()):
+            if _update_work_has_backup(work):
                 continue
             # A self-updater now runs from inside update_<id>. Never delete its directory while that process is alive.
             if _update_session_is_active(work):
@@ -954,6 +963,9 @@ def run_update_installer(argv: list[str] | None = None) -> int:
                     except Exception as rollback_error:
                         print(f'ERROR: Ninja Patch Tool update failed and rollback was incomplete: {rollback_error}', file=sys.stderr)
                         return 1
+                elif _update_work_has_backup(work):
+                    print(f'ERROR: Ninja Patch Tool update failed and rollback was incomplete; recovery data was retained: {exc}', file=sys.stderr)
+                    return 1
 
                 print(f'ERROR: Ninja Patch Tool update failed; the previous installation was restored when possible: {exc}', file=sys.stderr)
                 try:
@@ -968,8 +980,9 @@ def run_update_installer(argv: list[str] | None = None) -> int:
             return 0
     except Exception as exc:
         print(f"ERROR: Ninja Patch Tool updater could not start the installation: {exc}", file=sys.stderr)
-        try:
-            relaunch(executable, relaunch_args, relaunch_cwd, work)
-        except Exception as relaunch_error:
-            print(f"ERROR: Could not restart Ninja Patch Tool after the failed update: {relaunch_error}", file=sys.stderr)
+        if not _update_work_has_backup(work):
+            try:
+                relaunch(executable, relaunch_args, relaunch_cwd, work)
+            except Exception as relaunch_error:
+                print(f"ERROR: Could not restart Ninja Patch Tool after the failed update: {relaunch_error}", file=sys.stderr)
         return 1

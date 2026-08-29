@@ -517,9 +517,9 @@ This should not be included.
                 with self.assertRaisesRegex(FileExistsError, "already exists"):
                     build_release.validate_release_output_available()
 
-    def test_version_141_maps_to_windows_four_part_version(self) -> None:
-        self.assertEqual(common.VERSION, "1.4.1")
-        self.assertEqual(build_release.version_tuple(), (1, 4, 1, 0))
+    def test_version_142_maps_to_windows_four_part_version(self) -> None:
+        self.assertEqual(common.VERSION, "1.4.2")
+        self.assertEqual(build_release.version_tuple(), (1, 4, 2, 0))
 
     def test_update_arguments_reject_duplicate_aliases_and_conflicts(self) -> None:
         invalid = (
@@ -569,12 +569,12 @@ This should not be included.
         record.assert_called_once_with("success")
         self.assertEqual(
             stdout.getvalue(),
-            "[Update] Local Ninja Patch Tool v1.4.1 is newer than the latest release v1.3.1.\n",
+            "[Update] Local Ninja Patch Tool v1.4.2 is newer than the latest release v1.3.1.\n",
         )
 
     def test_check_update_reports_equal_version_as_up_to_date(self) -> None:
         stdout = io.StringIO()
-        release = {"version": "1.4.1", "url": "https://example.test/release"}
+        release = {"version": "1.4.2", "url": "https://example.test/release"}
         with (
             mock.patch.object(update, "latest_release", return_value=release),
             mock.patch.object(update, "_record_update_check_result") as record,
@@ -582,7 +582,7 @@ This should not be included.
         ):
             self.assertEqual(update.check_update_only(), 0)
         record.assert_called_once_with("success")
-        self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4.1 is up to date.\n")
+        self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4.2 is up to date.\n")
 
     def test_check_update_reports_newer_release(self) -> None:
         stdout = io.StringIO()
@@ -597,7 +597,7 @@ This should not be included.
         self.assertEqual(
             stdout.getvalue(),
             "[Update] Ninja Patch Tool v1.5 is available.\n"
-            "Current version: v1.4.1\n"
+            "Current version: v1.4.2\n"
             "Release: https://example.test/release\n",
         )
 
@@ -827,7 +827,7 @@ This should not be included.
 
     def test_temporary_self_updater_version_check_accepts_matching_version(self) -> None:
         updater_path = Path("NinjaPatchToolUpdater.exe")
-        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.4.1\n", stderr="")
+        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.4.2\n", stderr="")
         with mock.patch.object(update.subprocess, "run", return_value=result) as run:
             update._validate_temporary_updater(updater_path)
         run.assert_called_once_with(
@@ -1232,6 +1232,37 @@ This should not be included.
             self.assertEqual((install / "a.exe").read_bytes(), b"old a")
             self.assertEqual((install / "b.exe").read_bytes(), b"old b")
 
+    def test_updater_preserves_work_when_install_rollback_is_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "temp" / "update_deadbeef" / "stage"
+            backup = stage.parent / "backup_deadbeef"
+            install.mkdir(parents=True)
+            stage.mkdir(parents=True)
+            backup.mkdir()
+            executable = install / "make_patch.exe"
+            with (
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update, "write_update_session"),
+                mock.patch.object(update, "wait_for_process_exit"),
+                mock.patch.object(update, "updater_install_lock", return_value=nullcontext()),
+                mock.patch.object(update, "installed_executable_satisfies_target", return_value=None),
+                mock.patch.object(update, "install_staged_release", side_effect=RuntimeError("rollback incomplete")),
+                mock.patch.object(update, "relaunch") as relaunch,
+            ):
+                result = update.run_update_installer([
+                    "--install-dir", str(install),
+                    "--stage-dir", str(stage),
+                    "--parent-pid", "123",
+                    "--target-version", "1.5.0",
+                    "--relaunch-executable", str(executable),
+                    "--relaunch-cwd", str(root),
+                ])
+            self.assertEqual(result, 1)
+            self.assertTrue(backup.is_dir())
+            relaunch.assert_not_called()
+
     def test_updater_can_roll_back_after_post_install_validation_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1560,6 +1591,32 @@ This should not be included.
         self.assertIn("WARNING: Disk space may be insufficient", stderr.getvalue())
 
 class MakePatchTests(unittest.TestCase):
+    def test_stale_make_patch_cleanup_does_not_touch_other_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            temp_root = root / "temp"
+            work = temp_root / "make_patch_123_deadbeef"
+            work.mkdir(parents=True)
+            first_output = (root / "first.patch").resolve()
+            second_output = (root / "second.patch").resolve()
+            (work / make_patch.MAKE_SESSION_FILE).write_text(json.dumps({"pid": 123, "process_identity": "dead", "output": str(first_output)}), encoding="utf-8")
+            first_partial = make_patch.temporary_patch_path(first_output)
+            first_partial.write_bytes(b"partial")
+            with (
+                mock.patch.object(make_patch, "TEMP_ROOT", temp_root),
+                mock.patch.object(make_patch, "process_matches_identity", return_value=False),
+            ):
+                make_patch.cleanup_stale_make_patch_work(second_output)
+            self.assertTrue(work.is_dir())
+            self.assertTrue(first_partial.is_file())
+            with (
+                mock.patch.object(make_patch, "TEMP_ROOT", temp_root),
+                mock.patch.object(make_patch, "process_matches_identity", return_value=False),
+            ):
+                make_patch.cleanup_stale_make_patch_work(first_output)
+            self.assertFalse(work.exists())
+            self.assertFalse(first_partial.exists())
+
     def test_unowned_patch_tmp_is_never_deleted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp) / "temp"
@@ -1580,6 +1637,30 @@ class MakePatchTests(unittest.TestCase):
             partial = make_patch.temporary_patch_path(output)
             partial.write_bytes(b"partial")
             (work / make_patch.MAKE_SESSION_FILE).write_text(json.dumps({"pid": 123, "output": str(output)}), encoding="utf-8")
+            with mock.patch.object(make_patch, "TEMP_ROOT", temp_root), mock.patch.object(make_patch, "process_matches_identity", return_value=False):
+                make_patch.cleanup_stale_make_patch_work(output)
+            self.assertFalse(partial.exists())
+            self.assertFalse(work.exists())
+
+    def test_stale_make_patch_work_without_session_is_removed_when_owner_is_dead(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp) / "temp"
+            work = temp_root / "make_patch_123_deadbeef"
+            work.mkdir(parents=True)
+            output = Path(tmp) / "output.patch"
+            with mock.patch.object(make_patch, "TEMP_ROOT", temp_root), mock.patch.object(make_patch, "process_matches_identity", return_value=False):
+                make_patch.cleanup_stale_make_patch_work(output)
+            self.assertFalse(work.exists())
+
+    def test_complete_temporary_make_session_is_used_for_stale_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp) / "temp"
+            work = temp_root / "make_patch_123_deadbeef"
+            work.mkdir(parents=True)
+            output = Path(tmp) / "output.patch"
+            partial = make_patch.temporary_patch_path(output)
+            partial.write_bytes(b"partial")
+            (work / f"{make_patch.MAKE_SESSION_FILE}.tmp").write_text(json.dumps({"pid": 123, "process_identity": "123:1", "output": str(output)}), encoding="utf-8")
             with mock.patch.object(make_patch, "TEMP_ROOT", temp_root), mock.patch.object(make_patch, "process_matches_identity", return_value=False):
                 make_patch.cleanup_stale_make_patch_work(output)
             self.assertFalse(partial.exists())
