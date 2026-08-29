@@ -25,7 +25,6 @@ import build_release
 import common
 import make_patch
 import update
-import updater
 import verify_base
 
 def sha256_bytes(data: bytes) -> str:
@@ -1175,7 +1174,7 @@ This should not be included.
             (stage / "data" / "licenses" / "new.txt").write_text("new", encoding="utf-8")
             (stage / "data" / "hdiffz.exe").write_bytes(b"new hdiff")
 
-            backup, _ = updater.install_staged_release(stage, install)
+            backup, _ = update.install_staged_release(stage, install)
             self.assertTrue(backup.is_dir())
             self.assertEqual((install / "make_patch.exe").read_bytes(), b"new")
             self.assertEqual(
@@ -1203,7 +1202,7 @@ This should not be included.
             (install / "data" / "index.json").write_text(json.dumps(installed_index), encoding="utf-8")
             (stage / "data" / "index.json").write_text(json.dumps(release_index), encoding="utf-8")
 
-            updater.install_staged_release(stage, install)
+            update.install_staged_release(stage, install)
             merged = json.loads((install / "data" / "index.json").read_text(encoding="utf-8"))
             self.assertNotIn("CustomAlias", merged)
             self.assertEqual(merged["U44.1"], release_index["U44.1"])
@@ -1220,16 +1219,16 @@ This should not be included.
             (install / "b.exe").write_bytes(b"old b")
             (stage / "a.exe").write_bytes(b"new a")
             (stage / "b.exe").write_bytes(b"new b")
-            original_copy = updater._copy_item
+            original_copy = update._copy_item
 
             def fail_on_b(source: Path, destination: Path) -> None:
                 if source.name == "b.exe":
                     raise OSError("copy failed")
                 original_copy(source, destination)
 
-            with mock.patch.object(updater, "_copy_item", side_effect=fail_on_b):
+            with mock.patch.object(update, "_copy_item", side_effect=fail_on_b):
                 with self.assertRaisesRegex(OSError, "copy failed"):
-                    updater.install_staged_release(stage, install)
+                    update.install_staged_release(stage, install)
             self.assertEqual((install / "a.exe").read_bytes(), b"old a")
             self.assertEqual((install / "b.exe").read_bytes(), b"old b")
 
@@ -1243,9 +1242,9 @@ This should not be included.
             (install / "make_patch.exe").write_bytes(b"old")
             (stage / "make_patch.exe").write_bytes(b"new")
 
-            backup, changes = updater.install_staged_release(stage, install)
+            backup, changes = update.install_staged_release(stage, install)
             self.assertEqual((install / "make_patch.exe").read_bytes(), b"new")
-            updater.rollback_staged_release(changes, backup)
+            update.rollback_staged_release(changes, backup)
             self.assertEqual((install / "make_patch.exe").read_bytes(), b"old")
 
     def test_updater_install_lock_times_out_instead_of_waiting_forever(self) -> None:
@@ -1259,7 +1258,7 @@ This should not be included.
         )
         with mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel32):
             with self.assertRaisesRegex(RuntimeError, "Timed out waiting for another Ninja Patch Tool update"):
-                with updater.updater_install_lock(Path("C:/NPT"), timeout_seconds=2):
+                with update.updater_install_lock(Path("C:/NPT"), timeout_seconds=2):
                     pass
 
         kernel32.WaitForSingleObject.assert_called_once_with(123, 2000)
@@ -1269,21 +1268,21 @@ This should not be included.
     def test_updater_queued_target_is_satisfied_by_equal_or_newer_installation(self) -> None:
         executable = Path("tool.exe")
         cwd = Path(".")
-        with mock.patch.object(updater, "_read_installed_version", return_value="1.5"):
-            self.assertEqual(updater.installed_executable_satisfies_target(executable, "1.5", cwd), "1.5")
-        with mock.patch.object(updater, "_read_installed_version", return_value="1.6"):
-            self.assertEqual(updater.installed_executable_satisfies_target(executable, "1.5", cwd), "1.6")
-        with mock.patch.object(updater, "_read_installed_version", return_value="1.5.0"):
-            self.assertEqual(updater.installed_executable_satisfies_target(executable, "1.5", cwd), "1.5.0")
-        with mock.patch.object(updater, "_read_installed_version", return_value="1.4.9"):
-            self.assertIsNone(updater.installed_executable_satisfies_target(executable, "1.5", cwd))
-        with mock.patch.object(updater, "_read_installed_version", side_effect=RuntimeError("not runnable")):
-            self.assertIsNone(updater.installed_executable_satisfies_target(executable, "1.5", cwd))
+        with mock.patch.object(update, "_read_installed_version", return_value="1.5"):
+            self.assertEqual(update.installed_executable_satisfies_target(executable, "1.5", cwd), "1.5")
+        with mock.patch.object(update, "_read_installed_version", return_value="1.6"):
+            self.assertEqual(update.installed_executable_satisfies_target(executable, "1.5", cwd), "1.6")
+        with mock.patch.object(update, "_read_installed_version", return_value="1.5.0"):
+            self.assertEqual(update.installed_executable_satisfies_target(executable, "1.5", cwd), "1.5.0")
+        with mock.patch.object(update, "_read_installed_version", return_value="1.4.9"):
+            self.assertIsNone(update.installed_executable_satisfies_target(executable, "1.5", cwd))
+        with mock.patch.object(update, "_read_installed_version", side_effect=RuntimeError("not runnable")):
+            self.assertIsNone(update.installed_executable_satisfies_target(executable, "1.5", cwd))
 
     def test_updater_post_install_validation_still_requires_exact_target_text(self) -> None:
-        with mock.patch.object(updater, "_read_installed_version", return_value="1.6"):
+        with mock.patch.object(update, "_read_installed_version", return_value="1.6"):
             with self.assertRaisesRegex(RuntimeError, "expected v1.5, got v1.6"):
-                updater.validate_installed_executable(Path("tool.exe"), "1.5", Path("."))
+                update.validate_installed_executable(Path("tool.exe"), "1.5", Path("."))
 
     def test_stale_update_work_cleanup_removes_only_safe_old_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1320,7 +1319,7 @@ This should not be included.
             temp_root = Path(tmp) / "temp"
             work = temp_root / "update_active"
             work.mkdir(parents=True)
-            (work / updater.UPDATE_SESSION_FILE).write_text(
+            (work / update.UPDATE_SESSION_FILE).write_text(
                 json.dumps({"pid": 123, "process_identity": "123:456"}), encoding="utf-8"
             )
             now = 2_000_000.0
@@ -1343,7 +1342,7 @@ This should not be included.
             temp_root = Path(tmp) / "temp"
             work = temp_root / "update_inactive"
             work.mkdir(parents=True)
-            (work / updater.UPDATE_SESSION_FILE).write_text(
+            (work / update.UPDATE_SESSION_FILE).write_text(
                 json.dumps({"pid": 123, "process_identity": "123:456"}), encoding="utf-8"
             )
             now = 2_000_000.0
@@ -1426,7 +1425,7 @@ This should not be included.
 
     def test_update_installer_internal_mode_dispatches_before_startup_cleanup(self) -> None:
         with (
-            mock.patch.object(update, "updater_main", return_value=7) as installer,
+            mock.patch.object(update, "run_update_installer", return_value=7) as installer,
             mock.patch.object(update, "cleanup_legacy_updater_executable") as legacy_cleanup,
             mock.patch.object(update, "cleanup_relaunched_update_work") as cleanup,
             mock.patch.object(update, "cleanup_stale_update_work") as stale,
@@ -1441,10 +1440,10 @@ This should not be included.
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp) / "update_deadbeef"
             work.mkdir()
-            with mock.patch.object(updater, "process_identity", return_value="123:456"):
-                with mock.patch.object(updater.os, "getpid", return_value=123):
-                    updater.write_update_session(work)
-            state = json.loads((work / updater.UPDATE_SESSION_FILE).read_text(encoding="utf-8"))
+            with mock.patch.object(update, "process_identity", return_value="123:456"):
+                with mock.patch.object(update.os, "getpid", return_value=123):
+                    update.write_update_session(work)
+            state = json.loads((work / update.UPDATE_SESSION_FILE).read_text(encoding="utf-8"))
             self.assertEqual(state, {"pid": 123, "process_identity": "123:456"})
 
     def test_updater_relaunch_uses_internal_one_shot_skip_without_changing_args(self) -> None:
@@ -1456,8 +1455,8 @@ This should not be included.
             captured["env"] = env
             return SimpleNamespace()
 
-        with mock.patch.object(updater.subprocess, "Popen", side_effect=fake_popen):
-            updater.relaunch(
+        with mock.patch.object(update.subprocess, "Popen", side_effect=fake_popen):
+            update.relaunch(
                 Path("C:/NPT/make_patch.exe"),
                 ["-a", "base", "new", "out", "U1"],
                 Path("C:/work"),

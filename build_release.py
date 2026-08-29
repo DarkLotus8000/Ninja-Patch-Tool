@@ -185,7 +185,7 @@ def validate_build_environment() -> list[Path]:
     validate_pyinstaller_version(pyinstaller_version)
 
     required = [ROOT / script for script in ENTRY_SCRIPTS]
-    required.extend([ROOT / "common.py", ROOT / "update.py", ROOT / "updater.py", ROOT / "README.md", FAVICON])
+    required.extend([ROOT / "common.py", ROOT / "update.py", ROOT / "README.md", FAVICON])
     required.extend(DATA_DIR / name for name in RELEASE_DATA_FILES)
     required.extend(LICENSES_DIR / name for name in THIRD_PARTY_LICENSE_FILES)
     missing = [path for path in required if not path.is_file()]
