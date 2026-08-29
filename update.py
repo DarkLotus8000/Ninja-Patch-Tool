@@ -785,7 +785,7 @@ def rollback_staged_release(changes: list[tuple[Path, Path | None]], backup: Pat
     rollback_errors: list[str] = []
     for destination, saved in reversed(changes):
         try:
-            if destination.exists():
+            if destination.exists() or destination.is_symlink():
                 _remove_path(destination)
             if saved is not None and saved.exists():
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -811,7 +811,7 @@ def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[t
 
     def replace(source: Path, destination: Path, relative: Path) -> None:
         saved: Path | None = None
-        if destination.exists():
+        if destination.exists() or destination.is_symlink():
             saved = backup / relative
             saved.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(destination), str(saved))
@@ -857,6 +857,8 @@ def _read_installed_version(executable: Path, cwd: Path) -> str:
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Updated executable did not respond to --version: {executable.name}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Updated executable could not be started: {executable.name}: {exc}") from exc
 
     output = result.stdout.strip()
     prefix = "Ninja Patch Tool v"
