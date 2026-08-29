@@ -27,14 +27,12 @@ UPDATER_LOCK_TIMEOUT_SECONDS = 120
 UPDATE_INSTALLER_ARGUMENT = "--update-installer"
 UPDATE_SESSION_FILE = "update_session.json"
 
-
 def ignore_interrupts() -> None:
     # Once the updater handoff has started, interruption must not stop file replacement or rollback halfway through.
     for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
         sig = getattr(signal, name, None)
         if sig is not None:
             signal.signal(sig, signal.SIG_IGN)
-
 
 @contextmanager
 def updater_install_lock(install_dir: Path, timeout_seconds: int = UPDATER_LOCK_TIMEOUT_SECONDS):
@@ -68,7 +66,6 @@ def updater_install_lock(install_dir: Path, timeout_seconds: int = UPDATER_LOCK_
     finally:
         kernel32.CloseHandle(handle)
 
-
 def wait_for_process_exit(pid: int, timeout_seconds: int = 30) -> None:
     if pid <= 0:
         return
@@ -98,7 +95,6 @@ def wait_for_process_exit(pid: int, timeout_seconds: int = 30) -> None:
     finally:
         kernel32.CloseHandle(handle)
 
-
 def write_update_session(work: Path) -> None:
     session = work / UPDATE_SESSION_FILE
     temporary = session.with_name(f"{session.name}.{uuid.uuid4().hex}.tmp")
@@ -112,13 +108,11 @@ def write_update_session(work: Path) -> None:
     finally:
         temporary.unlink(missing_ok=True)
 
-
 def _remove_path(path: Path) -> None:
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path)
     else:
         path.unlink(missing_ok=True)
-
 
 def _copy_item(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -127,7 +121,6 @@ def _copy_item(source: Path, destination: Path) -> None:
     else:
         shutil.copy2(source, destination)
 
-
 def _read_index(path: Path, label: str) -> dict:
     try:
         index = parse_json(path.read_text(encoding="utf-8"))
@@ -135,7 +128,6 @@ def _read_index(path: Path, label: str) -> dict:
         return index
     except Exception as exc:
         raise RuntimeError(f"{label} index.json is invalid: {exc}") from exc
-
 
 def _write_merged_index(release_path: Path, installed_path: Path, output_path: Path) -> None:
     release_index = _read_index(release_path, "Release")
@@ -162,7 +154,6 @@ def _write_merged_index(release_path: Path, installed_path: Path, output_path: P
     sorted_index = {name: merged[name] for name in sorted(merged, key=natural_sort_key)}
     output_path.write_text(json.dumps(sorted_index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
 
-
 def rollback_staged_release(changes: list[tuple[Path, Path | None]], backup: Path) -> None:
     rollback_errors: list[str] = []
     for destination, saved in reversed(changes):
@@ -180,7 +171,6 @@ def rollback_staged_release(changes: list[tuple[Path, Path | None]], backup: Pat
             f"Rollback was incomplete. Backup retained at {backup}. Rollback errors: {'; '.join(rollback_errors)}"
         )
     shutil.rmtree(backup, ignore_errors=True)
-
 
 def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[tuple[Path, Path | None]]]:
     if not stage.is_dir():
@@ -229,7 +219,6 @@ def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[t
 
     return backup, changes
 
-
 def _read_installed_version(executable: Path, cwd: Path) -> str:
     try:
         result = subprocess.run(
@@ -254,7 +243,6 @@ def _read_installed_version(executable: Path, cwd: Path) -> str:
         raise RuntimeError(f"Updated executable returned an invalid version: {executable.name}: {version!r}") from exc
     return version
 
-
 def validate_installed_executable(executable: Path, target_version: str, cwd: Path) -> None:
     installed_version = _read_installed_version(executable, cwd)
     if installed_version != target_version:
@@ -262,7 +250,6 @@ def validate_installed_executable(executable: Path, target_version: str, cwd: Pa
             f"Updated executable failed validation: {executable.name}: "
             f"expected v{target_version}, got v{installed_version}"
         )
-
 
 def installed_executable_satisfies_target(executable: Path, target_version: str, cwd: Path) -> str | None:
     try:
@@ -273,7 +260,6 @@ def installed_executable_satisfies_target(executable: Path, target_version: str,
         pass
     return None
 
-
 def relaunch(executable: Path, argv: list[str], cwd: Path, cleanup_work: Path | None = None) -> subprocess.Popen:
     environment = os.environ.copy()
     # Skip exactly one update check after a handoff. Injecting --no-auto-update would conflict with an original
@@ -282,7 +268,6 @@ def relaunch(executable: Path, argv: list[str], cwd: Path, cleanup_work: Path | 
     if cleanup_work is not None:
         environment["NPT_UPDATE_WORK_CLEANUP"] = str(cleanup_work)
     return subprocess.Popen([str(executable), *argv], cwd=cwd, env=environment)
-
 
 def main(argv: list[str] | None = None) -> int:
     if sys.platform != "win32":
@@ -323,10 +308,7 @@ def main(argv: list[str] | None = None) -> int:
             if installed_version is not None:
                 relaunch(executable, relaunch_args, relaunch_cwd, work)
                 if compare_versions(installed_version, args.target_version) > 0:
-                    print(
-                        f"[Update] Ninja Patch Tool v{installed_version} is already installed; "
-                        f"skipping queued update to v{args.target_version}."
-                    )
+                    print(f'[Update] Ninja Patch Tool v{installed_version} is already installed; skipping queued update to v{args.target_version}.')
                 else:
                     print(f"[Update] Ninja Patch Tool v{args.target_version} was already installed by another updater.")
                 return 0
@@ -341,16 +323,10 @@ def main(argv: list[str] | None = None) -> int:
                     try:
                         rollback_staged_release(changes, backup)
                     except Exception as rollback_error:
-                        print(
-                            f"ERROR: Ninja Patch Tool update failed and rollback was incomplete: {rollback_error}",
-                            file=sys.stderr,
-                        )
+                        print(f'ERROR: Ninja Patch Tool update failed and rollback was incomplete: {rollback_error}', file=sys.stderr)
                         return 1
 
-                print(
-                    f"ERROR: Ninja Patch Tool update failed; the previous installation was restored when possible: {exc}",
-                    file=sys.stderr,
-                )
+                print(f'ERROR: Ninja Patch Tool update failed; the previous installation was restored when possible: {exc}', file=sys.stderr)
                 try:
                     relaunch(executable, relaunch_args, relaunch_cwd, work)
                 except Exception as relaunch_error:
@@ -368,7 +344,6 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as relaunch_error:
             print(f"ERROR: Could not restart Ninja Patch Tool after the failed update: {relaunch_error}", file=sys.stderr)
         return 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

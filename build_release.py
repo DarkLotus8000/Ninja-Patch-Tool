@@ -453,12 +453,7 @@ def main() -> int:
                     pass
 
         print(f"\n[Created] {archive}")
-        print(
-            f"Version: {VERSION}\n"
-            f"Size: {format_bytes(archive.stat().st_size)}\n"
-            f"SHA-256: {digest}\n"
-            f"Checksum: {checksum}"
-        )
+        print(f'Version: {VERSION}\nSize: {format_bytes(archive.stat().st_size)}\nSHA-256: {digest}\nChecksum: {checksum}')
         return 0
     except KeyboardInterrupt:
         print("\nRelease creation interrupted.", file=sys.stderr)

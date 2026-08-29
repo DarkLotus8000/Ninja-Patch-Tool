@@ -18,7 +18,6 @@ from common import (
 )
 from update import add_update_arguments, handle_automatic_update, handle_early_update_request
 
-
 def _existing_base_conflict(index: dict, name: str, manifest_id: int) -> str | None:
     try:
         existing_name = resolve_base_name(index, name)
@@ -32,7 +31,6 @@ def _existing_base_conflict(index: dict, name: str, manifest_id: int) -> str | N
         if entry["steam_manifest_id"] == manifest_id:
             return f'Steam manifest ID {manifest_id} is already indexed as "{existing_name}".'
     return None
-
 
 def main() -> int:
     install_termination_handlers()
@@ -93,22 +91,13 @@ def main() -> int:
 
                 for existing_name, entry in index.items():
                     if entry["sha256"].lower() == root_hash.lower():
-                        print(
-                            f'ERROR: This exact base is already indexed as "{existing_name}".\nNo changes were made.',
-                            file=sys.stderr,
-                        )
+                        print(f'ERROR: This exact base is already indexed as "{existing_name}".\nNo changes were made.', file=sys.stderr)
                         return 1
 
                 index[name] = {"steam_manifest_id": manifest_id, "sha256": root_hash, "file_count": len(files)}
                 write_index(index)
 
-        print(
-            f'\n[Added] Base "{name}"\n'
-            f"Steam manifest ID: {manifest_id}\n"
-            f"Files: {len(files):,}\n"
-            f"SHA-256: {root_hash}\n"
-            f"Index: {INDEX_FILE}"
-        )
+        print(f'\n[Added] Base "{name}"\nSteam manifest ID: {manifest_id}\nFiles: {len(files):,}\nSHA-256: {root_hash}\nIndex: {INDEX_FILE}')
         return 0
     except KeyboardInterrupt:
         print("\nBase addition cancelled.", file=sys.stderr)
@@ -116,7 +105,6 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -40,7 +40,6 @@ GITHUB_RELEASES_URL = "https://github.com/DarkLotus8000/Ninja-Patch-Tool/release
 UPDATE_ATTEMPTS = 3
 STALE_UPDATE_AGE_SECONDS = 7 * 24 * 60 * 60
 
-
 def add_update_arguments(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -62,7 +61,6 @@ def add_update_arguments(parser: argparse.ArgumentParser) -> None:
         help="Check GitHub Releases for a newer version without installing it",
     )
 
-
 def _move_file_if_absent_windows(source: Path, destination: Path) -> None:
     # FAT/exFAT do not support hard links. MoveFileEx without MOVEFILE_REPLACE_EXISTING gives us the same important
     # property on Windows: atomic publication within the directory without overwriting a config another process won.
@@ -83,7 +81,6 @@ def _move_file_if_absent_windows(source: Path, destination: Path) -> None:
         raise FileExistsError(error, "Update configuration already exists.", str(destination))
     raise OSError(error, "Could not publish the default update configuration.", str(destination))
 
-
 def _create_default_update_config() -> None:
     UPDATE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary = UPDATE_CONFIG_FILE.with_name(f"{UPDATE_CONFIG_FILE.name}.{uuid.uuid4().hex}.tmp")
@@ -103,7 +100,6 @@ def _create_default_update_config() -> None:
     finally:
         temporary.unlink(missing_ok=True)
 
-
 def _read_update_config() -> dict[str, Any]:
     if not UPDATE_CONFIG_FILE.exists():
         _create_default_update_config()
@@ -111,7 +107,6 @@ def _read_update_config() -> dict[str, Any]:
     if not isinstance(config, dict) or not isinstance(config.get("auto_update"), bool):
         raise ValueError('Expected a JSON object containing boolean "auto_update".')
     return config
-
 
 def _write_update_config(config: dict[str, Any]) -> None:
     UPDATE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -123,31 +118,22 @@ def _write_update_config(config: dict[str, Any]) -> None:
     finally:
         temporary.unlink(missing_ok=True)
 
-
 def load_auto_update_setting() -> bool:
     try:
         return _read_update_config()["auto_update"]
     except OSError as exc:
         message = "Could not create" if not UPDATE_CONFIG_FILE.exists() else "Could not read"
-        print(
-            f"[Update] Warning: {message} {UPDATE_CONFIG_FILE}; automatic updating is disabled for this run: {exc}",
-            file=sys.stderr,
-        )
+        print(f'[Update] Warning: {message} {UPDATE_CONFIG_FILE}; automatic updating is disabled for this run: {exc}', file=sys.stderr)
         return False
     except ValueError as exc:
-        print(
-            f"[Update] Warning: Invalid update configuration; automatic updating is disabled for this run: {exc}",
-            file=sys.stderr,
-        )
+        print(f'[Update] Warning: Invalid update configuration; automatic updating is disabled for this run: {exc}', file=sys.stderr)
         return False
-
 
 def _stored_check_time(config: dict[str, Any], key: str) -> int | None:
     value = config.get(key)
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
-
 
 def automatic_update_check_due(now: float | None = None) -> bool:
     # Cooldown state is best-effort. A damaged/unreadable config must not create a second failure mode here; the normal
@@ -168,7 +154,6 @@ def automatic_update_check_due(now: float | None = None) -> bool:
         age = current - successful
         return age < 0 or age >= 24 * 60 * 60
     return True
-
 
 def _record_update_check_result(result: str, now: float | None = None) -> None:
     # Source checkouts must not write runtime cooldown state into the repository.
@@ -195,7 +180,6 @@ def _record_update_check_result(result: str, now: float | None = None) -> None:
     except (OSError, ValueError):
         pass
 
-
 def _request(url: str, timeout: float):
     if not url.lower().startswith("https://"):
         raise RuntimeError(f"Update URL is not HTTPS: {url}")
@@ -209,7 +193,6 @@ def _request(url: str, timeout: float):
     )
     return urllib.request.urlopen(request, timeout=timeout)
 
-
 def _request_json(url: str) -> dict[str, Any]:
     with _request(url, 5) as response:
         payload = response.read()
@@ -217,7 +200,6 @@ def _request_json(url: str) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise RuntimeError("GitHub returned an unexpected response.")
     return result
-
 
 def latest_release() -> dict[str, Any]:
     release = _request_json(GITHUB_RELEASES_API)
@@ -234,7 +216,6 @@ def latest_release() -> dict[str, Any]:
     version = tag[1:] if tag[:1].lower() == "v" else tag
     return {"tag": tag, "version": version, "assets": assets, "url": html_url}
 
-
 def find_release_asset(release: dict[str, Any], name: str) -> tuple[str, int | None]:
     for asset in release["assets"]:
         if not isinstance(asset, dict) or asset.get("name") != name:
@@ -248,13 +229,11 @@ def find_release_asset(release: dict[str, Any], name: str) -> tuple[str, int | N
         return url, size
     raise RuntimeError(f"Required GitHub Release asset is missing: {name}")
 
-
 def check_for_update() -> dict[str, Any] | None:
     release = latest_release()
     if compare_versions(release["version"], VERSION) <= 0:
         return None
     return release
-
 
 def check_update_only() -> int:
     try:
@@ -262,20 +241,13 @@ def check_update_only() -> int:
         comparison = compare_versions(release["version"], VERSION)
         if comparison < 0:
             _record_update_check_result("success")
-            print(
-                f"[Update] Local Ninja Patch Tool v{VERSION} is newer than the latest release "
-                f"v{release['version']}."
-            )
+            print(f"[Update] Local Ninja Patch Tool v{VERSION} is newer than the latest release v{release['version']}.")
         elif comparison == 0:
             _record_update_check_result("success")
             print(f"[Update] Ninja Patch Tool v{VERSION} is up to date.")
         else:
             _record_update_check_result("update_available")
-            print(
-                f"[Update] Ninja Patch Tool v{release['version']} is available.\n"
-                f"Current version: v{VERSION}\n"
-                f"Release: {release['url']}"
-            )
+            print(f"[Update] Ninja Patch Tool v{release['version']} is available.\nCurrent version: v{VERSION}\nRelease: {release['url']}")
         return 0
     except KeyboardInterrupt:
         print("\nUpdate check cancelled.", file=sys.stderr)
@@ -284,7 +256,6 @@ def check_update_only() -> int:
         _record_update_check_result("failure")
         print(f"ERROR: Update check failed: {exc}", file=sys.stderr)
         return 1
-
 
 def cleanup_legacy_updater_executable() -> None:
     # v1.4 shipped a separate updater.exe. v1.4.1 and later use a temporary self-copy instead, so remove the obsolete
@@ -300,7 +271,6 @@ def cleanup_legacy_updater_executable() -> None:
     except OSError:
         # Migration cleanup is best-effort. A locked or otherwise undeletable legacy helper must never block NPT.
         pass
-
 
 def handle_early_update_request(argv: list[str]) -> int | None:
     # Every release executable contains the updater module. A temporary copy of whichever executable initiated the
@@ -327,7 +297,6 @@ def handle_early_update_request(argv: list[str]) -> int | None:
         print("\nStartup cancelled.", file=sys.stderr)
         return 130
 
-
 def _ensure_free_space(path: Path, required: int, purpose: str) -> None:
     if required <= 0:
         return
@@ -336,7 +305,6 @@ def _ensure_free_space(path: Path, required: int, purpose: str) -> None:
         raise RuntimeError(
             f"Not enough free disk space to {purpose}: {format_bytes(required)} required, {format_bytes(free)} available."
         )
-
 
 def _download_file(
     url: str,
@@ -368,7 +336,6 @@ def _download_file(
         temporary.unlink(missing_ok=True)
         raise
 
-
 def _read_expected_checksum(path: Path, archive_name: str) -> str:
     lines = [line.strip() for line in path.read_text(encoding="ascii").splitlines() if line.strip()]
     if len(lines) != 1:
@@ -377,7 +344,6 @@ def _read_expected_checksum(path: Path, archive_name: str) -> str:
     if len(parts) != 2 or not is_sha256(parts[0]) or parts[1].lstrip("*") != archive_name:
         raise RuntimeError("Release checksum file has an unexpected format or filename.")
     return parts[0].lower()
-
 
 def _safe_archive_parts(name: str) -> tuple[str, ...]:
     # ZIP member names are POSIX-style. Reject backslashes rather than normalizing them, then apply the same strict
@@ -388,7 +354,6 @@ def _safe_archive_parts(name: str) -> tuple[str, ...]:
         return relative_path_parts(name)
     except ValueError as exc:
         raise RuntimeError(f"Unsafe update archive path: {name!r}") from exc
-
 
 def extract_release_archive(archive_path: Path, destination: Path, release_version: str) -> Path:
     expected_root = f"NinjaPatchTool-v{release_version}"
@@ -459,7 +424,6 @@ def extract_release_archive(archive_path: Path, destination: Path, release_versi
         raise RuntimeError("Downloaded release does not contain its license files.")
     return destination
 
-
 def download_release(release: dict[str, Any], work: Path) -> Path:
     version = release["version"]
     archive_name = f"NinjaPatchTool-v{version}-Windows-x64.zip"
@@ -492,13 +456,11 @@ def download_release(release: dict[str, Any], work: Path) -> Path:
                 time.sleep(attempt)
     raise RuntimeError(f"Update download failed after {UPDATE_ATTEMPTS} attempts: {last_error}")
 
-
 def _current_application_path() -> Path:
     executable = Path(sys.executable).resolve()
     if not executable.is_file():
         raise RuntimeError(f"Current Ninja Patch Tool executable is missing: {executable}")
     return executable
-
 
 def _validate_temporary_updater(executable: Path) -> None:
     expected = f"Ninja Patch Tool v{VERSION}"
@@ -529,14 +491,12 @@ def _validate_temporary_updater(executable: Path) -> None:
             f"Actual: {actual or '(no version output)'}"
         )
 
-
 def _copy_application_for_update(work: Path) -> Path:
     source = _current_application_path()
     temporary = work / "NinjaPatchToolUpdater.exe"
     shutil.copy2(source, temporary)
     _validate_temporary_updater(temporary)
     return temporary
-
 
 def launch_updater(temporary_updater: Path, stage: Path, argv: list[str], target_version: str) -> None:
     # Revalidate the already-created self-copy immediately before handoff. The copy lives in this update work directory,
@@ -562,7 +522,6 @@ def launch_updater(temporary_updater: Path, stage: Path, argv: list[str], target
     ]
     subprocess.Popen(command, cwd=TOOL_DIR)
 
-
 def _update_session_is_active(work: Path) -> bool:
     session = work / UPDATE_SESSION_FILE
     if not session.is_file() or sys.platform != "win32":
@@ -578,7 +537,6 @@ def _update_session_is_active(work: Path) -> bool:
     except Exception:
         # If process inspection itself fails, be conservative and leave the work directory alone.
         return True
-
 
 def cleanup_stale_update_work(max_age_seconds: int = STALE_UPDATE_AGE_SECONDS) -> None:
     if max_age_seconds < 0 or not TEMP_ROOT.is_dir():
@@ -605,7 +563,6 @@ def cleanup_stale_update_work(max_age_seconds: int = STALE_UPDATE_AGE_SECONDS) -
         except OSError:
             # Startup cleanup is best-effort and must never block normal tool use.
             continue
-
 
 def cleanup_relaunched_update_work() -> None:
     value = os.environ.pop("NPT_UPDATE_WORK_CLEANUP", None)
@@ -639,7 +596,6 @@ def cleanup_relaunched_update_work() -> None:
         TEMP_ROOT.rmdir()
     except OSError:
         pass
-
 
 def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | None:
     # The updater sets this one-shot flag when it relaunches the original command. An environment flag is used instead

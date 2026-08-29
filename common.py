@@ -42,12 +42,7 @@ def is_ignored_file(path: Path) -> bool:
 def validate_warframe_installation(path: Path, label: str) -> bool:
     if (path / "Cache.Windows").is_dir() and (path / "Tools").is_dir() and (path / "Warframe.x64.exe").is_file():
         return True
-    print(
-        f"ERROR: {label} directory is not a Warframe installation root:\n"
-        f"{path}\n"
-        "Expected at least Cache.Windows, Tools, and Warframe.x64.exe directly inside it.",
-        file=sys.stderr,
-    )
+    print(f'ERROR: {label} directory is not a Warframe installation root:\n{path}\nExpected at least Cache.Windows, Tools, and Warframe.x64.exe directly inside it.', file=sys.stderr)
     return False
 
 def natural_sort_key(value: str):
@@ -426,12 +421,7 @@ def warn_if_low_disk_space(path: Path, required_bytes: int, purpose: str) -> Non
     except OSError:
         return
     if free < required_bytes:
-        print(
-            f"WARNING: Disk space may be insufficient for {purpose}.\n"
-            f"Available: {format_bytes(free)}\n"
-            f"Estimated required: {format_bytes(required_bytes)}",
-            file=sys.stderr,
-        )
+        print(f'WARNING: Disk space may be insufficient for {purpose}.\nAvailable: {format_bytes(free)}\nEstimated required: {format_bytes(required_bytes)}', file=sys.stderr)
 
 def warn_if_low_disk_space_groups(requirements: list[tuple[Path, int, str]]) -> None:
     grouped: dict[int, tuple[Path, int, list[str]]] = {}

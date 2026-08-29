@@ -52,22 +52,10 @@ def main() -> int:
             files, actual_hash = scan_tree(base, "Hashing base")
 
         if actual_hash.lower() != expected["sha256"].lower() or len(files) != expected["file_count"]:
-            print(
-                "ERROR: Base verification failed.\n"
-                f"Expected files: {expected['file_count']:,}\n"
-                f"Actual files: {len(files):,}\n"
-                f"Expected SHA-256: {expected['sha256']}\n"
-                f"Actual SHA-256: {actual_hash}",
-                file=sys.stderr,
-            )
+            print(f"ERROR: Base verification failed.\nExpected files: {expected['file_count']:,}\nActual files: {len(files):,}\nExpected SHA-256: {expected['sha256']}\nActual SHA-256: {actual_hash}", file=sys.stderr)
             return 1
 
-        print(
-            f'\n[Verified] Base "{canonical_name}" is valid and unmodified.\n'
-            f"Steam manifest ID: {expected['steam_manifest_id']}\n"
-            f"Files: {len(files):,}\n"
-            f"SHA-256: {actual_hash}"
-        )
+        print(f'\n[Verified] Base "{canonical_name}" is valid and unmodified.\nSteam manifest ID: {expected["steam_manifest_id"]}\nFiles: {len(files):,}\nSHA-256: {actual_hash}')
         return 0
 
     except KeyError:

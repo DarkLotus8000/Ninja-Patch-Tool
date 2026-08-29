@@ -358,12 +358,7 @@ def main() -> int:
         print(f"ERROR: hdiffz.exe was not found in the data folder:\n{HDIFFZ}", file=sys.stderr)
         return 1
     if output.exists():
-        print(
-            f"ERROR: Patch output already exists:\n{output}\n"
-            "Choose a different output name or remove the existing patch first.\n"
-            "No patch was generated.",
-            file=sys.stderr,
-        )
+        print(f'ERROR: Patch output already exists:\n{output}\nChoose a different output name or remove the existing patch first.\nNo patch was generated.', file=sys.stderr)
         return 1
 
     try:
@@ -429,13 +424,7 @@ def main() -> int:
             relative for relative in common_names if old_files[relative]["sha256"] != new_files[relative]["sha256"]
         )
 
-        print(
-            f"\nUnchanged: {len(common_names) - len(modified):,}\n"
-            f"Modified: {len(modified):,}\n"
-            f"Added: {len(added):,}\n"
-            f"Removed: {len(removed):,}\n\n"
-            "Creating patch payload..."
-        )
+        print(f'\nUnchanged: {len(common_names) - len(modified):,}\nModified: {len(modified):,}\nAdded: {len(added):,}\nRemoved: {len(removed):,}\n\nCreating patch payload...')
 
         final_payload_estimate = sum(new_files[relative]["size"] for relative in modified + added)
         temporary_payload_estimate = sum(new_files[relative]["size"] for relative in modified)
@@ -551,13 +540,7 @@ def main() -> int:
             output.unlink(missing_ok=True)
             raise
         duration = format_duration(time.perf_counter() - started)
-        print(
-            "\n[Created] Patch completed successfully.\n"
-            f"Base: {canonical_name}\n"
-            f"Steam manifest ID: {indexed_base['steam_manifest_id']}\n"
-            f"Duration: {duration}\n"
-            f"Patch size: {format_bytes(output.stat().st_size)}"
-        )
+        print(f"\n[Created] Patch completed successfully.\nBase: {canonical_name}\nSteam manifest ID: {indexed_base['steam_manifest_id']}\nDuration: {duration}\nPatch size: {format_bytes(output.stat().st_size)}")
         return 0
 
     except KeyError:

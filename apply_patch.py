@@ -928,19 +928,11 @@ def run_locked_apply(
                     publish_output_directory(working_destination, destination)
                     keep_work = False
                 except BaseException:
-                    print(
-                        "\nPatch interrupted or failed. Removing Ninja Patch Tool's incomplete temporary output...\n"
-                        "The original base and any unrelated final output were not modified.",
-                        file=sys.stderr,
-                    )
+                    print("\nPatch interrupted or failed. Removing Ninja Patch Tool's incomplete temporary output...\nThe original base and any unrelated final output were not modified.", file=sys.stderr)
                     if remove_incomplete_output(working_destination):
                         keep_work = False
                     else:
-                        print(
-                            "WARNING: The incomplete temporary output could not be removed completely. Recovery data was kept at:\n"
-                            f"{work}",
-                            file=sys.stderr,
-                        )
+                        print(f'WARNING: The incomplete temporary output could not be removed completely. Recovery data was kept at:\n{work}', file=sys.stderr)
                     raise
 
             duration = format_duration(time.perf_counter() - started)

@@ -1,6 +1,7 @@
 # Run from the project root with: py -m unittest discover -s tests
 from __future__ import annotations
 
+import ast
 import hashlib
 import io
 import json
@@ -52,6 +53,18 @@ def write_recovery(work: Path, state: dict, recovery_version: int | None = None)
     (work / apply_patch.RECOVERY_FILE).write_text(json.dumps(data), encoding="utf-8")
 
 class CommonTests(unittest.TestCase):
+    def test_source_formatting_stays_compact(self) -> None:
+        paths = sorted(ROOT.glob("*.py")) + sorted((ROOT / "tests").glob("*.py"))
+        for path in paths:
+            source = path.read_text(encoding="utf-8")
+            lines = source.splitlines()
+            for index in range(1, len(lines)):
+                self.assertFalse(not lines[index - 1].strip() and not lines[index].strip(), f"Multiple consecutive blank lines: {path.name}:{index}")
+            tree = ast.parse(source, filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print":
+                    self.assertEqual(node.lineno, node.end_lineno, f"print() spans multiple source lines: {path.name}:{node.lineno}-{node.end_lineno}")
+
     def test_duplicate_json_keys_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
             common.parse_json('{"a": 1, "a": 2}')
