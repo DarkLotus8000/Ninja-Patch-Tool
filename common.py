@@ -227,13 +227,16 @@ def make_work_dir(prefix: str) -> Path:
     work.mkdir()
     return work
 
-def cleanup_work_dir(work: Path) -> None:
-    shutil.rmtree(work, ignore_errors=True)
+def cleanup_temp_root_if_empty(temp_root: Path) -> None:
     try:
-        TEMP_ROOT.rmdir()
+        temp_root.rmdir()
     except OSError:
         # Leave it alone if another operation is still using it, cleanup failed, or anything else remains inside it.
         pass
+
+def cleanup_work_dir(work: Path) -> None:
+    shutil.rmtree(work, ignore_errors=True)
+    cleanup_temp_root_if_empty(TEMP_ROOT)
 
 def install_termination_handlers() -> None:
     # Route termination/break signals through the same KeyboardInterrupt cleanup path as Ctrl+C. Forced Windows

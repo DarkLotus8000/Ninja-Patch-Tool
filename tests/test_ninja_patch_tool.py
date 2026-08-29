@@ -927,8 +927,7 @@ This should not be included.
                 mock.patch("sys.stderr", io.StringIO()),
             ):
                 self.assertEqual(update.handle_automatic_update(args, []), 130)
-            self.assertTrue(temp_root.is_dir())
-            self.assertEqual(list(temp_root.iterdir()), [])
+            self.assertFalse(temp_root.exists())
 
     def test_restarted_update_session_skips_exactly_one_update_check(self) -> None:
         args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
@@ -1380,6 +1379,7 @@ This should not be included.
                 update.cleanup_stale_update_work()
 
             self.assertFalse(work.exists())
+            self.assertFalse(temp_root.exists())
 
     def test_relaunched_tool_cleans_completed_update_work_inside_temp_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

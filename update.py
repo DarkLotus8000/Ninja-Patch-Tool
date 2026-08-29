@@ -22,6 +22,7 @@ from common import (
     ByteProgress,
     ErrorArgumentParser,
     SingleUseStoreTrueAction,
+    cleanup_temp_root_if_empty,
     compare_versions,
     format_bytes,
     is_sha256,
@@ -563,6 +564,7 @@ def cleanup_stale_update_work(max_age_seconds: int = STALE_UPDATE_AGE_SECONDS) -
         except OSError:
             # Startup cleanup is best-effort and must never block normal tool use.
             continue
+    cleanup_temp_root_if_empty(TEMP_ROOT)
 
 def cleanup_relaunched_update_work() -> None:
     value = os.environ.pop("NPT_UPDATE_WORK_CLEANUP", None)
@@ -592,10 +594,7 @@ def cleanup_relaunched_update_work() -> None:
             break
         except OSError:
             time.sleep(0.1)
-    try:
-        TEMP_ROOT.rmdir()
-    except OSError:
-        pass
+    cleanup_temp_root_if_empty(TEMP_ROOT)
 
 def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | None:
     # The updater sets this one-shot flag when it relaunches the original command. An environment flag is used instead
@@ -639,10 +638,12 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
         print("\nUpdate cancelled.", file=sys.stderr)
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)
+        cleanup_temp_root_if_empty(TEMP_ROOT)
         return 130
     except Exception as exc:
         _record_update_check_result("failure")
         print(f"[Update] Warning: Automatic update failed; continuing with v{VERSION}: {exc}", file=sys.stderr)
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)
+        cleanup_temp_root_if_empty(TEMP_ROOT)
         return None
