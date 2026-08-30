@@ -349,6 +349,10 @@ def main() -> int:
     parser.add_help_argument()
     args = parser.parse_args(argv)
 
+    update_result = handle_automatic_update(args, argv)
+    if update_result is not None:
+        return update_result
+
     base = args.base.resolve()
     new = args.new.resolve()
     output = resolve_patch_path(args.output)
@@ -387,10 +391,6 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
-    update_result = handle_automatic_update(args, argv)
-    if update_result is not None:
-        return update_result
 
     work = None
     locks = ExitStack()

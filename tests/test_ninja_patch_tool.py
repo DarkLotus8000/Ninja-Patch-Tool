@@ -520,9 +520,9 @@ This should not be included.
                 with self.assertRaisesRegex(FileExistsError, "already exists"):
                     build_release.validate_release_output_available()
 
-    def test_version_143_maps_to_windows_four_part_version(self) -> None:
-        self.assertEqual(common.VERSION, "1.4.3")
-        self.assertEqual(build_release.version_tuple(), (1, 4, 3, 0))
+    def test_version_144_maps_to_windows_four_part_version(self) -> None:
+        self.assertEqual(common.VERSION, "1.4.4")
+        self.assertEqual(build_release.version_tuple(), (1, 4, 4, 0))
 
     def test_update_arguments_reject_duplicate_aliases_and_conflicts(self) -> None:
         invalid = (
@@ -572,12 +572,12 @@ This should not be included.
         record.assert_called_once_with("success")
         self.assertEqual(
             stdout.getvalue(),
-            "[Update] Local Ninja Patch Tool v1.4.3 is newer than the latest release v1.3.1.\n",
+            "[Update] Local Ninja Patch Tool v1.4.4 is newer than the latest release v1.3.1.\n",
         )
 
     def test_check_update_reports_equal_version_as_up_to_date(self) -> None:
         stdout = io.StringIO()
-        release = {"version": "1.4.3", "url": "https://example.test/release"}
+        release = {"version": "1.4.4", "url": "https://example.test/release"}
         with (
             mock.patch.object(update, "latest_release", return_value=release),
             mock.patch.object(update, "_record_update_check_result") as record,
@@ -585,7 +585,7 @@ This should not be included.
         ):
             self.assertEqual(update.check_update_only(), 0)
         record.assert_called_once_with("success")
-        self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4.3 is up to date.\n")
+        self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4.4 is up to date.\n")
 
     def test_check_update_reports_newer_release(self) -> None:
         stdout = io.StringIO()
@@ -600,7 +600,7 @@ This should not be included.
         self.assertEqual(
             stdout.getvalue(),
             "[Update] Ninja Patch Tool v1.5 is available.\n"
-            "Current version: v1.4.3\n"
+            "Current version: v1.4.4\n"
             "Release: https://example.test/release\n",
         )
 
@@ -830,7 +830,7 @@ This should not be included.
 
     def test_temporary_self_updater_version_check_accepts_matching_version(self) -> None:
         updater_path = Path("NinjaPatchToolUpdater.exe")
-        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.4.3\n", stderr="")
+        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.4.4\n", stderr="")
         with mock.patch.object(update.subprocess, "run", return_value=result) as run:
             update._validate_temporary_updater(updater_path)
         run.assert_called_once_with(
@@ -921,7 +921,7 @@ This should not be included.
             self.assertNotIn("NPT_SKIP_UPDATE_CHECK_ONCE", update.os.environ)
         check.assert_not_called()
 
-    def test_update_handoff_happens_after_cheap_add_base_validation(self) -> None:
+    def test_update_handoff_happens_before_add_base_operation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "base"
             make_warframe_root(base)
@@ -939,7 +939,7 @@ This should not be included.
             auto_update.assert_called_once()
             scan.assert_not_called()
 
-    def test_add_base_existing_name_is_rejected_before_hash_or_update_check(self) -> None:
+    def test_add_base_existing_name_is_rejected_after_update_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "base"
             make_warframe_root(base)
@@ -952,16 +952,16 @@ This should not be included.
                 mock.patch.object(add_base, "handle_early_update_request", return_value=None),
                 mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
                 mock.patch.object(add_base, "load_index", return_value={"U43.5.1": entry}),
-                mock.patch.object(add_base, "handle_automatic_update") as auto_update,
+                mock.patch.object(add_base, "handle_automatic_update", return_value=None) as auto_update,
                 mock.patch.object(add_base, "scan_tree") as scan,
                 mock.patch("sys.stderr", stderr),
             ):
                 self.assertEqual(add_base.main(), 1)
-            auto_update.assert_not_called()
+            auto_update.assert_called_once()
             scan.assert_not_called()
             self.assertIn('Base "U43.5.1" already exists', stderr.getvalue())
 
-    def test_add_base_existing_manifest_is_rejected_before_hash_or_update_check(self) -> None:
+    def test_add_base_existing_manifest_is_rejected_after_update_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "base"
             make_warframe_root(base)
@@ -974,12 +974,12 @@ This should not be included.
                 mock.patch.object(add_base, "handle_early_update_request", return_value=None),
                 mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
                 mock.patch.object(add_base, "load_index", return_value={"U43.5.1": entry}),
-                mock.patch.object(add_base, "handle_automatic_update") as auto_update,
+                mock.patch.object(add_base, "handle_automatic_update", return_value=None) as auto_update,
                 mock.patch.object(add_base, "scan_tree") as scan,
                 mock.patch("sys.stderr", stderr),
             ):
                 self.assertEqual(add_base.main(), 1)
-            auto_update.assert_not_called()
+            auto_update.assert_called_once()
             scan.assert_not_called()
             self.assertIn('Steam manifest ID 456 is already indexed as "U43.5.1"', stderr.getvalue())
 
@@ -1006,7 +1006,7 @@ This should not be included.
             write.assert_not_called()
             self.assertIn('Base "U43.5.2" already exists', stderr.getvalue())
 
-    def test_update_handoff_happens_after_cheap_verify_base_validation(self) -> None:
+    def test_update_handoff_happens_before_verify_base_operation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "base"
             make_warframe_root(base)
@@ -1024,7 +1024,7 @@ This should not be included.
             auto_update.assert_called_once()
             scan.assert_not_called()
 
-    def test_verify_base_missing_index_entry_is_rejected_before_update_check(self) -> None:
+    def test_verify_base_missing_index_entry_is_rejected_after_update_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "base"
             make_warframe_root(base)
@@ -1035,12 +1035,12 @@ This should not be included.
                 mock.patch.object(verify_base, "install_termination_handlers"),
                 mock.patch.object(verify_base, "handle_early_update_request", return_value=None),
                 mock.patch.object(verify_base, "load_index", return_value={}),
-                mock.patch.object(verify_base, "handle_automatic_update") as auto_update,
+                mock.patch.object(verify_base, "handle_automatic_update", return_value=None) as auto_update,
                 mock.patch.object(verify_base, "scan_tree") as scan,
                 mock.patch("sys.stderr", stderr),
             ):
                 self.assertEqual(verify_base.main(), 1)
-            auto_update.assert_not_called()
+            auto_update.assert_called_once()
             scan.assert_not_called()
             self.assertIn('Base "U43.5.1" is not present', stderr.getvalue())
 
@@ -1792,7 +1792,7 @@ class MakePatchTests(unittest.TestCase):
                 self.assertFalse(make_patch.should_store_full_file(diff, info, "high", root, "x"))
                 measure.assert_not_called()
 
-    def test_update_handoff_happens_after_cheap_make_patch_validation(self) -> None:
+    def test_update_handoff_happens_before_make_patch_operation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             base, new = root / "base", root / "new"
@@ -1877,7 +1877,7 @@ class MakePatchTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), b"ok")
             self.assertEqual(calls, len(make_patch.MAXIMUM_MEMORY_CANDIDATES))
 
-    def test_patch_output_inside_installation_is_rejected_by_main(self) -> None:
+    def test_patch_output_inside_installation_is_rejected_after_update_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             base, new = root / "base", root / "new"
@@ -1889,11 +1889,11 @@ class MakePatchTests(unittest.TestCase):
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(make_patch, "install_termination_handlers"),
-                mock.patch.object(make_patch, "handle_automatic_update") as auto_update,
+                mock.patch.object(make_patch, "handle_automatic_update", return_value=None) as auto_update,
                 mock.patch("sys.stderr", stderr),
             ):
                 self.assertEqual(make_patch.main(), 1)
-            auto_update.assert_not_called()
+            auto_update.assert_called_once()
             self.assertIn("Patch output must not be inside", stderr.getvalue())
 
     def test_make_rejects_different_paths_with_identical_contents(self) -> None:
@@ -1999,7 +1999,7 @@ class MakePatchTests(unittest.TestCase):
             self.assertFalse(output.exists())
 
 class ApplyPatchTests(unittest.TestCase):
-    def test_update_handoff_happens_after_cheap_apply_patch_validation(self) -> None:
+    def test_update_handoff_happens_before_apply_patch_operation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             base = root / "base"
@@ -2023,7 +2023,7 @@ class ApplyPatchTests(unittest.TestCase):
             auto_update.assert_called_once()
             zip_file.assert_not_called()
 
-    def test_apply_missing_patch_is_rejected_before_update_check(self) -> None:
+    def test_apply_missing_patch_is_rejected_after_update_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             base = root / "base"
@@ -2037,11 +2037,11 @@ class ApplyPatchTests(unittest.TestCase):
                 mock.patch.object(apply_patch, "handle_early_update_request", return_value=None),
                 mock.patch.object(apply_patch, "operation_lock", side_effect=lambda *args: nullcontext()),
                 mock.patch.object(apply_patch, "recover_interrupted_operations", return_value=None),
-                mock.patch.object(apply_patch, "handle_automatic_update") as auto_update,
+                mock.patch.object(apply_patch, "handle_automatic_update", return_value=None) as auto_update,
                 mock.patch("sys.stderr", stderr),
             ):
                 self.assertEqual(apply_patch.main(), 1)
-            auto_update.assert_not_called()
+            auto_update.assert_called_once()
             self.assertIn("Patch file does not exist", stderr.getvalue())
 
     def minimal_manifest(self, operation: dict, old_count: int = 0, new_count: int = 1) -> dict:

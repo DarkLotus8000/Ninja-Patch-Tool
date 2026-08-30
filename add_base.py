@@ -47,24 +47,28 @@ def main() -> int:
     parser.add_help_argument()
     args = parser.parse_args(argv)
 
-    base = args.path.resolve()
-    name = args.name.strip()
-    manifest_id = args.manifest_id
-
-    if not base.is_dir():
-        print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
-        return 1
-    if not validate_warframe_installation(base, "Base"):
-        return 1
-
-    if not name:
-        print("ERROR: Base name cannot be empty.", file=sys.stderr)
-        return 1
-    if not is_steam_manifest_id(manifest_id):
-        print("ERROR: Steam manifest ID must be a valid unsigned 64-bit integer.", file=sys.stderr)
-        return 1
-
     try:
+        update_result = handle_automatic_update(args, argv)
+        if update_result is not None:
+            return update_result
+
+        base = args.path.resolve()
+        name = args.name.strip()
+        manifest_id = args.manifest_id
+
+        if not base.is_dir():
+            print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
+            return 1
+        if not validate_warframe_installation(base, "Base"):
+            return 1
+
+        if not name:
+            print("ERROR: Base name cannot be empty.", file=sys.stderr)
+            return 1
+        if not is_steam_manifest_id(manifest_id):
+            print("ERROR: Steam manifest ID must be a valid unsigned 64-bit integer.", file=sys.stderr)
+            return 1
+
         # Reject conflicts that can be determined from the index before doing a potentially very expensive full-tree hash.
         # The same checks are repeated after hashing because another add_base process may update the index meanwhile.
         with operation_lock("index", INDEX_FILE, "base index update"):
@@ -72,10 +76,6 @@ def main() -> int:
         if conflict is not None:
             print(f"ERROR: {conflict}\nNo changes were made.", file=sys.stderr)
             return 1
-
-        update_result = handle_automatic_update(args, argv)
-        if update_result is not None:
-            return update_result
 
         with operation_lock("installation", base, "operation using this installation"):
             print(f'Hashing base "{name}"...\n' "This may take a while for large installations.")
