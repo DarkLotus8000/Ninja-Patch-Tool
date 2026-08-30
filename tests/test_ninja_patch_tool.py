@@ -124,14 +124,16 @@ class CommonTests(unittest.TestCase):
         self.assertTrue(parser.suggest_on_error)
         self.assertFalse(parser.color)
 
-    def test_version_argument_includes_v_prefix(self) -> None:
-        parser = common.ErrorArgumentParser()
-        parser.add_version_argument()
-        stdout = io.StringIO()
-        with mock.patch("sys.stdout", stdout), self.assertRaises(SystemExit) as raised:
-            parser.parse_args(["--version"])
-        self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(stdout.getvalue().strip(), f"Ninja Patch Tool v{common.VERSION}")
+    def test_version_argument_supports_short_and_long_forms(self) -> None:
+        for option in ("-v", "--version"):
+            with self.subTest(option=option):
+                parser = common.ErrorArgumentParser()
+                parser.add_version_argument()
+                stdout = io.StringIO()
+                with mock.patch("sys.stdout", stdout), self.assertRaises(SystemExit) as raised:
+                    parser.parse_args([option])
+                self.assertEqual(raised.exception.code, 0)
+                self.assertEqual(stdout.getvalue().strip(), f"Ninja Patch Tool v{common.VERSION}")
 
     def test_steam_manifest_id_range(self) -> None:
         self.assertTrue(common.is_steam_manifest_id(1))
@@ -500,6 +502,7 @@ This should not be included.
             expected = []
             for script in build_release.ENTRY_SCRIPTS:
                 expected.append([f"{Path(script).stem}.exe", "-h"])
+                expected.append([f"{Path(script).stem}.exe", "-v"])
                 expected.append([f"{Path(script).stem}.exe", "--version"])
                 expected.append([f"{Path(script).stem}.exe", "--update-installer", "--version"])
             self.assertEqual([[Path(command[0]).name, *command[1:]] for command in calls], expected)
@@ -517,9 +520,9 @@ This should not be included.
                 with self.assertRaisesRegex(FileExistsError, "already exists"):
                     build_release.validate_release_output_available()
 
-    def test_version_142_maps_to_windows_four_part_version(self) -> None:
-        self.assertEqual(common.VERSION, "1.4.2")
-        self.assertEqual(build_release.version_tuple(), (1, 4, 2, 0))
+    def test_version_143_maps_to_windows_four_part_version(self) -> None:
+        self.assertEqual(common.VERSION, "1.4.3")
+        self.assertEqual(build_release.version_tuple(), (1, 4, 3, 0))
 
     def test_update_arguments_reject_duplicate_aliases_and_conflicts(self) -> None:
         invalid = (
@@ -569,12 +572,12 @@ This should not be included.
         record.assert_called_once_with("success")
         self.assertEqual(
             stdout.getvalue(),
-            "[Update] Local Ninja Patch Tool v1.4.2 is newer than the latest release v1.3.1.\n",
+            "[Update] Local Ninja Patch Tool v1.4.3 is newer than the latest release v1.3.1.\n",
         )
 
     def test_check_update_reports_equal_version_as_up_to_date(self) -> None:
         stdout = io.StringIO()
-        release = {"version": "1.4.2", "url": "https://example.test/release"}
+        release = {"version": "1.4.3", "url": "https://example.test/release"}
         with (
             mock.patch.object(update, "latest_release", return_value=release),
             mock.patch.object(update, "_record_update_check_result") as record,
@@ -582,7 +585,7 @@ This should not be included.
         ):
             self.assertEqual(update.check_update_only(), 0)
         record.assert_called_once_with("success")
-        self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4.2 is up to date.\n")
+        self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4.3 is up to date.\n")
 
     def test_check_update_reports_newer_release(self) -> None:
         stdout = io.StringIO()
@@ -597,7 +600,7 @@ This should not be included.
         self.assertEqual(
             stdout.getvalue(),
             "[Update] Ninja Patch Tool v1.5 is available.\n"
-            "Current version: v1.4.2\n"
+            "Current version: v1.4.3\n"
             "Release: https://example.test/release\n",
         )
 
@@ -827,7 +830,7 @@ This should not be included.
 
     def test_temporary_self_updater_version_check_accepts_matching_version(self) -> None:
         updater_path = Path("NinjaPatchToolUpdater.exe")
-        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.4.2\n", stderr="")
+        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.4.3\n", stderr="")
         with mock.patch.object(update.subprocess, "run", return_value=result) as run:
             update._validate_temporary_updater(updater_path)
         run.assert_called_once_with(

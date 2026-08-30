@@ -21,6 +21,7 @@ Update options available on all main executables:
 - `-a, --auto-update` - Enable automatic updating for this run, overriding `data/update.json`
 - `-n, --no-auto-update` - Disable automatic updating for this run, overriding `data/update.json`
 - `-u, --check-update` - Check GitHub Releases for a newer version without installing it; use this option without operation arguments
+- `-v, --version` - Show the installed Ninja Patch Tool version and exit
 
 ## Add a base
 

@@ -319,6 +319,9 @@ def smoke_test_executables(dist: Path) -> None:
             help_result = subprocess.run(
                 [str(executable), "-h"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30
             )
+            short_version_result = subprocess.run(
+                [str(executable), "-v"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30
+            )
             version_result = subprocess.run(
                 [str(executable), "--version"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30
             )
@@ -327,6 +330,9 @@ def smoke_test_executables(dist: Path) -> None:
         if help_result.returncode != 0 or "Shows this help message" not in help_result.stdout:
             details = help_result.stderr.strip() or help_result.stdout.strip() or "No output was produced."
             raise RuntimeError(f"Standalone executable smoke test failed for {executable.name}:\n{details}")
+        if short_version_result.returncode != 0 or short_version_result.stdout.strip() != f"Ninja Patch Tool v{VERSION}":
+            details = short_version_result.stderr.strip() or short_version_result.stdout.strip() or "No output was produced."
+            raise RuntimeError(f"Standalone executable short version test failed for {executable.name}:\n{details}")
         if version_result.returncode != 0 or version_result.stdout.strip() != f"Ninja Patch Tool v{VERSION}":
             details = version_result.stderr.strip() or version_result.stdout.strip() or "No output was produced."
             raise RuntimeError(f"Standalone executable version test failed for {executable.name}:\n{details}")

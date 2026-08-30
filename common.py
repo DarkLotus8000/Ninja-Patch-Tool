@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 
 def get_tool_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -511,7 +511,7 @@ class ErrorArgumentParser(argparse.ArgumentParser):
         self.color = False
 
     def add_version_argument(self) -> None:
-        self.add_argument("--version", action="version", version=f"Ninja Patch Tool v{VERSION}", help="Shows the Ninja Patch Tool version")
+        self.add_argument("-v", "--version", action="version", version=f"Ninja Patch Tool v{VERSION}", help="Shows the Ninja Patch Tool version")
 
     def add_help_argument(self) -> None:
         self.add_argument("-h", "--help", action="help", help="Shows this help message")
