@@ -12,7 +12,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from common import VERSION, format_bytes, operation_lock, parse_json, sha256_file, validate_index
+from common import ENTRY_SCRIPTS, VERSION, format_bytes, operation_lock, parse_json, sha256_file, validate_index
 
 COMPANY_NAME = "DarkLotus"
 ROOT = Path(__file__).resolve().parent
@@ -21,12 +21,6 @@ RELEASE_TEMP_DIR = ROOT / "release_temp"
 DATA_DIR = ROOT / "data"
 FAVICON = DATA_DIR / "favicon.ico"
 LICENSES_DIR = DATA_DIR / "licenses"
-ENTRY_SCRIPTS = {
-    "add_base.py": "Add Base - Ninja Patch Tool",
-    "verify_base.py": "Verify Base - Ninja Patch Tool",
-    "make_patch.py": "Make Patch - Ninja Patch Tool",
-    "apply_patch.py": "Apply Patch - Ninja Patch Tool",
-}
 RELEASE_DATA_FILES = ("index.json", "update.json", "hdiffz.exe", "hpatchz.exe")
 THIRD_PARTY_LICENSE_FILES = ("Python_LICENSE.txt", "HDiffPatch_LICENSE.txt")
 MIN_PYINSTALLER_VERSION = (6, 15, 0)

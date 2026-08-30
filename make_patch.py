@@ -11,6 +11,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from common import (
+    ENTRY_SCRIPTS,
     ByteProgress,
     ErrorArgumentParser,
     SingleUseStoreAction,
@@ -20,6 +21,7 @@ from common import (
     display_relative_path,
     format_bytes,
     format_duration,
+    console_title,
     install_termination_handlers,
     is_within,
     load_index,
@@ -573,4 +575,5 @@ def main() -> int:
         locks.close()
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    with console_title(ENTRY_SCRIPTS["make_patch.py"]):
+        raise SystemExit(main())

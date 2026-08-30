@@ -5,7 +5,9 @@ import sys
 from pathlib import Path
 
 from common import (
+    ENTRY_SCRIPTS,
     ErrorArgumentParser,
+    console_title,
     install_termination_handlers,
     load_index,
     operation_lock,
@@ -70,4 +72,5 @@ def main() -> int:
         return 1
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    with console_title(ENTRY_SCRIPTS["verify_base.py"]):
+        raise SystemExit(main())

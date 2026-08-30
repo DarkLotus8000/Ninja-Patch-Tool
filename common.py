@@ -16,7 +16,13 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
+ENTRY_SCRIPTS = {
+    "add_base.py": "Add Base - Ninja Patch Tool",
+    "verify_base.py": "Verify Base - Ninja Patch Tool",
+    "make_patch.py": "Make Patch - Ninja Patch Tool",
+    "apply_patch.py": "Apply Patch - Ninja Patch Tool",
+}
 
 def get_tool_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -248,6 +254,33 @@ def install_termination_handlers() -> None:
         sig = getattr(signal, name, None)
         if sig is not None:
             signal.signal(sig, handle_termination)
+
+@contextmanager
+def console_title(title: str):
+    if sys.platform != "win32":
+        yield
+        return
+
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetConsoleTitleW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+    kernel32.GetConsoleTitleW.restype = ctypes.c_uint32
+    kernel32.SetConsoleTitleW.argtypes = [ctypes.c_wchar_p]
+    kernel32.SetConsoleTitleW.restype = ctypes.c_int
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    kernel32.GetConsoleTitleW(buffer, len(buffer))
+    previous = buffer.value
+
+    if not kernel32.SetConsoleTitleW(title):
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        kernel32.SetConsoleTitleW(previous)
 
 def run_child(command: list[str]) -> int:
     # Ensure an interrupted parent does not leave hdiffz/hpatchz running on its own.

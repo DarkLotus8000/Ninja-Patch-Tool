@@ -5,8 +5,10 @@ import sys
 from pathlib import Path
 
 from common import (
+    ENTRY_SCRIPTS,
     ErrorArgumentParser,
     INDEX_FILE,
+    console_title,
     install_termination_handlers,
     is_steam_manifest_id,
     load_index,
@@ -107,4 +109,5 @@ def main() -> int:
         return 1
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    with console_title(ENTRY_SCRIPTS["add_base.py"]):
+        raise SystemExit(main())

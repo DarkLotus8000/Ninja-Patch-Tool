@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from common import (
+    ENTRY_SCRIPTS,
     ByteProgress,
     ErrorArgumentParser,
     SingleUseStoreAction,
@@ -22,6 +23,7 @@ from common import (
     cleanup_work_dir,
     display_relative_path,
     format_duration,
+    console_title,
     install_termination_handlers,
     is_ignored_file,
     is_nonnegative_int,
@@ -1056,4 +1058,5 @@ def main() -> int:
         return 1
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    with console_title(ENTRY_SCRIPTS["apply_patch.py"]):
+        raise SystemExit(main())

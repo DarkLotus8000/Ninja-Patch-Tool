@@ -520,9 +520,9 @@ This should not be included.
                 with self.assertRaisesRegex(FileExistsError, "already exists"):
                     build_release.validate_release_output_available()
 
-    def test_version_144_maps_to_windows_four_part_version(self) -> None:
-        self.assertEqual(common.VERSION, "1.4.4")
-        self.assertEqual(build_release.version_tuple(), (1, 4, 4, 0))
+    def test_version_145_maps_to_windows_four_part_version(self) -> None:
+        self.assertEqual(common.VERSION, "1.4.5")
+        self.assertEqual(build_release.version_tuple(), (1, 4, 5, 0))
 
     def test_update_arguments_reject_duplicate_aliases_and_conflicts(self) -> None:
         invalid = (
@@ -572,12 +572,12 @@ This should not be included.
         record.assert_called_once_with("success")
         self.assertEqual(
             stdout.getvalue(),
-            "[Update] Local Ninja Patch Tool v1.4.4 is newer than the latest release v1.3.1.\n",
+            "[Update] Local Ninja Patch Tool v1.4.5 is newer than the latest release v1.3.1.\n",
         )
 
     def test_check_update_reports_equal_version_as_up_to_date(self) -> None:
         stdout = io.StringIO()
-        release = {"version": "1.4.4", "url": "https://example.test/release"}
+        release = {"version": "1.4.5", "url": "https://example.test/release"}
         with (
             mock.patch.object(update, "latest_release", return_value=release),
             mock.patch.object(update, "_record_update_check_result") as record,
@@ -585,7 +585,7 @@ This should not be included.
         ):
             self.assertEqual(update.check_update_only(), 0)
         record.assert_called_once_with("success")
-        self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4.4 is up to date.\n")
+        self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4.5 is up to date.\n")
 
     def test_check_update_reports_newer_release(self) -> None:
         stdout = io.StringIO()
@@ -600,7 +600,7 @@ This should not be included.
         self.assertEqual(
             stdout.getvalue(),
             "[Update] Ninja Patch Tool v1.5 is available.\n"
-            "Current version: v1.4.4\n"
+            "Current version: v1.4.5\n"
             "Release: https://example.test/release\n",
         )
 
@@ -830,7 +830,7 @@ This should not be included.
 
     def test_temporary_self_updater_version_check_accepts_matching_version(self) -> None:
         updater_path = Path("NinjaPatchToolUpdater.exe")
-        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.4.4\n", stderr="")
+        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.4.5\n", stderr="")
         with mock.patch.object(update.subprocess, "run", return_value=result) as run:
             update._validate_temporary_updater(updater_path)
         run.assert_called_once_with(
