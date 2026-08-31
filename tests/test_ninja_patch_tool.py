@@ -2006,10 +2006,12 @@ This should not be included.
     def test_scan_tree_rejects_case_insensitive_path_collisions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "Foo.bin").write_bytes(b"a")
-            (root / "foo.bin").write_bytes(b"b")
-            with self.assertRaisesRegex(RuntimeError, "collide on Windows"):
-                common.scan_tree(root)
+            # Windows filesystems normally cannot contain both spellings at once, so
+            # simulate the enumeration result instead of relying on the host filesystem.
+            collision_paths = [root / "Foo.bin", root / "foo.bin"]
+            with mock.patch.object(common, "validated_tree_paths", return_value=([], collision_paths)):
+                with self.assertRaisesRegex(RuntimeError, "collide on Windows"):
+                    common.scan_tree(root)
 
     def test_scan_tree_detects_atomic_replacement_with_same_size_and_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
