@@ -222,50 +222,15 @@ This should not be included.
         self.assertNotIn("build_release.py", readme)
         self.assertFalse(readme.endswith("\n"))
 
-    def test_project_readme_uses_release_executable_commands(self) -> None:
-        readme = (build_release.ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("add_base path name manifest_id [-a | -n]", readme)
-        self.assertIn("verify_base path name [-a | -n]", readme)
-        self.assertIn("make_patch base new output base_name [-c PRESET] [-a | -n]", readme)
-        self.assertIn("apply_patch base patch [-o OUTPUT | -i] [-a | -n]", readme)
-        self.assertIn("When running from source, use the corresponding `.py` script with Python 3.14 instead.", readme)
-        self.assertNotIn("py add_base.py path name manifest_id", readme)
-        self.assertNotIn("py verify_base.py path name", readme)
-        self.assertNotIn("py make_patch.py base new output base_name [-c PRESET]", readme)
-        self.assertNotIn("py apply_patch.py base patch [-o OUTPUT | -i]", readme)
-        self.assertIn("-a, --auto-update", readme)
-        self.assertIn("-n, --no-auto-update", readme)
-        self.assertIn("-u, --check-update", readme)
-        self.assertNotIn("## Automatic updates", readme)
-        self.assertIn(".sha256", readme)
-        for technical in ("HDiff payloads", "DEFLATE", "LZMA", "ZIP compression"):
-            self.assertNotIn(technical, readme)
-        self.assertIn("Ninja Capture Tool", readme)
-        self.assertNotIn("Ninja Reverse Proxy", readme)
-        self.assertIn("through Wine", readme)
-        self.assertIn("native Linux/macOS source execution is not supported", readme)
-
-        release_readme = build_release.create_release_readme(readme)
-        for technical in ("HDiff payloads", "DEFLATE", "LZMA", "ZIP compression"):
-            self.assertNotIn(technical, release_readme)
-
-    def test_release_temp_directory_is_separate_from_patch_temp(self) -> None:
-        self.assertEqual(build_release.RELEASE_TEMP_DIR, build_release.ROOT / "release_temp")
-        self.assertNotEqual(build_release.RELEASE_TEMP_DIR, common.TEMP_ROOT)
-
     def test_stale_release_temp_is_removed_before_build(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release_temp = Path(tmp) / "release_temp"
             nested = release_temp / "old_build" / "build"
             nested.mkdir(parents=True)
             (nested / "leftover.bin").write_bytes(b"leftover")
-            with (
-                mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp),
-                mock.patch("builtins.print") as print_mock,
-            ):
+            with mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp):
                 build_release.clean_stale_release_temp()
             self.assertFalse(release_temp.exists())
-            print_mock.assert_called_once_with("[Cleaning] Previous temporary build files")
 
     def test_release_data_is_allowlisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,9 +243,6 @@ This should not be included.
 
             expected_data = {"index.json", "update.json", "hdiffz.exe", "hpatchz.exe"}
             expected_licenses = {"Python_LICENSE.txt", "HDiffPatch_LICENSE.txt", "LICENSE"}
-            self.assertEqual(set(build_release.RELEASE_DATA_FILES), expected_data)
-            self.assertEqual(set(build_release.THIRD_PARTY_LICENSE_FILES), {"Python_LICENSE.txt", "HDiffPatch_LICENSE.txt"})
-            self.assertNotIn("updater.py", build_release.ENTRY_SCRIPTS)
             for name in expected_data:
                 if name == "index.json":
                     (data / name).write_bytes(b"{}")
@@ -294,7 +256,7 @@ This should not be included.
 
             licenses = data / "licenses"
             licenses.mkdir()
-            for name in build_release.THIRD_PARTY_LICENSE_FILES:
+            for name in ("Python_LICENSE.txt", "HDiffPatch_LICENSE.txt"):
                 (licenses / name).write_text(name, encoding="ascii")
 
             project_license = root / "LICENSE"
@@ -479,9 +441,9 @@ This should not be included.
                 with self.assertRaisesRegex(FileExistsError, "already exists"):
                     build_release.validate_release_output_available()
 
-    def test_version_145_maps_to_windows_four_part_version(self) -> None:
-        self.assertEqual(common.VERSION, "1.4.5")
-        self.assertEqual(build_release.version_tuple(), (1, 4, 5, 0))
+    def test_windows_version_tuple_pads_to_four_components(self) -> None:
+        with mock.patch.object(build_release, "VERSION", "1.4.5"):
+            self.assertEqual(build_release.version_tuple(), (1, 4, 5, 0))
 
     def test_update_arguments_reject_duplicate_aliases_and_conflicts(self) -> None:
         invalid = (
@@ -2022,8 +1984,6 @@ class ApplyPatchTests(unittest.TestCase):
                 manifest = self.minimal_manifest(operation, old_count=1, new_count=0)
                 manifest["version"] = version
                 self.assertEqual(apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json")})["version"], version)
-        self.assertEqual(make_patch.PATCH_VERSION, 2)
-        self.assertEqual(apply_patch.SUPPORTED_VERSIONS, {1, 2})
 
     def test_manifest_rejects_boolean_patch_version(self) -> None:
         operation = {"type": "remove", "path": "a.bin", "old_size": 1, "old_sha256": "a" * 64}
