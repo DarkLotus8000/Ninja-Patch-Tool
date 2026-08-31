@@ -661,12 +661,12 @@ This should not be included.
         record.assert_called_once_with("success")
         self.assertEqual(
             stdout.getvalue(),
-            "[Update] Local Ninja Patch Tool v1.4.5 is newer than the latest release v1.3.1.\n",
+            f"[Update] Local Ninja Patch Tool v{common.VERSION} is newer than the latest release v1.3.1.\n",
         )
 
     def test_check_update_reports_equal_version_as_up_to_date(self) -> None:
         stdout = io.StringIO()
-        release = {"version": "1.4.5", "url": "https://example.test/release"}
+        release = {"version": common.VERSION, "url": "https://example.test/release"}
         with (
             mock.patch.object(update, "latest_release", return_value=release),
             mock.patch.object(update, "_record_update_check_result") as record,
@@ -674,7 +674,7 @@ This should not be included.
         ):
             self.assertEqual(update.check_update_only(), 0)
         record.assert_called_once_with("success")
-        self.assertEqual(stdout.getvalue(), "[Update] Ninja Patch Tool v1.4.5 is up to date.\n")
+        self.assertEqual(stdout.getvalue(), f"[Update] Ninja Patch Tool v{common.VERSION} is up to date.\n")
 
     def test_check_update_reports_newer_release(self) -> None:
         stdout = io.StringIO()
@@ -689,7 +689,7 @@ This should not be included.
         self.assertEqual(
             stdout.getvalue(),
             "[Update] Ninja Patch Tool v1.5 is available.\n"
-            "Current version: v1.4.5\n"
+            f"Current version: v{common.VERSION}\n"
             "Release: https://example.test/release\n",
         )
 
@@ -919,7 +919,7 @@ This should not be included.
 
     def test_temporary_self_updater_version_check_accepts_matching_version(self) -> None:
         updater_path = Path("NinjaPatchToolUpdater.exe")
-        result = SimpleNamespace(returncode=0, stdout="Ninja Patch Tool v1.4.5\n", stderr="")
+        result = SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{common.VERSION}\n", stderr="")
         with mock.patch.object(update.subprocess, "run", return_value=result) as run:
             update._validate_temporary_updater(updater_path)
         run.assert_called_once_with(
