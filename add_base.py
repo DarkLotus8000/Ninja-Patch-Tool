@@ -11,11 +11,13 @@ from common import (
     console_title,
     install_termination_handlers,
     is_steam_manifest_id,
+    index_update_lock,
     load_index,
     operation_activity_lock,
     operation_lock,
     resolve_base_name,
     scan_tree,
+    validate_installation_root_entry,
     validate_warframe_installation,
     write_index,
 )
@@ -56,13 +58,14 @@ def main() -> int:
             if update_result is not None:
                 return update_result
 
+            if not args.path.is_dir():
+                print(f"ERROR: Base directory does not exist: {args.path}", file=sys.stderr)
+                return 1
+            validate_installation_root_entry(args.path)
             base = args.path.resolve()
             name = args.name.strip()
             manifest_id = args.manifest_id
 
-            if not base.is_dir():
-                print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
-                return 1
             if not validate_warframe_installation(base, "Base"):
                 return 1
 
@@ -75,7 +78,7 @@ def main() -> int:
 
             # Reject conflicts that can be determined from the index before doing a potentially very expensive full-tree hash.
             # The same checks are repeated after hashing because another add_base process may update the index meanwhile.
-            with operation_lock("index", INDEX_FILE, "base index update"):
+            with index_update_lock(INDEX_FILE):
                 conflict = _existing_base_conflict(load_index(), name, manifest_id)
             if conflict is not None:
                 print(f"ERROR: {conflict}\nNo changes were made.", file=sys.stderr)
@@ -86,7 +89,7 @@ def main() -> int:
                 files, root_hash = scan_tree(base, "Hashing base")
 
                 # Keep the installation locked until its verified identity is committed to the index.
-                with operation_lock("index", INDEX_FILE, "base index update"):
+                with index_update_lock(INDEX_FILE):
                     index = load_index()
                     conflict = _existing_base_conflict(index, name, manifest_id)
                     if conflict is not None:

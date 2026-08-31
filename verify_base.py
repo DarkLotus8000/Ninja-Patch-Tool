@@ -14,6 +14,7 @@ from common import (
     operation_lock,
     resolve_base_name,
     scan_tree,
+    validate_installation_root_entry,
     validate_warframe_installation,
 )
 from update import add_update_arguments, handle_automatic_update, handle_early_update_request
@@ -38,11 +39,12 @@ def main() -> int:
             if update_result is not None:
                 return update_result
 
+            if not args.path.is_dir():
+                print(f"ERROR: Base directory does not exist: {args.path}", file=sys.stderr)
+                return 1
+            validate_installation_root_entry(args.path)
             base = args.path.resolve()
 
-            if not base.is_dir():
-                print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
-                return 1
             if not validate_warframe_installation(base, "Base"):
                 return 1
 

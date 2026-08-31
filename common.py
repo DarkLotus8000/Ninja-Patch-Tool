@@ -5,7 +5,9 @@ import argparse
 import errno
 import hashlib
 import json
+import os
 import re
+import stat
 import shutil
 import signal
 import subprocess
@@ -228,14 +230,92 @@ def root_sha256_from_files(files: dict[str, dict[str, Any]]) -> str:
         root_hash.update(relative.encode("utf-8") + b"\0" + str(info["size"]).encode("ascii") + b"\0" + info["sha256"].lower().encode("ascii") + b"\n")
     return root_hash.hexdigest()
 
+def _stat_identity(stat_result) -> tuple[int, int, int]:
+    # Device/inode catches atomic file replacement even when size and timestamps are deliberately preserved.
+    # Modern Python exposes Windows creation time as st_birthtime_ns; fall back to ctime on filesystems without it.
+    creation_ns = getattr(stat_result, "st_birthtime_ns", None)
+    if creation_ns is None:
+        creation_ns = stat_result.st_ctime_ns
+    return int(stat_result.st_dev), int(stat_result.st_ino), int(creation_ns)
+
+def _is_reparse_stat(stat_result) -> bool:
+    attributes = int(getattr(stat_result, "st_file_attributes", 0))
+    return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)))
+
+def validate_installation_root_entry(root: Path) -> None:
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"Could not inspect installation root:\n{root}") from exc
+    if root.is_symlink() or _is_reparse_stat(root_stat):
+        raise RuntimeError(
+            f"Warframe installation root must not be a symlink, junction, or reparse point:\n{root}"
+        )
+
+def validated_tree_paths(root: Path) -> tuple[list[Path], list[Path]]:
+    validate_installation_root_entry(root)
+    directories: list[Path] = []
+    files: list[Path] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise RuntimeError(f"Could not scan installation directory:\n{directory}") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise RuntimeError(f"Could not inspect installation path:\n{path}") from exc
+            if entry.is_symlink() or _is_reparse_stat(entry_stat):
+                raise RuntimeError(
+                    "Warframe installation contains a symlink, junction, or reparse point, which Ninja Patch Tool "
+                    f"does not support:\n{path}"
+                )
+            if stat.S_ISDIR(entry_stat.st_mode):
+                directories.append(path)
+                pending.append(path)
+            elif stat.S_ISREG(entry_stat.st_mode):
+                files.append(path)
+
+    directories.sort(key=lambda path: path.relative_to(root).as_posix())
+    files.sort(key=lambda path: path.relative_to(root).as_posix())
+    return directories, files
+
+def _validated_scan_paths(root: Path) -> tuple[list[Path], list[str]]:
+    _, all_files = validated_tree_paths(root)
+    paths = [path for path in all_files if not is_ignored_file(path)]
+    relative_paths: list[str] = []
+    seen_casefold: dict[str, str] = {}
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        try:
+            normalized = "/".join(relative_path_parts(relative))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Installation contains a path that cannot be represented safely in a Ninja Patch:\n{path}"
+            ) from exc
+        if normalized != relative:
+            raise RuntimeError(
+                f"Installation contains a path that is not valid on Windows and cannot be patched safely:\n{path}"
+            )
+        folded = normalized.casefold()
+        previous = seen_casefold.get(folded)
+        if previous is not None and previous != normalized:
+            raise RuntimeError(
+                "Installation contains two paths that collide on Windows because they differ only by capitalization:\n"
+                f"{previous}\n{normalized}"
+            )
+        seen_casefold[folded] = normalized
+        relative_paths.append(normalized)
+    return paths, relative_paths
+
 def scan_tree(root: Path, progress_label: str | None = None) -> tuple[dict[str, dict[str, Any]], str]:
     # The root hash uses each relative path, size, and file SHA-256. Filesystem enumeration order is not guaranteed,
     # so only the in-memory path list is sorted before hashing; no files are moved or modified.
-    paths = sorted(
-        (path for path in root.rglob("*") if path.is_file() and not is_ignored_file(path)),
-        key=lambda path: path.relative_to(root).as_posix(),
-    )
-    relative_paths = [path.relative_to(root).as_posix() for path in paths]
+    paths, relative_paths = _validated_scan_paths(root)
     progress = ByteProgress(progress_label, sum(path.stat().st_size for path in paths)) if progress_label else None
     files: dict[str, dict[str, Any]] = {}
 
@@ -251,14 +331,22 @@ def scan_tree(root: Path, progress_label: str | None = None) -> tuple[dict[str, 
                     progress.update(len(chunk))
             digest = digest_hash.hexdigest()
         after = path.stat()
-        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+        if (
+            before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or _stat_identity(before) != _stat_identity(after)
+        ):
             raise RuntimeError(f"Installation changed while it was being scanned:\n{path}\nClose Warframe and the Warframe Launcher and try again.")
 
-        files[relative] = {"path": path, "size": after.st_size, "sha256": digest, "mtime_ns": after.st_mtime_ns}
+        files[relative] = {
+            "path": path,
+            "size": after.st_size,
+            "sha256": digest,
+            "mtime_ns": after.st_mtime_ns,
+            "stat_identity": _stat_identity(after),
+        }
 
-    current_paths = sorted(
-        path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and not is_ignored_file(path)
-    )
+    _, current_paths = _validated_scan_paths(root)
     if current_paths != relative_paths:
         raise RuntimeError(f"Installation changed while it was being scanned:\n{root}\nClose Warframe and the Warframe Launcher and try again.")
     if progress is not None:
@@ -272,13 +360,15 @@ def verify_scanned_file(info: dict[str, Any]) -> None:
         current = path.stat()
     except OSError as exc:
         raise RuntimeError(f"Installation changed after it was scanned:\n{path}\nClose Warframe and the Warframe Launcher and try again.") from exc
-    if current.st_size != info["size"] or current.st_mtime_ns != info["mtime_ns"]:
+    if (
+        current.st_size != info["size"]
+        or current.st_mtime_ns != info["mtime_ns"]
+        or ("stat_identity" in info and _stat_identity(current) != tuple(info["stat_identity"]))
+    ):
         raise RuntimeError(f"Installation changed after it was scanned:\n{path}\nClose Warframe and the Warframe Launcher and try again.")
 
 def verify_scanned_tree(root: Path, files: dict[str, dict[str, Any]]) -> None:
-    current_paths = sorted(
-        path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and not is_ignored_file(path)
-    )
+    _, current_paths = _validated_scan_paths(root)
     if current_paths != sorted(files):
         raise RuntimeError(f"Installation changed after it was scanned:\n{root}\nClose Warframe and the Warframe Launcher and try again.")
     for info in files.values():
@@ -357,18 +447,13 @@ def write_index(index: dict[str, Any]) -> None:
     validate_index(index)
     sorted_index = {name: index[name] for name in sorted(index, key=natural_sort_key)}
 
-    # Create the temporary index exclusively so an unexplained pre-existing .tmp file is never overwritten.
-    temporary = INDEX_FILE.with_name(INDEX_FILE.name + ".tmp")
-    created = False
+    temporary = INDEX_FILE.with_name(f".{INDEX_FILE.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("x", encoding="utf-8", newline="\n") as file:
-            created = True
             file.write(json.dumps(sorted_index, indent=2, ensure_ascii=False) + "\n")
         temporary.replace(INDEX_FILE)
-    except BaseException:
-        if created:
-            temporary.unlink(missing_ok=True)
-        raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 def resolve_base_name(index: dict[str, Any], requested: str) -> str:
     requested_folded = requested.casefold()
@@ -498,6 +583,70 @@ def process_matches_identity(pid: int, identity: object) -> bool:
         return True
     current = process_identity(pid)
     return current is None or current == identity
+
+def index_update_lock_path(index_file: Path) -> Path:
+    return index_file.with_name(".index.lock")
+
+@contextmanager
+def index_update_lock(index_file: Path, timeout_seconds: int = 0):
+    # data/index.json is shared by every copy of add_base.py in this installation. A filesystem byte-range lock keeps
+    # its read-modify-write transaction serialized across Windows users/UAC tokens without preventing unrelated NPT
+    # operations from running concurrently. The OS releases the byte-range lock if the process exits unexpectedly.
+    lock_path = index_update_lock_path(index_file)
+    resolved = str(lock_path.resolve()).casefold()
+    process_key = f"index-file:{hashlib.sha256(resolved.encode('utf-8')).hexdigest()}"
+    with _PROCESS_LOCKS_GUARD:
+        if process_key in _PROCESS_LOCKS:
+            raise RuntimeError(f"Another base index update is already running for:\n{index_file}")
+        _PROCESS_LOCKS.add(process_key)
+
+    file = None
+    locked = False
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        file = lock_path.open("a+b")
+        file.seek(0, 2)
+        if file.tell() < 1:
+            file.write(b"\0")
+            file.flush()
+        while True:
+            file.seek(0)
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError as exc:
+                busy_errors = {errno.EACCES, errno.EDEADLK}
+                if sys.platform != "win32":
+                    busy_errors.add(errno.EAGAIN)
+                if exc.errno not in busy_errors:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Another base index update is already running for:\n{index_file}") from exc
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        yield
+    finally:
+        if locked and file is not None:
+            try:
+                file.seek(0)
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        if file is not None:
+            file.close()
+        with _PROCESS_LOCKS_GUARD:
+            _PROCESS_LOCKS.discard(process_key)
 
 @contextmanager
 def operation_lock(kind: str, target: Path, description: str):

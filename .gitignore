@@ -13,6 +13,7 @@ temp/
 
 # Runtime update/operation coordination
 data/.operation.lock
+data/.index.lock
 
 # Release build working directory
 release_temp/

@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+import uuid
 import zipfile
 from contextlib import ExitStack
 from pathlib import Path
@@ -35,6 +36,7 @@ from common import (
     resolve_patch_path,
     run_child,
     scan_tree,
+    validate_installation_root_entry,
     validate_warframe_installation,
     verify_scanned_file,
     verify_scanned_tree,
@@ -73,8 +75,31 @@ FULL_FILE_ZIP_COMPRESSION = {
     "maximum": (zipfile.ZIP_LZMA, None),
 }
 
-def temporary_patch_path(output: Path) -> Path:
-    return output.with_name(output.name + ".tmp")
+def temporary_patch_path(output: Path, token: str) -> Path:
+    if len(token) != 32 or any(char not in "0123456789abcdef" for char in token):
+        raise ValueError("Temporary patch token must be 32 lowercase hexadecimal characters.")
+    return output.with_name(f".{output.name}.npt-{token}.tmp")
+
+def owned_temporary_patch_path(output: Path, value: object) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        temporary = Path(value).resolve()
+        resolved_output = output.resolve()
+    except OSError:
+        return None
+    prefix = f".{resolved_output.name}.npt-"
+    suffix = ".tmp"
+    if (
+        temporary.parent != resolved_output.parent
+        or not temporary.name.startswith(prefix)
+        or not temporary.name.endswith(suffix)
+    ):
+        return None
+    token = temporary.name[len(prefix):-len(suffix)]
+    if len(token) != 32 or any(char not in "0123456789abcdef" for char in token):
+        return None
+    return temporary
 
 def publish_patch_archive(temporary: Path, output: Path) -> None:
     try:
@@ -87,12 +112,17 @@ def publish_patch_archive(temporary: Path, output: Path) -> None:
 def uses_stream(old: Path, new: Path, compression: str) -> bool:
     return compression != "normal" and max(old.stat().st_size, new.stat().st_size) >= STREAM_MODE_THRESHOLD
 
-def write_make_session(work: Path, output: Path) -> None:
-    # Creation is intentionally not resumable. This marker only lets a later run distinguish abandoned work from
-    # another make_patch process that is still active.
+def write_make_session(work: Path, output: Path, temporary_patch: Path) -> None:
+    # Creation is intentionally not resumable. The exact randomized patch temporary path is recorded so stale cleanup
+    # never has to infer ownership from a predictable <output>.tmp filename.
     session = work / MAKE_SESSION_FILE
     temporary = session.with_name(session.name + ".tmp")
-    data = {"pid": os.getpid(), "process_identity": process_identity(os.getpid()), "output": str(output)}
+    data = {
+        "pid": os.getpid(),
+        "process_identity": process_identity(os.getpid()),
+        "output": str(output),
+        "temporary_patch": str(temporary_patch),
+    }
 
     with temporary.open("w", encoding="utf-8", newline="\n") as file:
         json.dump(data, file, indent=2, ensure_ascii=False)
@@ -111,6 +141,7 @@ def cleanup_stale_make_patch_work(output: Path) -> None:
         for work in sorted(TEMP_ROOT.glob("make_patch_*")):
             session = work / MAKE_SESSION_FILE
             session_output = None
+            session_temporary = None
             pid = None
             state = None
 
@@ -127,16 +158,17 @@ def cleanup_stale_make_patch_work(output: Path) -> None:
                         continue
                     pid = candidate_pid
                     session_output = Path(raw_output).resolve()
+                    session_temporary = owned_temporary_patch_path(
+                        session_output, candidate_state.get("temporary_patch")
+                    )
                     state = candidate_state
                     break
                 except Exception:
                     continue
 
-            if session_output is not None and session_output != output:
-                continue
-
             if isinstance(pid, int) and process_matches_identity(pid, state.get("process_identity") if isinstance(state, dict) else None):
-                active_for_output = True
+                if session_output == output:
+                    active_for_output = True
                 continue
 
             if state is None:
@@ -154,22 +186,15 @@ def cleanup_stale_make_patch_work(output: Path) -> None:
                     except OSError:
                         continue
 
-            if session_output is not None:
+            if session_temporary is not None:
                 try:
-                    temporary_patch_path(session_output).unlink(missing_ok=True)
+                    session_temporary.unlink(missing_ok=True)
                 except OSError:
                     pass
             cleanup_work_dir(work)
 
     if active_for_output:
         raise RuntimeError(f"Another make_patch operation appears to still be creating this output:\n{output}")
-
-    partial = temporary_patch_path(output)
-    if partial.exists():
-        raise RuntimeError(
-            "Temporary patch path already exists and was not removed because Ninja Patch Tool cannot prove that it owns the file:\n"
-            f"{partial}"
-        )
 
 def payload_id(relative: str) -> str:
     return hashlib.sha256(relative.encode("utf-8")).hexdigest()
@@ -287,12 +312,20 @@ def should_store_full_file(diff_path: Path, new_info: dict, compression: str, wo
     compressed_size = measure_full_file_compressed_size(new_info, compression, work, item_id)
     return compressed_size is not None and compressed_size < diff_size
 
-def create_patch_archive(work: Path, output: Path, compression: str, full_file_sources: dict[str, dict]) -> None:
+def create_patch_archive(
+    work: Path,
+    output: Path,
+    compression: str,
+    full_file_sources: dict[str, dict],
+    temporary: Path | None = None,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise FileExistsError(f"Patch output already exists: {output}")
 
-    temporary = temporary_patch_path(output)
+    temporary = temporary or temporary_patch_path(output, uuid.uuid4().hex)
+    if owned_temporary_patch_path(output, str(temporary)) != temporary.resolve():
+        raise RuntimeError(f"Invalid temporary patch path: {temporary}")
     if temporary.exists():
         raise FileExistsError(f"Temporary patch path already exists: {temporary}")
 
@@ -328,16 +361,18 @@ def _run_operation(args, argv: list[str]) -> int:
     if update_result is not None:
         return update_result
 
+    if not args.base.is_dir():
+        print(f"ERROR: Base directory does not exist: {args.base}", file=sys.stderr)
+        return 1
+    if not args.new.is_dir():
+        print(f"ERROR: New directory does not exist: {args.new}", file=sys.stderr)
+        return 1
+    validate_installation_root_entry(args.base)
+    validate_installation_root_entry(args.new)
     base = args.base.resolve()
     new = args.new.resolve()
     output = resolve_patch_path(args.output)
 
-    if not base.is_dir():
-        print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
-        return 1
-    if not new.is_dir():
-        print(f"ERROR: New directory does not exist: {new}", file=sys.stderr)
-        return 1
     if not validate_warframe_installation(base, "Base"):
         return 1
     if not validate_warframe_installation(new, "New"):
@@ -426,7 +461,8 @@ def _run_operation(args, argv: list[str]) -> int:
         ])
 
         work = make_work_dir(f"make_patch_{os.getpid()}")
-        write_make_session(work, output)
+        patch_temporary = temporary_patch_path(output, uuid.uuid4().hex)
+        write_make_session(work, output, patch_temporary)
         diffs_dir = work / "diffs"
         diffs_dir.mkdir()
         operations = []
@@ -522,7 +558,7 @@ def _run_operation(args, argv: list[str]) -> int:
         )
 
         print(f"\nCreating single patch file:\n{output}")
-        create_patch_archive(work, output, args.compression, full_file_sources)
+        create_patch_archive(work, output, args.compression, full_file_sources, patch_temporary)
         try:
             verify_scanned_tree(base, old_files)
             verify_scanned_tree(new, new_files)

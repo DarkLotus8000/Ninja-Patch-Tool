@@ -288,16 +288,16 @@ class CommonTests(unittest.TestCase):
                     common.relative_path_parts(path)
         self.assertEqual(common.relative_path_parts("Cache.Windows/B.Misc.cache"), ("Cache.Windows", "B.Misc.cache"))
 
-    def test_write_index_refuses_preexisting_temporary_file(self) -> None:
+    def test_write_index_uses_unique_owned_temporary_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             index_file = Path(tmp) / "index.json"
-            temporary = index_file.with_name(index_file.name + ".tmp")
-            temporary.write_text("keep", encoding="utf-8")
+            legacy_temporary = index_file.with_name(index_file.name + ".tmp")
+            legacy_temporary.write_text("keep", encoding="utf-8")
             with mock.patch.object(common, "INDEX_FILE", index_file):
-                with self.assertRaises(FileExistsError):
-                    common.write_index({})
-            self.assertEqual(temporary.read_text(encoding="utf-8"), "keep")
-            self.assertFalse(index_file.exists())
+                common.write_index({})
+            self.assertEqual(legacy_temporary.read_text(encoding="utf-8"), "keep")
+            self.assertEqual(json.loads(index_file.read_text(encoding="utf-8")), {})
+            self.assertEqual(list(index_file.parent.glob(".index.json.*.tmp")), [])
 
     def test_add_base_keeps_installation_locked_until_index_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -314,6 +314,14 @@ class CommonTests(unittest.TestCase):
                 finally:
                     active.remove(kind)
 
+            @contextmanager
+            def fake_index_lock(index_file: Path, timeout_seconds: int = 0):
+                active.append("index")
+                try:
+                    yield
+                finally:
+                    active.remove("index")
+
             def write_index(index: dict) -> None:
                 self.assertIn("installation", active)
                 self.assertIn("index", active)
@@ -322,6 +330,7 @@ class CommonTests(unittest.TestCase):
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(add_base, "operation_lock", side_effect=fake_lock),
+                mock.patch.object(add_base, "index_update_lock", side_effect=fake_index_lock),
                 mock.patch.object(add_base, "validate_warframe_installation", return_value=True),
                 mock.patch.object(add_base, "scan_tree", return_value=({}, "a" * 64)),
                 mock.patch.object(add_base, "load_index", return_value={}),
@@ -1158,7 +1167,7 @@ This should not be included.
             }
             calls = 0
 
-            def fake_download(url: str, destination: Path, expected_size=None, progress_label=None) -> None:
+            def fake_download(url: str, destination: Path, expected_size=None, progress_label=None, max_size=None) -> None:
                 nonlocal calls
                 calls += 1
                 if calls <= 2:
@@ -1172,6 +1181,40 @@ This should not be included.
                 archive = update.download_release(release, work)
             self.assertEqual(archive.read_bytes(), payload)
             self.assertEqual(calls, 4)
+
+    def test_update_download_rejects_excess_bytes_before_writing_them(self) -> None:
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "release.zip"
+            with mock.patch.object(update, "_request", return_value=Response(b"123456")):
+                with self.assertRaisesRegex(RuntimeError, "exceeds the expected size"):
+                    update._download_file("https://example.test/release.zip", destination, expected_size=5)
+            self.assertFalse(destination.exists())
+            self.assertFalse(destination.with_name(destination.name + ".part").exists())
+
+    def test_release_assets_require_valid_sizes(self) -> None:
+        for size in (None, -1, True, "123"):
+            with self.subTest(size=size):
+                release = {"assets": [{"name": "asset.zip", "browser_download_url": "https://example.test/asset.zip", "size": size}]}
+                with self.assertRaisesRegex(RuntimeError, "invalid or missing size"):
+                    update.find_release_asset(release, "asset.zip")
+
+    def test_update_metadata_response_has_size_limit(self) -> None:
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.close()
+
+        payload = b"{" + b" " * update.MAX_GITHUB_JSON_BYTES + b"}"
+        with mock.patch.object(update, "_request", return_value=Response(payload)):
+            with self.assertRaisesRegex(RuntimeError, "unexpectedly large"):
+                update._request_json("https://example.test/latest")
 
     def test_update_archive_validation_and_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1484,28 +1527,103 @@ This should not be included.
             relaunch.assert_called_once_with(executable.resolve(), ["base", "patch"], root.resolve(), stage.parent)
             self.assertIn("Installation deferred", stdout.getvalue())
 
-    def test_updater_install_lock_times_out_instead_of_waiting_forever(self) -> None:
-        import ctypes
+    def test_updater_releases_all_installation_locks_before_relaunch(self) -> None:
+        events: list[str] = []
 
-        kernel32 = SimpleNamespace(
-            CreateMutexW=mock.MagicMock(return_value=123),
-            WaitForSingleObject=mock.MagicMock(return_value=0x102),
-            ReleaseMutex=mock.MagicMock(),
-            CloseHandle=mock.MagicMock(),
+        @contextmanager
+        def updater_lock(*args, **kwargs):
+            events.append("updater-enter")
+            try:
+                yield
+            finally:
+                events.append("updater-exit")
+
+        @contextmanager
+        def activity_lock(*args, **kwargs):
+            events.append("activity-enter")
+            try:
+                yield
+            finally:
+                events.append("activity-exit")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            backup = root / "work" / "backup"
+            install.mkdir(parents=True)
+            stage.mkdir(parents=True)
+            backup.mkdir()
+            executable = install / "make_patch.exe"
+            with (
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update, "write_update_session"),
+                mock.patch.object(update, "wait_for_process_exit"),
+                mock.patch.object(update, "updater_install_lock", side_effect=updater_lock),
+                mock.patch.object(update, "exclusive_operation_activity_lock", side_effect=activity_lock),
+                mock.patch.object(update, "installed_executable_satisfies_target", return_value=None),
+                mock.patch.object(update, "_parse_release_manifest", return_value=("1.5.0", {})),
+                mock.patch.object(update, "install_staged_release", side_effect=lambda *args: (events.append("install") or (backup, []))),
+                mock.patch.object(update, "validate_installed_executable", side_effect=lambda *args: events.append("validate")),
+                mock.patch.object(update, "relaunch", side_effect=lambda *args: events.append("relaunch")),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                result = update.run_update_installer([
+                    "--install-dir", str(install),
+                    "--stage-dir", str(stage),
+                    "--parent-pid", "123",
+                    "--target-version", "1.5.0",
+                    "--relaunch-executable", str(executable),
+                    "--relaunch-cwd", str(root),
+                ])
+            self.assertEqual(result, 0)
+        self.assertLess(events.index("validate"), events.index("activity-exit"))
+        self.assertLess(events.index("activity-exit"), events.index("updater-exit"))
+        self.assertLess(events.index("updater-exit"), events.index("relaunch"))
+
+    def test_updater_does_not_relaunch_while_another_updater_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            install.mkdir(parents=True)
+            stage.mkdir(parents=True)
+            executable = install / "make_patch.exe"
+            with (
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update, "write_update_session"),
+                mock.patch.object(update, "wait_for_process_exit"),
+                mock.patch.object(update, "updater_install_lock", side_effect=update.UpdaterBusyError("busy")),
+                mock.patch.object(update, "cleanup_deferred_update_payload") as cleanup_deferred,
+                mock.patch.object(update, "relaunch") as relaunch,
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                result = update.run_update_installer([
+                    "--install-dir", str(install),
+                    "--stage-dir", str(stage),
+                    "--parent-pid", "123",
+                    "--target-version", "1.5.0",
+                    "--relaunch-executable", str(executable),
+                    "--relaunch-cwd", str(root),
+                ])
+            self.assertEqual(result, 0)
+            cleanup_deferred.assert_called_once_with(stage.parent)
+            relaunch.assert_not_called()
+
+    def test_updater_install_lock_defers_immediately_and_is_installation_scoped(self) -> None:
+        fake_msvcrt = SimpleNamespace(
+            LK_NBLCK=1,
+            LK_UNLCK=2,
+            locking=mock.MagicMock(side_effect=OSError(errno.EACCES, "busy")),
         )
-        with (
-            mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel32),
-            mock.patch.object(update, "windows_user_sid", return_value="S-1-5-21-42"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "Timed out waiting for another Ninja Patch Tool update"):
-                with update.updater_install_lock(Path("C:/NPT"), timeout_seconds=2):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}):
+            install = Path(tmp)
+            with self.assertRaisesRegex(update.UpdaterBusyError, "already in progress"):
+                with update.updater_install_lock(install):
                     pass
-
-        kernel32.WaitForSingleObject.assert_called_once_with(123, 2000)
-        kernel32.ReleaseMutex.assert_not_called()
-        kernel32.CloseHandle.assert_called_once_with(123)
-        mutex_name = kernel32.CreateMutexW.call_args.args[2]
-        self.assertTrue(mutex_name.startswith(r"Global\DarkLotus.NinjaPatchTool.updater.S-1-5-21-42."))
+            self.assertTrue(update.updater_install_lock_path(install).is_file())
+        fake_msvcrt.locking.assert_called_once()
+        self.assertEqual(fake_msvcrt.locking.call_args.args[1:], (fake_msvcrt.LK_NBLCK, 1))
 
     def test_updater_queued_target_is_satisfied_by_equal_or_newer_installation(self) -> None:
         executable = Path("tool.exe")
@@ -1628,7 +1746,7 @@ This should not be included.
                 update.cleanup_relaunched_update_work()
             self.assertFalse(work.exists())
 
-    def test_legacy_updater_cleanup_removes_old_release_helper(self) -> None:
+    def test_legacy_updater_cleanup_removes_only_identified_old_release_helper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tool_dir = Path(tmp)
             legacy_updater = tool_dir / "updater.exe"
@@ -1638,9 +1756,39 @@ This should not be included.
                 mock.patch.object(update.sys, "platform", "win32"),
                 mock.patch.object(update.sys, "frozen", True, create=True),
                 mock.patch.object(update.sys, "executable", str(tool_dir / "make_patch.exe")),
+                mock.patch.object(update, "_is_known_legacy_updater", return_value=True),
             ):
                 update.cleanup_legacy_updater_executable()
             self.assertFalse(legacy_updater.exists())
+
+    def test_legacy_updater_cleanup_preserves_unrecognized_updater(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tool_dir = Path(tmp)
+            legacy_updater = tool_dir / "updater.exe"
+            legacy_updater.write_bytes(b"user file")
+            with (
+                mock.patch.object(update, "TOOL_DIR", tool_dir),
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update.sys, "frozen", True, create=True),
+                mock.patch.object(update.sys, "executable", str(tool_dir / "make_patch.exe")),
+                mock.patch.object(update, "_is_known_legacy_updater", return_value=False),
+            ):
+                update.cleanup_legacy_updater_executable()
+            self.assertTrue(legacy_updater.exists())
+
+    def test_legacy_updater_identity_requires_old_npt_updater_metadata(self) -> None:
+        valid = {
+            "ProductName": "Ninja Patch Tool",
+            "ProductVersion": "1.4.0.0",
+            "FileDescription": "Ninja Patch Tool Updater",
+            "InternalName": "updater",
+        }
+        wrong_product = {**valid, "ProductName": "Other Tool"}
+        wrong_version = {**valid, "ProductVersion": "1.4.1"}
+        not_updater = {**valid, "FileDescription": "Ninja Patch Tool", "InternalName": "make_patch"}
+        for metadata, expected in ((valid, True), (wrong_product, False), (wrong_version, False), (not_updater, False), ({}, False)):
+            with mock.patch.object(update, "_legacy_updater_version_info", return_value=metadata):
+                self.assertEqual(update._is_known_legacy_updater(Path("updater.exe")), expected)
 
     def test_legacy_updater_cleanup_is_release_only_and_best_effort(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1661,6 +1809,7 @@ This should not be included.
                 mock.patch.object(update.sys, "platform", "win32"),
                 mock.patch.object(update.sys, "frozen", True, create=True),
                 mock.patch.object(update.sys, "executable", str(tool_dir / "make_patch.exe")),
+                mock.patch.object(update, "_is_known_legacy_updater", return_value=True),
                 mock.patch.object(Path, "unlink", side_effect=PermissionError("locked")),
             ):
                 update.cleanup_legacy_updater_executable()
@@ -1817,6 +1966,71 @@ This should not be included.
             with self.assertRaisesRegex(RuntimeError, "Installation changed after it was scanned"):
                 common.verify_scanned_tree(root, files)
 
+    def test_scan_tree_rejects_windows_unsafe_source_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CON").write_bytes(b"bad")
+            with self.assertRaisesRegex(RuntimeError, "cannot be represented safely"):
+                common.scan_tree(root)
+
+    def test_scan_tree_rejects_symlink_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target.bin"
+            link = root / "linked.bin"
+            target.write_bytes(b"target")
+            try:
+                link.symlink_to(target)
+            except OSError as exc:
+                self.skipTest(f"Symlink creation is unavailable: {exc}")
+            with self.assertRaisesRegex(RuntimeError, "symlink, junction, or reparse point"):
+                common.scan_tree(root)
+
+    def test_installation_root_symlink_is_rejected_before_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real"
+            real.mkdir()
+            link = root / "linked-root"
+            try:
+                link.symlink_to(real, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"Directory symlink creation is unavailable: {exc}")
+            with self.assertRaisesRegex(RuntimeError, "root must not be a symlink, junction, or reparse point"):
+                common.validate_installation_root_entry(link)
+
+    def test_reparse_attribute_is_detected(self) -> None:
+        self.assertTrue(common._is_reparse_stat(SimpleNamespace(st_file_attributes=0x400)))
+        self.assertFalse(common._is_reparse_stat(SimpleNamespace(st_file_attributes=0)))
+
+    def test_scan_tree_rejects_case_insensitive_path_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Foo.bin").write_bytes(b"a")
+            (root / "foo.bin").write_bytes(b"b")
+            with self.assertRaisesRegex(RuntimeError, "collide on Windows"):
+                common.scan_tree(root)
+
+    def test_scan_tree_detects_atomic_replacement_with_same_size_and_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "file.bin"
+            target.write_bytes(b"same")
+            original_mtime = target.stat().st_mtime_ns
+            original_hash = common.sha256_file
+
+            def replace_during_hash(path: Path) -> str:
+                digest = original_hash(path)
+                replacement = root / "replacement.tmp"
+                replacement.write_bytes(b"same")
+                os.utime(replacement, ns=(original_mtime, original_mtime))
+                os.replace(replacement, path)
+                return digest
+
+            with mock.patch.object(common, "sha256_file", side_effect=replace_during_hash):
+                with self.assertRaisesRegex(RuntimeError, "changed while it was being scanned"):
+                    common.scan_tree(root)
+
     def test_low_disk_space_is_only_a_warning(self) -> None:
         stderr = io.StringIO()
         with mock.patch.object(common.shutil, "disk_usage", return_value=SimpleNamespace(free=100)), mock.patch("sys.stderr", stderr):
@@ -1824,7 +2038,7 @@ This should not be included.
         self.assertIn("WARNING: Disk space may be insufficient", stderr.getvalue())
 
 class MakePatchTests(unittest.TestCase):
-    def test_stale_make_patch_cleanup_does_not_touch_other_output(self) -> None:
+    def test_stale_make_patch_cleanup_removes_dead_owned_work_for_other_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             temp_root = root / "temp"
@@ -1832,44 +2046,57 @@ class MakePatchTests(unittest.TestCase):
             work.mkdir(parents=True)
             first_output = (root / "first.patch").resolve()
             second_output = (root / "second.patch").resolve()
-            (work / make_patch.MAKE_SESSION_FILE).write_text(json.dumps({"pid": 123, "process_identity": "dead", "output": str(first_output)}), encoding="utf-8")
-            first_partial = make_patch.temporary_patch_path(first_output)
+            first_partial = make_patch.temporary_patch_path(first_output, "a" * 32)
+            (work / make_patch.MAKE_SESSION_FILE).write_text(
+                json.dumps({
+                    "pid": 123,
+                    "process_identity": "dead",
+                    "output": str(first_output),
+                    "temporary_patch": str(first_partial),
+                }),
+                encoding="utf-8",
+            )
             first_partial.write_bytes(b"partial")
             with (
                 mock.patch.object(make_patch, "TEMP_ROOT", temp_root),
                 mock.patch.object(make_patch, "process_matches_identity", return_value=False),
             ):
                 make_patch.cleanup_stale_make_patch_work(second_output)
-            self.assertTrue(work.is_dir())
-            self.assertTrue(first_partial.is_file())
-            with (
-                mock.patch.object(make_patch, "TEMP_ROOT", temp_root),
-                mock.patch.object(make_patch, "process_matches_identity", return_value=False),
-            ):
-                make_patch.cleanup_stale_make_patch_work(first_output)
             self.assertFalse(work.exists())
             self.assertFalse(first_partial.exists())
 
-    def test_unowned_patch_tmp_is_never_deleted(self) -> None:
+    def test_unowned_randomized_patch_tmp_is_never_deleted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp) / "temp"
             output = Path(tmp) / "output.patch"
-            partial = make_patch.temporary_patch_path(output)
+            partial = make_patch.temporary_patch_path(output, "a" * 32)
             partial.write_bytes(b"unrelated")
             with mock.patch.object(make_patch, "TEMP_ROOT", temp_root):
-                with self.assertRaisesRegex(RuntimeError, "cannot prove that it owns"):
-                    make_patch.cleanup_stale_make_patch_work(output)
+                make_patch.cleanup_stale_make_patch_work(output)
             self.assertEqual(partial.read_bytes(), b"unrelated")
 
-    def test_known_stale_patch_tmp_is_removed(self) -> None:
+    def test_predictable_legacy_patch_tmp_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp) / "temp"
+            output = Path(tmp) / "output.patch"
+            legacy = output.with_name(output.name + ".tmp")
+            legacy.write_bytes(b"unrelated")
+            with mock.patch.object(make_patch, "TEMP_ROOT", temp_root):
+                make_patch.cleanup_stale_make_patch_work(output)
+            self.assertEqual(legacy.read_bytes(), b"unrelated")
+
+    def test_known_stale_randomized_patch_tmp_is_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp) / "temp"
             work = temp_root / "make_patch_old"
             work.mkdir(parents=True)
             output = Path(tmp) / "output.patch"
-            partial = make_patch.temporary_patch_path(output)
+            partial = make_patch.temporary_patch_path(output, "b" * 32)
             partial.write_bytes(b"partial")
-            (work / make_patch.MAKE_SESSION_FILE).write_text(json.dumps({"pid": 123, "output": str(output)}), encoding="utf-8")
+            (work / make_patch.MAKE_SESSION_FILE).write_text(
+                json.dumps({"pid": 123, "output": str(output), "temporary_patch": str(partial)}),
+                encoding="utf-8",
+            )
             with mock.patch.object(make_patch, "TEMP_ROOT", temp_root), mock.patch.object(make_patch, "process_matches_identity", return_value=False):
                 make_patch.cleanup_stale_make_patch_work(output)
             self.assertFalse(partial.exists())
@@ -1891,9 +2118,17 @@ class MakePatchTests(unittest.TestCase):
             work = temp_root / "make_patch_123_deadbeef"
             work.mkdir(parents=True)
             output = Path(tmp) / "output.patch"
-            partial = make_patch.temporary_patch_path(output)
+            partial = make_patch.temporary_patch_path(output, "c" * 32)
             partial.write_bytes(b"partial")
-            (work / f"{make_patch.MAKE_SESSION_FILE}.tmp").write_text(json.dumps({"pid": 123, "process_identity": "123:1", "output": str(output)}), encoding="utf-8")
+            (work / f"{make_patch.MAKE_SESSION_FILE}.tmp").write_text(
+                json.dumps({
+                    "pid": 123,
+                    "process_identity": "123:1",
+                    "output": str(output),
+                    "temporary_patch": str(partial),
+                }),
+                encoding="utf-8",
+            )
             with mock.patch.object(make_patch, "TEMP_ROOT", temp_root), mock.patch.object(make_patch, "process_matches_identity", return_value=False):
                 make_patch.cleanup_stale_make_patch_work(output)
             self.assertFalse(partial.exists())
@@ -1978,10 +2213,10 @@ class MakePatchTests(unittest.TestCase):
             (work / "diffs").mkdir(parents=True)
             (work / "manifest.json").write_text("{}", encoding="utf-8")
             output = root / "test.patch"
-            partial = make_patch.temporary_patch_path(output)
+            partial = make_patch.temporary_patch_path(output, "d" * 32)
             partial.write_bytes(b"keep")
             with self.assertRaises(FileExistsError):
-                make_patch.create_patch_archive(work, output, "normal", {})
+                make_patch.create_patch_archive(work, output, "normal", {}, partial)
             self.assertEqual(partial.read_bytes(), b"keep")
 
     def test_create_archive_never_overwrites_output_created_during_publication(self) -> None:
@@ -1998,12 +2233,13 @@ class MakePatchTests(unittest.TestCase):
                 with mock.patch.object(Path, "rename", side_effect=FileExistsError):
                     original_publish(temporary, destination)
 
+            partial = make_patch.temporary_patch_path(output, "e" * 32)
             with mock.patch.object(make_patch, "publish_patch_archive", side_effect=race):
                 with self.assertRaisesRegex(FileExistsError, "appeared while the patch was being created"):
-                    make_patch.create_patch_archive(work, output, "normal", {})
+                    make_patch.create_patch_archive(work, output, "normal", {}, partial)
 
             self.assertEqual(output.read_bytes(), b"unrelated")
-            self.assertFalse(make_patch.temporary_patch_path(output).exists())
+            self.assertFalse(partial.exists())
 
     def test_higher_and_maximum_compare_compressed_full_file_against_delta(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2363,15 +2599,20 @@ class ApplyPatchTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unsafe path"):
             apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json")})
 
-    def test_temporary_path_collision_is_rejected(self) -> None:
+    def test_apply_temporary_paths_are_session_owned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             target = root / "a.bin"
             target.write_bytes(b"old")
             (root / "a.bin.tmp").write_bytes(b"mine")
             operation = {"type": "replace", "path": "a.bin"}
+            token = "abc123"
+            apply_patch.check_temporary_paths(root, [operation], token)
+            owned = apply_patch.temporary_output(target, token)
+            owned.write_bytes(b"owned")
             with self.assertRaisesRegex(RuntimeError, "Temporary output path already exists"):
-                apply_patch.check_temporary_paths(root, [operation])
+                apply_patch.check_temporary_paths(root, [operation], token)
+            self.assertEqual((root / "a.bin.tmp").read_bytes(), b"mine")
 
     def test_file_to_directory_and_directory_to_file_topology(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2437,6 +2678,22 @@ class ApplyPatchTests(unittest.TestCase):
             self.assertEqual((destination / "Cache.Windows" / "data.bin").read_bytes(), b"A" * 1024)
             self.assertEqual((destination / "Launcher.exe").read_bytes(), b"ignored but copied")
             self.assertNotIn("Launcher.exe", copied_files)
+
+    def test_separate_copy_rejects_symlink_in_base_without_copying_external_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, destination = root / "base", root / "destination"
+            external = root / "external.bin"
+            make_warframe_root(base)
+            external.write_bytes(b"external")
+            link = base / "Cache.Windows" / "linked.bin"
+            try:
+                link.symlink_to(external)
+            except OSError as exc:
+                self.skipTest(f"Symlink creation is unavailable: {exc}")
+            with self.assertRaisesRegex(RuntimeError, "symlink, junction, or reparse point"):
+                apply_patch.copy_verified_base(base, destination)
+            self.assertFalse(destination.exists())
 
     def test_tracked_old_file_avoids_rehashing_copied_base(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2843,6 +3100,58 @@ class ApplyPatchTests(unittest.TestCase):
             self.assertTrue(apply_patch.recovery_matches_manifest(completed, matching))
             self.assertFalse(apply_patch.recovery_matches_manifest(completed, different))
             self.assertTrue(destination.exists())
+
+    def test_index_update_lock_is_filesystem_scoped_and_non_recursive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            index_file = Path(tmp) / "data" / "index.json"
+            with common.index_update_lock(index_file):
+                self.assertTrue(common.index_update_lock_path(index_file).is_file())
+                with self.assertRaisesRegex(RuntimeError, "Another base index update"):
+                    with common.index_update_lock(index_file):
+                        pass
+            with common.index_update_lock(index_file):
+                pass
+
+    def test_separate_copy_rejects_file_added_during_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, destination = root / "base", root / "destination"
+            make_warframe_root(base)
+            (base / "Cache.Windows" / "data.bin").write_bytes(b"A" * 1024)
+            original_validated_tree_paths = apply_patch.validated_tree_paths
+            calls = 0
+
+            def changing_tree_paths(tree: Path):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    (base / "Cache.Windows" / "appeared-during-copy.bin").write_bytes(b"late")
+                return original_validated_tree_paths(tree)
+
+            with mock.patch.object(apply_patch, "validated_tree_paths", side_effect=changing_tree_paths):
+                with self.assertRaisesRegex(RuntimeError, "Installation changed while it was being copied"):
+                    apply_patch.copy_verified_base(base, destination)
+
+    def test_updater_rejects_reparse_destination_hierarchy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            external = root / "external"
+            install.mkdir()
+            stage.mkdir(parents=True)
+            external.mkdir()
+            try:
+                (install / "data").symlink_to(external, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"Directory symlink creation is unavailable: {exc}")
+            with self.assertRaisesRegex(RuntimeError, "symlink, junction, or reparse point"):
+                update.install_staged_release(stage, install)
+            self.assertEqual(list(external.iterdir()), [])
+
+    def test_updater_reparse_attribute_is_detected(self) -> None:
+        self.assertTrue(update._is_reparse_stat(SimpleNamespace(st_file_attributes=0x400)))
+        self.assertFalse(update._is_reparse_stat(SimpleNamespace(st_file_attributes=0)))
 
 if __name__ == "__main__":
     unittest.main()

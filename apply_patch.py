@@ -43,7 +43,9 @@ from common import (
     safe_join,
     scan_tree,
     sha256_file,
+    validate_installation_root_entry,
     validate_warframe_installation,
+    validated_tree_paths,
     verify_scanned_file,
     verify_scanned_tree,
     warn_if_low_disk_space_groups,
@@ -212,23 +214,41 @@ def verify_file(path: Path, expected_size: int, expected_hash: str) -> None:
         raise RuntimeError(f"SHA-256 verification failed: {path}")
 
 def installation_size(root: Path) -> int:
-    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+    _, source_files = validated_tree_paths(root)
+    return sum(path.stat().st_size for path in source_files)
 
 def copy_verified_base(base: Path, destination: Path, total_size: int | None = None) -> tuple[dict[str, dict], str]:
-    # Separate-output mode hashes each tracked base file while copying it. This verifies the required base and creates
-    # the output in one read pass instead of hashing the whole base before copying it.
+    # Validate the complete tree before copying so symlinks, junctions, and other reparse points are never followed
+    # into data outside the selected Warframe installation. Each tracked file is hashed while it is copied.
+    directories, source_files = validated_tree_paths(base)
+    initial_directories = [path.relative_to(base).as_posix() for path in directories]
+    initial_files = [path.relative_to(base).as_posix() for path in source_files]
     files: dict[str, dict] = {}
-    progress = ByteProgress("Copying and verifying base", installation_size(base) if total_size is None else total_size)
+    estimated_size = sum(path.stat().st_size for path in source_files) if total_size is None else total_size
+    progress = ByteProgress("Copying and verifying base", estimated_size)
 
-    def copy_file(source_name: str, destination_name: str) -> str:
-        source = Path(source_name)
-        target = Path(destination_name)
+    destination.mkdir(parents=True)
+    for source_directory in directories:
+        target_directory = destination / source_directory.relative_to(base)
+        target_directory.mkdir(parents=True, exist_ok=True)
+
+    for source in source_files:
+        target = destination / source.relative_to(base)
+        target.parent.mkdir(parents=True, exist_ok=True)
         if is_ignored_file(source):
-            result = shutil.copy2(source, target)
-            progress.update(source.stat().st_size)
-            return result
+            before = source.lstat()
+            if source.is_symlink():
+                raise RuntimeError(f"Installation changed while it was being copied:\n{source}")
+            shutil.copy2(source, target)
+            after = source.lstat()
+            if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+                raise RuntimeError(f"Installation changed while it was being copied:\n{source}\nClose Warframe and the Warframe Launcher and try again.")
+            progress.update(after.st_size)
+            continue
 
-        before = source.stat()
+        before = source.lstat()
+        if source.is_symlink():
+            raise RuntimeError(f"Installation changed while it was being copied:\n{source}")
         digest = hashlib.sha256()
         with source.open("rb") as input_file, target.open("wb") as output_file:
             while chunk := input_file.read(COPY_BUFFER_SIZE):
@@ -237,8 +257,8 @@ def copy_verified_base(base: Path, destination: Path, total_size: int | None = N
                     raise RuntimeError(f"Could not completely copy base file: {source}")
                 progress.update(len(chunk))
         shutil.copystat(source, target)
-        after = source.stat()
-        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+        after = source.lstat()
+        if source.is_symlink() or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
             raise RuntimeError(f"Installation changed while it was being copied:\n{source}\nClose Warframe and the Warframe Launcher and try again.")
 
         target_stat = target.stat()
@@ -246,9 +266,20 @@ def copy_verified_base(base: Path, destination: Path, total_size: int | None = N
             raise RuntimeError(f"Base copy size verification failed: {target}")
         relative = source.relative_to(base).as_posix()
         files[relative] = {"path": target, "size": target_stat.st_size, "sha256": digest.hexdigest(), "mtime_ns": target_stat.st_mtime_ns}
-        return str(target)
 
-    shutil.copytree(base, destination, copy_function=copy_file)
+    final_directories, final_files = validated_tree_paths(base)
+    if (
+        [path.relative_to(base).as_posix() for path in final_directories] != initial_directories
+        or [path.relative_to(base).as_posix() for path in final_files] != initial_files
+    ):
+        raise RuntimeError(
+            "Installation changed while it was being copied.\n"
+            "Close Warframe and the Warframe Launcher and try again."
+        )
+
+    for source_directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        shutil.copystat(source_directory, destination / source_directory.relative_to(base))
+    shutil.copystat(base, destination)
     progress.finish()
     verify_scanned_tree(destination, files)
     return files, root_sha256_from_files(files)
@@ -288,12 +319,15 @@ def prune_empty_parents(path: Path, root: Path) -> None:
             break
         path = path.parent
 
-def temporary_output(target: Path) -> Path:
-    return target.with_name(target.name + ".tmp")
+def temporary_output(target: Path, token: str | None) -> Path:
+    if token is None:
+        # Recovery compatibility with NPT versions that used predictable <target>.tmp files.
+        return target.with_name(target.name + ".tmp")
+    return target.with_name(f".{target.name}.npt-{token}.tmp")
 
-def check_temporary_paths(destination: Path, operations: list[dict]) -> None:
-    # .tmp files are written beside targets for atomic replacement. Refuse any pre-existing or manifest-target
-    # collision instead of deleting a possibly legitimate file.
+def check_temporary_paths(destination: Path, operations: list[dict], token: str | None = None) -> None:
+    # New apply operations only touch session-owned temporary names. Refuse the vanishingly unlikely collision instead
+    # of deleting a file that existed before this operation.
     targets = {
         str(safe_join(destination, operation["path"]).resolve()).casefold()
         for operation in operations
@@ -301,7 +335,7 @@ def check_temporary_paths(destination: Path, operations: list[dict]) -> None:
     for operation in operations:
         if operation["type"] not in {"patch", "replace", "add"}:
             continue
-        temporary = temporary_output(safe_join(destination, operation["path"]))
+        temporary = temporary_output(safe_join(destination, operation["path"]), token)
         if str(temporary.resolve()).casefold() in targets:
             raise RuntimeError(f"Temporary output path conflicts with a patch target: {temporary}")
         if temporary.exists():
@@ -319,6 +353,7 @@ def apply_operations(
     scratch: Path,
     operations: list[dict],
     tracked_files: dict[str, dict] | None = None,
+    temporary_token: str | None = None,
 ) -> None:
     payload_file = scratch / "payload.hdiff"
     ordered = ordered_operations(operations)
@@ -339,7 +374,7 @@ def apply_operations(
             print(f"[Removed {operation_number}/{total_operations}] {display_relative_path(relative_path)}")
             continue
 
-        temporary = temporary_output(target)
+        temporary = temporary_output(target, temporary_token)
         if temporary.exists():
             raise RuntimeError(f"Temporary output path unexpectedly exists: {temporary}")
 
@@ -436,7 +471,13 @@ def backup_in_place(base: Path, backup: Path, operations: list[dict]) -> dict[st
     progress.finish()
     return existed
 
-def rollback_in_place(base: Path, backup: Path, operations: list[dict], existed: dict[str, bool]) -> None:
+def rollback_in_place(
+    base: Path,
+    backup: Path,
+    operations: list[dict],
+    existed: dict[str, bool],
+    temporary_token: str | None = None,
+) -> None:
     # Remove every path created by the patch first, then restore original files. This ordering is required when a
     # patch changes a path between file and directory topology.
     for operation in operations:
@@ -445,7 +486,7 @@ def rollback_in_place(base: Path, backup: Path, operations: list[dict], existed:
             continue
         target = safe_join(base, relative)
         try:
-            temporary_output(target).unlink(missing_ok=True)
+            temporary_output(target, temporary_token).unlink(missing_ok=True)
         except NotADirectoryError:
             pass
         if target.is_file():
@@ -457,7 +498,7 @@ def rollback_in_place(base: Path, backup: Path, operations: list[dict], existed:
         if not existed.get(relative):
             continue
         target = safe_join(base, relative)
-        temporary_output(target).unlink(missing_ok=True)
+        temporary_output(target, temporary_token).unlink(missing_ok=True)
         if target.exists() and not target.is_file():
             try:
                 target.rmdir()
@@ -490,6 +531,7 @@ def make_recovery_state(
     phase: str,
     existed: dict[str, bool] | None = None,
     working_destination: Path | None = None,
+    temporary_token: str | None = None,
 ) -> dict:
     state = {
         "mode": mode,
@@ -502,6 +544,8 @@ def make_recovery_state(
         "old_file_count": manifest["old_file_count"],
         "new_file_count": manifest["new_file_count"],
     }
+    if temporary_token is not None:
+        state["temporary_token"] = temporary_token
     if mode == "in_place":
         state["operations"] = manifest["operations"]
         state["existed"] = existed or {}
@@ -541,9 +585,10 @@ def restore_in_place(
     existed: dict[str, bool],
     old_root_sha256: str,
     old_file_count: int,
+    temporary_token: str | None = None,
 ) -> None:
     with protected_cleanup():
-        rollback_in_place(base, backup, operations, existed)
+        rollback_in_place(base, backup, operations, existed, temporary_token)
         if not tree_matches(base, old_root_sha256, old_file_count, "Verifying restored base"):
             raise RuntimeError("Rollback failed: the original base could not be fully restored.")
 
@@ -685,7 +730,10 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
                 )
 
             print("Restoring the original base from the recovery backup...")
-            restore_in_place(base, backup, operations, existed, old_hash, old_count)
+            temporary_token = state.get("temporary_token")
+            if temporary_token is not None and (not isinstance(temporary_token, str) or not temporary_token.isalnum()):
+                raise RuntimeError(f"Interrupted patch recovery data contains an invalid temporary token.\nRecovery state: {recovery}")
+            restore_in_place(base, backup, operations, existed, old_hash, old_count, temporary_token)
             print("[Recovery] Original base restored successfully.")
             cleanup_work_dir(work)
             continue
@@ -768,10 +816,11 @@ def apply_and_verify(
     scratch: Path,
     manifest: dict,
     tracked_files: dict[str, dict] | None = None,
+    temporary_token: str | None = None,
 ) -> float:
     print("\nApplying patch...")
     patch_started = time.perf_counter()
-    apply_operations(destination, archive, members, scratch, manifest["operations"], tracked_files)
+    apply_operations(destination, archive, members, scratch, manifest["operations"], tracked_files, temporary_token)
     patch_duration = time.perf_counter() - patch_started
 
     print("\nVerifying final installation...")
@@ -879,13 +928,14 @@ def run_locked_apply(
                     (TEMP_ROOT, largest_payload, "temporary patch payload data"),
                 ])
 
-            if in_place:
-                check_temporary_paths(base, manifest["operations"])
-
             work = make_work_dir(f"apply_patch_{os.getpid()}")
+            temporary_token = work.name.rsplit("_", 1)[-1]
 
             if in_place:
-                write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "preparing"))
+                check_temporary_paths(base, manifest["operations"], temporary_token)
+
+            if in_place:
+                write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "preparing", temporary_token=temporary_token))
                 keep_work = True
                 scratch = work / "payload"
                 scratch.mkdir()
@@ -894,7 +944,7 @@ def run_locked_apply(
                 print("\n--in-place was specified.\nCreating and verifying a temporary backup before modifying the base...")
                 try:
                     existed = backup_in_place(base, backup, manifest["operations"])
-                    write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "prepared", existed))
+                    write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "prepared", existed, temporary_token=temporary_token))
                 except BaseException as exc:
                     raise RuntimeError(
                         "In-place recovery preparation failed before any patch changes were made. Recovery data was kept at:\n"
@@ -902,7 +952,7 @@ def run_locked_apply(
                     ) from exc
                 try:
                     verify_scanned_tree(base, base_files)
-                    write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "applying", existed))
+                    write_recovery_state(work, make_recovery_state("in_place", base, base, patch, manifest, "applying", existed, temporary_token=temporary_token))
                 except BaseException as exc:
                     raise RuntimeError(
                         "The base changed or recovery metadata could not be finalized after the in-place backup was created.\n"
@@ -912,7 +962,7 @@ def run_locked_apply(
                     ) from exc
 
                 try:
-                    apply_and_verify(base, archive, members, scratch, manifest)
+                    apply_and_verify(base, archive, members, scratch, manifest, temporary_token=temporary_token)
                     keep_work = False
                 except BaseException as patch_error:
                     if isinstance(patch_error, KeyboardInterrupt):
@@ -921,7 +971,7 @@ def run_locked_apply(
                         message = f"\nERROR: {patch_error}\nRolling back changes..."
                     print(message, file=sys.stderr)
                     try:
-                        restore_in_place(base, backup, manifest["operations"], existed, manifest["old_root_sha256"], manifest["old_file_count"])
+                        restore_in_place(base, backup, manifest["operations"], existed, manifest["old_root_sha256"], manifest["old_file_count"], temporary_token)
                     except BaseException as rollback_error:
                         raise RuntimeError(
                             "Rollback could not be completed. The persistent recovery backup was kept at:\n"
@@ -936,7 +986,7 @@ def run_locked_apply(
                 working_destination = separate_working_destination(destination, work)
                 if working_destination.exists():
                     raise RuntimeError(f"Temporary output path unexpectedly exists:\n{working_destination}")
-                write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "copying", working_destination=working_destination))
+                write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "copying", working_destination=working_destination, temporary_token=temporary_token))
                 keep_work = True
                 scratch = work / "payload"
                 scratch.mkdir()
@@ -956,10 +1006,10 @@ def run_locked_apply(
                             "The original base was not modified."
                         )
                     print(f'[Verified] Base "{manifest["base"]}" is valid.')
-                    check_temporary_paths(working_destination, manifest["operations"])
-                    write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "applying", working_destination=working_destination))
-                    apply_and_verify(working_destination, archive, members, scratch, manifest, copied_files)
-                    write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "publishing", working_destination=working_destination))
+                    check_temporary_paths(working_destination, manifest["operations"], temporary_token)
+                    write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "applying", working_destination=working_destination, temporary_token=temporary_token))
+                    apply_and_verify(working_destination, archive, members, scratch, manifest, copied_files, temporary_token=temporary_token)
+                    write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "publishing", working_destination=working_destination, temporary_token=temporary_token))
                     publish_output_directory(working_destination, destination)
                     keep_work = False
                 except BaseException:
@@ -989,12 +1039,13 @@ def _run_operation(args, argv: list[str]) -> int:
     if update_result is not None:
         return update_result
 
+    if not args.base.is_dir():
+        print(f"ERROR: Base directory does not exist: {args.base}", file=sys.stderr)
+        return 1
+    validate_installation_root_entry(args.base)
     base = args.base.resolve()
     patch = resolve_patch_path(args.patch)
 
-    if not base.is_dir():
-        print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
-        return 1
 
     if args.in_place:
         destination = base
