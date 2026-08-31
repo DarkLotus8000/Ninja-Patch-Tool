@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import re
@@ -23,6 +24,155 @@ ENTRY_SCRIPTS = {
     "make_patch.py": "Make Patch - Ninja Patch Tool",
     "apply_patch.py": "Apply Patch - Ninja Patch Tool",
 }
+
+RELEASE_MANIFEST_FILE = "data/release_manifest.json"
+RELEASE_MANIFEST_VERSION = 1
+PRESERVED_RELEASE_FILES = frozenset({"data/index.json", "data/update.json"})
+_OPERATION_ACTIVITY_SLOTS = 64
+
+class ActiveOperationError(RuntimeError):
+    pass
+
+def operation_activity_lock_path(install_dir: Path) -> Path:
+    return install_dir.resolve() / "data" / ".operation.lock"
+
+def _open_operation_activity_file(install_dir: Path):
+    path = operation_activity_lock_path(install_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file = path.open("a+b")
+    file.seek(0, 2)
+    size = file.tell()
+    if size < _OPERATION_ACTIVITY_SLOTS:
+        file.write(b"\0" * (_OPERATION_ACTIVITY_SLOTS - size))
+        file.flush()
+    return file
+
+def _try_lock_activity_range(file, offset: int, length: int) -> bool:
+    import msvcrt
+
+    file.seek(offset)
+    try:
+        msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, length)
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EDEADLK}:
+            return False
+        raise
+    return True
+
+def _unlock_activity_range(file, offset: int, length: int) -> None:
+    import msvcrt
+
+    file.seek(offset)
+    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, length)
+
+@contextmanager
+def operation_activity_lock(install_dir: Path | None = None):
+    # The updater needs an installation-wide exclusive gate, while normal NPT operations must still be allowed to run
+    # concurrently. Windows byte-range locks provide exactly that: every operation owns one byte and the updater locks
+    # the whole range. The OS releases these locks automatically if a process crashes or is forcibly terminated.
+    if sys.platform != "win32":
+        yield
+        return
+
+    root = TOOL_DIR if install_dir is None else install_dir
+    file = _open_operation_activity_file(root)
+    slot: int | None = None
+    try:
+        for candidate in range(_OPERATION_ACTIVITY_SLOTS):
+            if _try_lock_activity_range(file, candidate, 1):
+                slot = candidate
+                break
+        if slot is None:
+            raise RuntimeError(
+                "Ninja Patch Tool is currently being updated or too many operations are active. "
+                "Try again after the other activity finishes."
+            )
+        yield
+    finally:
+        if slot is not None:
+            try:
+                _unlock_activity_range(file, slot, 1)
+            except OSError:
+                pass
+        file.close()
+
+@contextmanager
+def exclusive_operation_activity_lock(install_dir: Path):
+    if sys.platform != "win32":
+        yield
+        return
+
+    file = _open_operation_activity_file(install_dir)
+    locked = False
+    try:
+        locked = _try_lock_activity_range(file, 0, _OPERATION_ACTIVITY_SLOTS)
+        if not locked:
+            raise ActiveOperationError("Another Ninja Patch Tool operation is active.")
+        yield
+    finally:
+        if locked:
+            try:
+                _unlock_activity_range(file, 0, _OPERATION_ACTIVITY_SLOTS)
+            except OSError:
+                pass
+        file.close()
+
+def windows_user_sid() -> str:
+    if sys.platform != "win32":
+        raise RuntimeError("Windows user identity is only available on Windows.")
+
+    import ctypes
+    from ctypes import wintypes
+
+    token_query = 0x0008
+    token_user = 1
+    error_insufficient_buffer = 122
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        size = wintypes.DWORD()
+        ctypes.set_last_error(0)
+        advapi32.GetTokenInformation(token, token_user, None, 0, ctypes.byref(size))
+        error = ctypes.get_last_error()
+        if size.value == 0 or error not in {0, error_insufficient_buffer}:
+            raise ctypes.WinError(error)
+        buffer = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(token, token_user, buffer, size.value, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        class SidAndAttributes(ctypes.Structure):
+            _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
+
+        token_user_data = ctypes.cast(buffer, ctypes.POINTER(SidAndAttributes)).contents
+        text = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(token_user_data.sid, ctypes.byref(text)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not text.value:
+                raise RuntimeError("Windows returned an empty user SID.")
+            return text.value
+        finally:
+            kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+    finally:
+        kernel32.CloseHandle(token)
 
 def get_tool_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -375,7 +525,11 @@ def operation_lock(kind: str, target: Path, description: str):
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel32.CloseHandle.restype = ctypes.c_int
 
-        handle = kernel32.CreateMutexW(None, False, f"Local\\DarkLotus.NinjaPatchTool.{safe_kind}.{digest}")
+        if sys.platform == "win32":
+            mutex_name = f"Global\\DarkLotus.NinjaPatchTool.operation.{windows_user_sid()}.{safe_kind}.{digest}"
+        else:
+            mutex_name = f"Local\\DarkLotus.NinjaPatchTool.{safe_kind}.{digest}"
+        handle = kernel32.CreateMutexW(None, False, mutex_name)
         if not handle:
             raise OSError(ctypes.get_last_error(), "Could not create the operation mutex.")
         wait_result = kernel32.WaitForSingleObject(handle, 0)

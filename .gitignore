@@ -11,6 +11,9 @@ __pycache__/
 # Tool working directory
 temp/
 
+# Runtime update/operation coordination
+data/.operation.lock
+
 # Release build working directory
 release_temp/
 

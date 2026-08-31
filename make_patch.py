@@ -26,6 +26,7 @@ from common import (
     is_within,
     load_index,
     make_work_dir,
+    operation_activity_lock,
     operation_lock,
     parse_json,
     process_identity,
@@ -322,35 +323,7 @@ def create_patch_archive(work: Path, output: Path, compression: str, full_file_s
         temporary.unlink(missing_ok=True)
         raise
 
-def main() -> int:
-    install_termination_handlers()
-    argv = sys.argv[1:]
-    early_update_result = handle_early_update_request(argv)
-    if early_update_result is not None:
-        return early_update_result
-    parser = ErrorArgumentParser(description="Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.")
-    parser.add_argument("base", type=Path, help="Clean indexed Steam manifest base")
-    parser.add_argument("new", type=Path, help="Newer installation")
-    parser.add_argument(
-        "output",
-        type=Path,
-        help="Patch filename or output path; .patch is appended automatically. A bare filename is saved in the tool's output folder.",
-    )
-    parser.add_argument("base_name", help="Base name from data/index.json, for example U43.5.1")
-    parser.add_argument(
-        "-c",
-        "--compression",
-        metavar="PRESET",
-        choices=COMPRESSION_PRESETS,
-        default="normal",
-        action=SingleUseStoreAction,
-        help="Compression preset (default: normal): normal, high, higher, maximum",
-    )
-    add_update_arguments(parser)
-    parser.add_version_argument()
-    parser.add_help_argument()
-    args = parser.parse_args(argv)
-
+def _run_operation(args, argv: list[str]) -> int:
     update_result = handle_automatic_update(args, argv)
     if update_result is not None:
         return update_result
@@ -573,6 +546,46 @@ def main() -> int:
         if work is not None:
             cleanup_work_dir(work)
         locks.close()
+
+
+def main() -> int:
+    install_termination_handlers()
+    argv = sys.argv[1:]
+    early_update_result = handle_early_update_request(argv)
+    if early_update_result is not None:
+        return early_update_result
+    parser = ErrorArgumentParser(description="Create one self-contained Ninja Patch (Diff Patch) from a clean indexed Steam manifest base.")
+    parser.add_argument("base", type=Path, help="Clean indexed Steam manifest base")
+    parser.add_argument("new", type=Path, help="Newer installation")
+    parser.add_argument(
+        "output",
+        type=Path,
+        help="Patch filename or output path; .patch is appended automatically. A bare filename is saved in the tool's output folder.",
+    )
+    parser.add_argument("base_name", help="Base name from data/index.json, for example U43.5.1")
+    parser.add_argument(
+        "-c",
+        "--compression",
+        metavar="PRESET",
+        choices=COMPRESSION_PRESETS,
+        default="normal",
+        action=SingleUseStoreAction,
+        help="Compression preset (default: normal): normal, high, higher, maximum",
+    )
+    add_update_arguments(parser)
+    parser.add_version_argument()
+    parser.add_help_argument()
+    args = parser.parse_args(argv)
+
+    try:
+        with operation_activity_lock():
+            return _run_operation(args, argv)
+    except KeyboardInterrupt:
+        print("\nPatch creation cancelled.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
 if __name__ == "__main__":
     with console_title(ENTRY_SCRIPTS["make_patch.py"]):

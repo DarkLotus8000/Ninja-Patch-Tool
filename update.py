@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Any
 
 from common import (
+    ActiveOperationError,
     DATA_DIR,
+    PRESERVED_RELEASE_FILES,
+    RELEASE_MANIFEST_FILE,
+    RELEASE_MANIFEST_VERSION,
     TEMP_ROOT,
     TOOL_DIR,
     VERSION,
@@ -27,6 +31,7 @@ from common import (
     SingleUseStoreTrueAction,
     cleanup_temp_root_if_empty,
     compare_versions,
+    exclusive_operation_activity_lock,
     format_bytes,
     is_sha256,
     natural_sort_key,
@@ -37,6 +42,7 @@ from common import (
     relative_path_parts,
     sha256_file,
     validate_index,
+    windows_user_sid,
 )
 
 UPDATE_CONFIG_FILE = DATA_DIR / "update.json"
@@ -362,6 +368,72 @@ def _safe_archive_parts(name: str) -> tuple[str, ...]:
     except ValueError as exc:
         raise RuntimeError(f"Unsafe update archive path: {name!r}") from exc
 
+def _parse_release_manifest(path: Path) -> tuple[str, dict[str, str]]:
+    try:
+        value = parse_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Release manifest is invalid: {exc}") from exc
+    if not isinstance(value, dict) or value.get("format_version") != RELEASE_MANIFEST_VERSION:
+        raise RuntimeError("Release manifest has an unsupported format version.")
+    application_version = value.get("application_version")
+    files = value.get("files")
+    if not isinstance(application_version, str) or not application_version:
+        raise RuntimeError("Release manifest has an invalid application version.")
+    if not isinstance(files, dict):
+        raise RuntimeError("Release manifest files must be a JSON object.")
+
+    seen: set[str] = set()
+    normalized: dict[str, str] = {}
+    for name, digest in files.items():
+        if not isinstance(name, str) or not isinstance(digest, str):
+            raise RuntimeError("Release manifest contains invalid file metadata.")
+        try:
+            parts = relative_path_parts(name)
+        except ValueError as exc:
+            raise RuntimeError(f"Release manifest contains an unsafe path: {name!r}") from exc
+        canonical = "/".join(parts)
+        folded = canonical.casefold()
+        if canonical != name or name in PRESERVED_RELEASE_FILES or name == RELEASE_MANIFEST_FILE:
+            raise RuntimeError(f"Release manifest contains an invalid managed path: {name!r}")
+        if folded in seen:
+            raise RuntimeError(f"Release manifest contains a duplicate managed path: {name!r}")
+        if not is_sha256(digest):
+            raise RuntimeError(f"Release manifest contains an invalid SHA-256 for {name!r}.")
+        seen.add(folded)
+        normalized[name] = digest.lower()
+    return application_version, normalized
+
+def _validate_staged_release_manifest(stage: Path, release_version: str) -> dict[str, str]:
+    application_version, files = _parse_release_manifest(stage / RELEASE_MANIFEST_FILE)
+    if application_version != release_version:
+        raise RuntimeError("Release manifest application version does not match the downloaded release.")
+
+    actual: set[str] = set()
+    for path in stage.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(stage).as_posix()
+        if relative == RELEASE_MANIFEST_FILE or relative in PRESERVED_RELEASE_FILES:
+            continue
+        actual.add(relative)
+    if actual != set(files):
+        raise RuntimeError("Release manifest does not match the downloaded release files.")
+
+    for name, expected in files.items():
+        target = stage.joinpath(*name.split("/"))
+        if sha256_file(target).lower() != expected:
+            raise RuntimeError(f"Release manifest SHA-256 does not match {name!r}.")
+    return files
+
+def _load_installed_release_manifest(install_dir: Path) -> dict[str, str] | None:
+    try:
+        _, files = _parse_release_manifest(install_dir / RELEASE_MANIFEST_FILE)
+        return files
+    except (OSError, RuntimeError):
+        # Older releases have no manifest. A missing, damaged, or locally edited manifest must never make the updater
+        # delete files speculatively, so obsolete-file cleanup is simply skipped for that upgrade.
+        return None
+
 def extract_release_archive(archive_path: Path, destination: Path, release_version: str) -> Path:
     expected_root = f"NinjaPatchTool-v{release_version}"
     seen: set[str] = set()
@@ -410,6 +482,7 @@ def extract_release_archive(archive_path: Path, destination: Path, release_versi
         "make_patch.exe",
         "apply_patch.exe",
         "README.txt",
+        RELEASE_MANIFEST_FILE,
         "data/index.json",
         "data/update.json",
         "data/hdiffz.exe",
@@ -429,6 +502,7 @@ def extract_release_archive(archive_path: Path, destination: Path, release_versi
     licenses = destination / "data" / "licenses"
     if not licenses.is_dir() or not any(path.is_file() for path in licenses.iterdir()):
         raise RuntimeError("Downloaded release does not contain its license files.")
+    _validate_staged_release_manifest(destination, release_version)
     return destination
 
 def download_release(release: dict[str, Any], work: Path) -> Path:
@@ -676,6 +750,7 @@ def updater_install_lock(install_dir: Path, timeout_seconds: int = 120):
 
     resolved = str(install_dir.resolve()).casefold()
     digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()
+    name = f"Global\\DarkLotus.NinjaPatchTool.updater.{windows_user_sid()}.{digest}"
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
     kernel32.CreateMutexW.restype = ctypes.c_void_p
@@ -686,14 +761,14 @@ def updater_install_lock(install_dir: Path, timeout_seconds: int = 120):
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
 
-    handle = kernel32.CreateMutexW(None, False, f"Local\\DarkLotus.NinjaPatchTool.updater.{digest}")
+    handle = kernel32.CreateMutexW(None, False, name)
     if not handle:
         raise OSError(ctypes.get_last_error(), "Could not create the updater installation mutex.")
     try:
         result = kernel32.WaitForSingleObject(handle, timeout_seconds * 1000)
-        if result == 0x102:  # WAIT_TIMEOUT
+        if result == 0x102:
             raise RuntimeError("Timed out waiting for another Ninja Patch Tool update to finish.")
-        if result not in {0, 0x80}:  # WAIT_OBJECT_0 / WAIT_ABANDONED
+        if result not in {0, 0x80}:
             raise OSError(ctypes.get_last_error(), "Could not acquire the updater installation mutex.")
         try:
             yield
@@ -814,6 +889,10 @@ def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[t
     if not install_dir.is_dir():
         raise RuntimeError(f"Ninja Patch Tool directory does not exist: {install_dir}")
 
+    staged_version, _ = _parse_release_manifest(stage / RELEASE_MANIFEST_FILE)
+    new_managed_files = _validate_staged_release_manifest(stage, staged_version)
+    old_managed_files = _load_installed_release_manifest(install_dir)
+
     backup = stage.parent / f"backup_{uuid.uuid4().hex}"
     backup.mkdir()
     changes: list[tuple[Path, Path | None]] = []
@@ -828,6 +907,29 @@ def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[t
         _copy_item(source, destination)
 
     try:
+        if old_managed_files is not None:
+            new_folded = {name.casefold() for name in new_managed_files}
+            obsolete = sorted(
+                (name for name in old_managed_files if name.casefold() not in new_folded),
+                key=str.casefold,
+            )
+            for relative_name in obsolete:
+                destination = install_dir.joinpath(*relative_name.split("/"))
+                if destination.is_symlink() or not destination.is_file():
+                    continue
+                try:
+                    current_digest = sha256_file(destination).lower()
+                except OSError:
+                    continue
+                if current_digest != old_managed_files[relative_name]:
+                    # Preserve locally modified old release files. Only unchanged files that the previous release itself
+                    # owned are safe to remove automatically.
+                    continue
+                saved = backup.joinpath(*relative_name.split("/"))
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(destination), str(saved))
+                changes.append((destination, saved))
+
         for source in sorted(stage.iterdir(), key=lambda path: path.name.casefold()):
             if source.name.casefold() != "data":
                 replace(source, install_dir / source.name, Path(source.name))
@@ -835,17 +937,28 @@ def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[t
 
             destination_data = install_dir / "data"
             destination_data.mkdir(parents=True, exist_ok=True)
-            for data_source in sorted(source.iterdir(), key=lambda path: path.name.casefold()):
-                data_destination = destination_data / data_source.name
-                data_name = data_source.name.casefold()
-                if data_name == "update.json" and data_destination.exists():
+            if old_managed_files is None and (source / "licenses").is_dir():
+                # Pre-manifest releases treated the bundled licenses as one managed directory. Preserve the old
+                # replacement behavior for this one upgrade so stale dependency licenses do not linger forever.
+                replace(source / "licenses", destination_data / "licenses", Path("data") / "licenses")
+
+            for data_source in sorted(source.rglob("*"), key=lambda path: path.as_posix().casefold()):
+                if not data_source.is_file():
                     continue
-                if data_name == "index.json" and data_destination.exists():
+                relative_in_data = data_source.relative_to(source)
+                if old_managed_files is None and relative_in_data.parts[:1] == ("licenses",):
+                    continue
+                relative = Path("data") / relative_in_data
+                data_destination = install_dir / relative
+                relative_text = relative.as_posix().casefold()
+                if relative_text == "data/update.json" and data_destination.exists():
+                    continue
+                if relative_text == "data/index.json" and data_destination.exists():
                     merged_index = backup / "merged_index.json"
                     _write_merged_index(data_source, data_destination, merged_index)
-                    replace(merged_index, data_destination, Path("data") / data_source.name)
+                    replace(merged_index, data_destination, relative)
                     continue
-                replace(data_source, data_destination, Path("data") / data_source.name)
+                replace(data_source, data_destination, relative)
     except BaseException as install_error:
         try:
             rollback_staged_release(changes, backup)
@@ -940,44 +1053,85 @@ def run_update_installer(argv: list[str] | None = None) -> int:
         write_update_session(work)
         wait_for_process_exit(args.parent_pid)
         with updater_install_lock(install_dir):
-            # Another updater may have completed while this updater was waiting for the installation mutex. Never let
-            # an older queued updater replace a version that is equal to or newer than its own target.
-            installed_version = installed_executable_satisfies_target(executable, args.target_version, install_dir)
-            if installed_version is not None:
-                relaunch(executable, relaunch_args, relaunch_cwd, work)
-                if compare_versions(installed_version, args.target_version) > 0:
-                    print(f'[Update] Ninja Patch Tool v{installed_version} is already installed; skipping queued update to v{args.target_version}.')
-                else:
-                    print(f"[Update] Ninja Patch Tool v{args.target_version} was already installed by another updater.")
-                return 0
-
             try:
-                transaction = install_staged_release(stage, install_dir)
-                validate_installed_executable(executable, args.target_version, install_dir)
-                relaunch(executable, relaunch_args, relaunch_cwd, work)
-            except Exception as exc:
-                if transaction is not None:
-                    backup, changes = transaction
-                    try:
-                        rollback_staged_release(changes, backup)
-                    except Exception as rollback_error:
-                        print(f'ERROR: Ninja Patch Tool update failed and rollback was incomplete: {rollback_error}', file=sys.stderr)
-                        return 1
-                elif _update_work_has_backup(work):
-                    print(f'ERROR: Ninja Patch Tool update failed and rollback was incomplete; recovery data was retained: {exc}', file=sys.stderr)
-                    return 1
+                with exclusive_operation_activity_lock(install_dir):
+                    # Another updater may have completed while this updater was waiting for the installation mutex.
+                    # Never let an older queued updater replace an equal or newer installation.
+                    installed_version = installed_executable_satisfies_target(
+                        executable, args.target_version, install_dir
+                    )
+                    if installed_version is not None:
+                        relaunch(executable, relaunch_args, relaunch_cwd, work)
+                        if compare_versions(installed_version, args.target_version) > 0:
+                            print(
+                                f'[Update] Ninja Patch Tool v{installed_version} is already installed; '
+                                f'skipping queued update to v{args.target_version}.'
+                            )
+                        else:
+                            print(
+                                f"[Update] Ninja Patch Tool v{args.target_version} was already installed by another updater."
+                            )
+                        return 0
 
-                print(f'ERROR: Ninja Patch Tool update failed; the previous installation was restored when possible: {exc}', file=sys.stderr)
+                    try:
+                        staged_version, _ = _parse_release_manifest(stage / RELEASE_MANIFEST_FILE)
+                        if staged_version != args.target_version:
+                            raise RuntimeError(
+                                "Staged release manifest version does not match the requested update version."
+                            )
+                        transaction = install_staged_release(stage, install_dir)
+                        validate_installed_executable(executable, args.target_version, install_dir)
+                        relaunch(executable, relaunch_args, relaunch_cwd, work)
+                    except Exception as exc:
+                        if transaction is not None:
+                            backup, changes = transaction
+                            try:
+                                rollback_staged_release(changes, backup)
+                            except Exception as rollback_error:
+                                print(
+                                    f"ERROR: Ninja Patch Tool update failed and rollback was incomplete: {rollback_error}",
+                                    file=sys.stderr,
+                                )
+                                return 1
+                        elif _update_work_has_backup(work):
+                            print(
+                                f"ERROR: Ninja Patch Tool update failed and rollback was incomplete; "
+                                f"recovery data was retained: {exc}",
+                                file=sys.stderr,
+                            )
+                            return 1
+
+                        print(
+                            f"ERROR: Ninja Patch Tool update failed; the previous installation was restored when possible: {exc}",
+                            file=sys.stderr,
+                        )
+                        try:
+                            relaunch(executable, relaunch_args, relaunch_cwd, work)
+                        except Exception as relaunch_error:
+                            print(
+                                f"ERROR: Could not restart Ninja Patch Tool after the failed update: {relaunch_error}",
+                                file=sys.stderr,
+                            )
+                        return 1
+
+                    backup, _ = transaction
+                    shutil.rmtree(backup, ignore_errors=True)
+                    print(f"[Update] Ninja Patch Tool updated successfully to v{args.target_version}.")
+                    return 0
+            except ActiveOperationError:
+                print(
+                    "[Update] Installation deferred because another Ninja Patch Tool operation is active. "
+                    "The requested command will continue on the current version; the update will be checked again next run."
+                )
                 try:
                     relaunch(executable, relaunch_args, relaunch_cwd, work)
                 except Exception as relaunch_error:
-                    print(f"ERROR: Could not restart Ninja Patch Tool after the failed update: {relaunch_error}", file=sys.stderr)
-                return 1
-
-            backup, _ = transaction
-            shutil.rmtree(backup, ignore_errors=True)
-            print(f"[Update] Ninja Patch Tool updated successfully to v{args.target_version}.")
-            return 0
+                    print(
+                        f"ERROR: Could not restart Ninja Patch Tool after deferring the update: {relaunch_error}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                return 0
     except Exception as exc:
         print(f"ERROR: Ninja Patch Tool updater could not start the installation: {exc}", file=sys.stderr)
         if not _update_work_has_backup(work):

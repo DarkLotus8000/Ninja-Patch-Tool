@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import os
 import re
 import shutil
@@ -12,7 +13,18 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from common import ENTRY_SCRIPTS, VERSION, format_bytes, operation_lock, parse_json, sha256_file, validate_index
+from common import (
+    ENTRY_SCRIPTS,
+    PRESERVED_RELEASE_FILES,
+    RELEASE_MANIFEST_FILE,
+    RELEASE_MANIFEST_VERSION,
+    VERSION,
+    format_bytes,
+    operation_lock,
+    parse_json,
+    sha256_file,
+    validate_index,
+)
 
 COMPANY_NAME = "DarkLotus"
 ROOT = Path(__file__).resolve().parent
@@ -292,7 +304,13 @@ def run_source_tests() -> None:
     print("[Testing] Source test suite")
     try:
         result = subprocess.run(
-            [sys.executable, "-W", "error::DeprecationWarning", "-m", "unittest", "discover", "-s", "tests"],
+            [
+                sys.executable,
+                "-W", "error::DeprecationWarning",
+                "-W", "error::RuntimeWarning",
+                "-W", "error::ResourceWarning",
+                "-m", "unittest", "discover", "-s", "tests",
+            ],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -374,6 +392,47 @@ def populate_release(stage: Path, dist: Path, project_licenses: list[Path]) -> N
     readme = create_release_readme((ROOT / "README.md").read_text(encoding="utf-8"))
     (stage / "README.txt").write_text(readme, encoding="utf-8", newline="\r\n")
 
+def release_managed_file_hashes(stage: Path) -> dict[str, str]:
+    files: dict[str, str] = {}
+    for path in sorted(stage.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(stage).as_posix()
+        if relative == RELEASE_MANIFEST_FILE or relative in PRESERVED_RELEASE_FILES:
+            continue
+        files[relative] = sha256_file(path)
+    return files
+
+def write_release_manifest(stage: Path) -> None:
+    manifest = {
+        "format_version": RELEASE_MANIFEST_VERSION,
+        "application_version": VERSION,
+        "files": release_managed_file_hashes(stage),
+    }
+    path = stage / RELEASE_MANIFEST_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+def validate_release_manifest(stage: Path) -> None:
+    path = stage / RELEASE_MANIFEST_FILE
+    try:
+        value = parse_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Release manifest is invalid: {exc}") from exc
+    if not isinstance(value, dict) or value.get("format_version") != RELEASE_MANIFEST_VERSION:
+        raise RuntimeError("Release manifest has an unsupported format version.")
+    if value.get("application_version") != VERSION:
+        raise RuntimeError("Release manifest application version does not match the build version.")
+    files = value.get("files")
+    if not isinstance(files, dict) or any(not isinstance(name, str) or not isinstance(digest, str) for name, digest in files.items()):
+        raise RuntimeError("Release manifest contains invalid file metadata.")
+    if files != release_managed_file_hashes(stage):
+        raise RuntimeError("Release manifest does not match the staged release files.")
+
 def publish_without_overwrite(temporary: Path, output: Path) -> None:
     try:
         temporary.rename(output)
@@ -413,6 +472,7 @@ def create_release_checksum(archive: Path) -> tuple[Path, str]:
     return checksum, digest
 
 def create_release_outputs(stage: Path) -> tuple[Path, Path, str]:
+    validate_release_manifest(stage)
     archive = create_release_archive(stage)
     try:
         checksum, digest = create_release_checksum(archive)
@@ -445,6 +505,7 @@ def main() -> int:
                         build_executable(ROOT / script, dist, work, specs)
                     smoke_test_executables(dist)
                     populate_release(stage, dist, project_licenses)
+                    write_release_manifest(stage)
                     archive, checksum, digest = create_release_outputs(stage)
             finally:
                 try:

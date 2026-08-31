@@ -1,15 +1,18 @@
 # Run from the project root with: py -m unittest discover -s tests
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -28,6 +31,49 @@ import verify_base
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+def add_release_manifest(files: dict[str, bytes], version: str) -> None:
+    managed = {
+        name: sha256_bytes(payload)
+        for name, payload in files.items()
+        if name not in common.PRESERVED_RELEASE_FILES and name != common.RELEASE_MANIFEST_FILE
+    }
+    files[common.RELEASE_MANIFEST_FILE] = (
+        json.dumps(
+            {
+                "format_version": common.RELEASE_MANIFEST_VERSION,
+                "application_version": version,
+                "files": managed,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+def write_stage_release_manifest(stage: Path, version: str = common.VERSION) -> None:
+    files: dict[str, str] = {}
+    for path in stage.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(stage).as_posix()
+        if relative == common.RELEASE_MANIFEST_FILE or relative in common.PRESERVED_RELEASE_FILES:
+            continue
+        files[relative] = common.sha256_file(path)
+    (stage / common.RELEASE_MANIFEST_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (stage / common.RELEASE_MANIFEST_FILE).write_text(
+        json.dumps(
+            {
+                "format_version": common.RELEASE_MANIFEST_VERSION,
+                "application_version": version,
+                "files": files,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 def make_warframe_root(root: Path) -> None:
     (root / "Cache.Windows").mkdir(parents=True, exist_ok=True)
@@ -102,6 +148,101 @@ class CommonTests(unittest.TestCase):
             self.assertFalse(common.process_matches_identity(123, "123:old"))
             self.assertTrue(common.process_matches_identity(123, "123:new"))
             self.assertTrue(common.process_matches_identity(123, None))
+
+    def test_operation_activity_gate_allows_parallel_operations_but_blocks_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            held: list[tuple[int, int, int]] = []
+            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2)
+
+            def locking(fd: int, mode: int, length: int) -> None:
+                offset = os.lseek(fd, 0, os.SEEK_CUR)
+                if mode == fake_msvcrt.LK_NBLCK:
+                    end = offset + length
+                    if any(not (end <= start or offset >= stop) for _, start, stop in held):
+                        raise OSError(errno.EACCES, "locked")
+                    held.append((fd, offset, end))
+                    return
+                for index, item in enumerate(held):
+                    if item == (fd, offset, offset + length):
+                        held.pop(index)
+                        return
+                raise OSError(errno.EINVAL, "unlock of unowned range")
+
+            fake_msvcrt.locking = locking
+            with mock.patch.object(common.sys, "platform", "win32"), mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}):
+                with common.operation_activity_lock(root):
+                    with common.operation_activity_lock(root):
+                        with self.assertRaisesRegex(common.ActiveOperationError, "operation is active"):
+                            with common.exclusive_operation_activity_lock(root):
+                                pass
+                with common.exclusive_operation_activity_lock(root):
+                    with self.assertRaisesRegex(RuntimeError, "currently being updated"):
+                        with common.operation_activity_lock(root):
+                            pass
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows file-lock test")
+    def test_operation_activity_gate_blocks_update_across_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            code = (
+                "import sys, time\n"
+                "from pathlib import Path\n"
+                "import common\n"
+                "with common.operation_activity_lock(Path(sys.argv[1])):\n"
+                "    print('ready', flush=True)\n"
+                "    time.sleep(30)\n"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", code, str(root)],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "ready")
+                with self.assertRaisesRegex(common.ActiveOperationError, "operation is active"):
+                    with common.exclusive_operation_activity_lock(root):
+                        pass
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+            with common.exclusive_operation_activity_lock(root):
+                pass
+
+    def test_all_entrypoints_hold_activity_gate_before_automatic_update(self) -> None:
+        cases = (
+            (add_base, ["add_base.py", "base", "U1", "1"]),
+            (verify_base, ["verify_base.py", "base", "U1"]),
+            (make_patch, ["make_patch.py", "base", "new", "out", "U1"]),
+            (apply_patch, ["apply_patch.py", "base", "patch"]),
+        )
+        for module, argv in cases:
+            with self.subTest(module=module.__name__):
+                events: list[str] = []
+
+                @contextmanager
+                def activity():
+                    events.append("activity-enter")
+                    try:
+                        yield
+                    finally:
+                        events.append("activity-exit")
+
+                def automatic(*args, **kwargs):
+                    events.append("update")
+                    return 0
+
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(module, "install_termination_handlers"),
+                    mock.patch.object(module, "handle_early_update_request", return_value=None),
+                    mock.patch.object(module, "operation_activity_lock", side_effect=activity),
+                    mock.patch.object(module, "handle_automatic_update", side_effect=automatic),
+                ):
+                    self.assertEqual(module.main(), 0)
+                self.assertEqual(events, ["activity-enter", "update", "activity-exit"])
 
     def test_version_argument_supports_short_and_long_forms(self) -> None:
         for option in ("-v", "--version"):
@@ -281,6 +422,27 @@ This should not be included.
                 {"auto_update": True},
             )
 
+    def test_release_manifest_tracks_managed_files_but_not_mutable_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp) / "stage"
+            (stage / "data").mkdir(parents=True)
+            (stage / "make_patch.exe").write_bytes(b"exe")
+            (stage / "data" / "index.json").write_text("{}", encoding="utf-8")
+            (stage / "data" / "update.json").write_text('{"auto_update": true}', encoding="utf-8")
+            (stage / "data" / "hdiffz.exe").write_bytes(b"hdiff")
+
+            build_release.write_release_manifest(stage)
+            build_release.validate_release_manifest(stage)
+            self.assertTrue((stage / "data" / "release_manifest.json").is_file())
+            self.assertFalse((stage / "release_manifest.json").exists())
+            manifest = json.loads((stage / common.RELEASE_MANIFEST_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["application_version"], common.VERSION)
+            self.assertEqual(
+                set(manifest["files"]),
+                {"make_patch.exe", "data/hdiffz.exe"},
+            )
+            self.assertEqual(manifest["files"]["make_patch.exe"], sha256_bytes(b"exe"))
+
     def test_release_preflight_validates_x64_pe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "tool.exe"
@@ -330,12 +492,15 @@ This should not be included.
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "release.zip"
             archive.write_bytes(b"release")
+            stage = Path(tmp) / "stage"
+            stage.mkdir()
+            build_release.write_release_manifest(stage)
             with (
                 mock.patch.object(build_release, "create_release_archive", return_value=archive),
                 mock.patch.object(build_release, "create_release_checksum", side_effect=RuntimeError("checksum failed")),
             ):
                 with self.assertRaisesRegex(RuntimeError, "checksum failed"):
-                    build_release.create_release_outputs(Path(tmp) / "stage")
+                    build_release.create_release_outputs(stage)
             self.assertFalse(archive.exists())
 
     def test_pyinstaller_minimum_version_for_python_314(self) -> None:
@@ -395,8 +560,11 @@ This should not be included.
         with mock.patch.object(build_release.subprocess, "run", return_value=result) as run:
             build_release.run_source_tests()
         command = run.call_args.args[0]
-        self.assertEqual(command[:3], [sys.executable, "-W", "error::DeprecationWarning"])
-        self.assertEqual(command[3:], ["-m", "unittest", "discover", "-s", "tests"])
+        self.assertEqual(command[0], sys.executable)
+        self.assertIn("error::DeprecationWarning", command)
+        self.assertIn("error::RuntimeWarning", command)
+        self.assertIn("error::ResourceWarning", command)
+        self.assertEqual(command[-5:], ["-m", "unittest", "discover", "-s", "tests"])
 
     def test_release_builder_stops_when_source_tests_fail(self) -> None:
         result = SimpleNamespace(returncode=1, stdout="failure", stderr="")
@@ -1022,12 +1190,38 @@ This should not be included.
                 "data/hpatchz.exe": b"exe",
                 "data/licenses/LICENSE": b"license",
             }
+            add_release_manifest(files, "1.5")
             with zipfile.ZipFile(archive_path, "w") as archive:
                 for name, payload in files.items():
                     archive.writestr(f"{release_root}/{name}", payload)
             stage = update.extract_release_archive(archive_path, root / "stage", "1.5")
             self.assertEqual((stage / "README.txt").read_bytes(), b"readme")
             self.assertTrue((stage / "data" / "licenses" / "LICENSE").is_file())
+
+    def test_update_archive_rejects_release_manifest_hash_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "release.zip"
+            release_root = "NinjaPatchTool-v1.5"
+            files = {
+                "add_base.exe": b"exe",
+                "verify_base.exe": b"exe",
+                "make_patch.exe": b"exe",
+                "apply_patch.exe": b"exe",
+                "README.txt": b"readme",
+                "data/index.json": b"{}",
+                "data/update.json": b'{"auto_update": true}',
+                "data/hdiffz.exe": b"exe",
+                "data/hpatchz.exe": b"exe",
+                "data/licenses/LICENSE": b"license",
+            }
+            add_release_manifest(files, "1.5")
+            files["make_patch.exe"] = b"tampered"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for name, payload in files.items():
+                    archive.writestr(f"{release_root}/{name}", payload)
+            with self.assertRaisesRegex(RuntimeError, "SHA-256 does not match"):
+                update.extract_release_archive(archive_path, root / "stage", "1.5")
 
     def test_update_archive_rejects_invalid_index_schema_before_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1046,6 +1240,7 @@ This should not be included.
                 "data/hpatchz.exe": b"exe",
                 "data/licenses/LICENSE": b"license",
             }
+            add_release_manifest(files, "1.5")
             with zipfile.ZipFile(archive_path, "w") as archive:
                 for name, payload in files.items():
                     archive.writestr(f"{release_root}/{name}", payload)
@@ -1097,6 +1292,7 @@ This should not be included.
             (install / "data" / "licenses" / "old.txt").write_text("old", encoding="utf-8")
             (stage / "data" / "licenses" / "new.txt").write_text("new", encoding="utf-8")
             (stage / "data" / "hdiffz.exe").write_bytes(b"new hdiff")
+            write_stage_release_manifest(stage)
 
             backup, _ = update.install_staged_release(stage, install)
             self.assertTrue(backup.is_dir())
@@ -1125,6 +1321,7 @@ This should not be included.
             }
             (install / "data" / "index.json").write_text(json.dumps(installed_index), encoding="utf-8")
             (stage / "data" / "index.json").write_text(json.dumps(release_index), encoding="utf-8")
+            write_stage_release_manifest(stage)
 
             update.install_staged_release(stage, install)
             merged = json.loads((install / "data" / "index.json").read_text(encoding="utf-8"))
@@ -1143,6 +1340,7 @@ This should not be included.
             (install / "b.exe").write_bytes(b"old b")
             (stage / "a.exe").write_bytes(b"new a")
             (stage / "b.exe").write_bytes(b"new b")
+            write_stage_release_manifest(stage)
             original_copy = update._copy_item
 
             def fail_on_b(source: Path, destination: Path) -> None:
@@ -1155,6 +1353,50 @@ This should not be included.
                     update.install_staged_release(stage, install)
             self.assertEqual((install / "a.exe").read_bytes(), b"old a")
             self.assertEqual((install / "b.exe").read_bytes(), b"old b")
+
+    def test_release_manifest_removes_only_unchanged_obsolete_release_files_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            install.mkdir(parents=True)
+            stage.mkdir(parents=True)
+
+            unchanged = install / "obsolete.exe"
+            modified = install / "modified.exe"
+            unowned = install / "user-file.txt"
+            unchanged.write_bytes(b"old unchanged")
+            modified.write_bytes(b"locally modified")
+            unowned.write_bytes(b"user")
+            old_manifest = {
+                "format_version": common.RELEASE_MANIFEST_VERSION,
+                "application_version": "1.4.4",
+                "files": {
+                    "obsolete.exe": sha256_bytes(b"old unchanged"),
+                    "modified.exe": sha256_bytes(b"original release bytes"),
+                },
+            }
+            (install / common.RELEASE_MANIFEST_FILE).parent.mkdir(parents=True, exist_ok=True)
+            (install / common.RELEASE_MANIFEST_FILE).write_text(json.dumps(old_manifest), encoding="utf-8")
+
+            (stage / "new.exe").write_bytes(b"new")
+            write_stage_release_manifest(stage, "1.4.5")
+            backup, changes = update.install_staged_release(stage, install)
+
+            self.assertFalse(unchanged.exists())
+            self.assertEqual(modified.read_bytes(), b"locally modified")
+            self.assertEqual(unowned.read_bytes(), b"user")
+            self.assertEqual((install / "new.exe").read_bytes(), b"new")
+
+            update.rollback_staged_release(changes, backup)
+            self.assertEqual(unchanged.read_bytes(), b"old unchanged")
+            self.assertEqual(modified.read_bytes(), b"locally modified")
+            self.assertEqual(unowned.read_bytes(), b"user")
+            self.assertFalse((install / "new.exe").exists())
+            self.assertEqual(
+                json.loads((install / common.RELEASE_MANIFEST_FILE).read_text(encoding="utf-8")),
+                old_manifest,
+            )
 
     def test_updater_preserves_work_when_install_rollback_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1171,7 +1413,9 @@ This should not be included.
                 mock.patch.object(update, "write_update_session"),
                 mock.patch.object(update, "wait_for_process_exit"),
                 mock.patch.object(update, "updater_install_lock", return_value=nullcontext()),
+                mock.patch.object(update, "exclusive_operation_activity_lock", return_value=nullcontext()),
                 mock.patch.object(update, "installed_executable_satisfies_target", return_value=None),
+                mock.patch.object(update, "_parse_release_manifest", return_value=("1.5.0", {})),
                 mock.patch.object(update, "install_staged_release", side_effect=RuntimeError("rollback incomplete")),
                 mock.patch.object(update, "relaunch") as relaunch,
             ):
@@ -1196,11 +1440,49 @@ This should not be included.
             stage.mkdir(parents=True)
             (install / "make_patch.exe").write_bytes(b"old")
             (stage / "make_patch.exe").write_bytes(b"new")
+            write_stage_release_manifest(stage)
 
             backup, changes = update.install_staged_release(stage, install)
             self.assertEqual((install / "make_patch.exe").read_bytes(), b"new")
             update.rollback_staged_release(changes, backup)
             self.assertEqual((install / "make_patch.exe").read_bytes(), b"old")
+
+    def test_updater_defers_when_another_operation_is_active_and_relaunches_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            install.mkdir(parents=True)
+            stage.mkdir(parents=True)
+            executable = install / "make_patch.exe"
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update, "write_update_session"),
+                mock.patch.object(update, "wait_for_process_exit"),
+                mock.patch.object(update, "updater_install_lock", return_value=nullcontext()),
+                mock.patch.object(
+                    update,
+                    "exclusive_operation_activity_lock",
+                    side_effect=common.ActiveOperationError("active"),
+                ),
+                mock.patch.object(update, "install_staged_release") as install_release,
+                mock.patch.object(update, "relaunch") as relaunch,
+                mock.patch("sys.stdout", stdout),
+            ):
+                result = update.run_update_installer([
+                    "--install-dir", str(install),
+                    "--stage-dir", str(stage),
+                    "--parent-pid", "123",
+                    "--target-version", "1.5.0",
+                    "--relaunch-executable", str(executable),
+                    "--relaunch-cwd", str(root),
+                    "--", "base", "patch",
+                ])
+            self.assertEqual(result, 0)
+            install_release.assert_not_called()
+            relaunch.assert_called_once_with(executable.resolve(), ["base", "patch"], root.resolve(), stage.parent)
+            self.assertIn("Installation deferred", stdout.getvalue())
 
     def test_updater_install_lock_times_out_instead_of_waiting_forever(self) -> None:
         import ctypes
@@ -1211,7 +1493,10 @@ This should not be included.
             ReleaseMutex=mock.MagicMock(),
             CloseHandle=mock.MagicMock(),
         )
-        with mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel32):
+        with (
+            mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel32),
+            mock.patch.object(update, "windows_user_sid", return_value="S-1-5-21-42"),
+        ):
             with self.assertRaisesRegex(RuntimeError, "Timed out waiting for another Ninja Patch Tool update"):
                 with update.updater_install_lock(Path("C:/NPT"), timeout_seconds=2):
                     pass
@@ -1219,6 +1504,8 @@ This should not be included.
         kernel32.WaitForSingleObject.assert_called_once_with(123, 2000)
         kernel32.ReleaseMutex.assert_not_called()
         kernel32.CloseHandle.assert_called_once_with(123)
+        mutex_name = kernel32.CreateMutexW.call_args.args[2]
+        self.assertTrue(mutex_name.startswith(r"Global\DarkLotus.NinjaPatchTool.updater.S-1-5-21-42."))
 
     def test_updater_queued_target_is_satisfied_by_equal_or_newer_installation(self) -> None:
         executable = Path("tool.exe")
@@ -1436,6 +1723,28 @@ This should not be included.
                     with self.assertRaisesRegex(RuntimeError, "Another test operation"):
                         with common.operation_lock("test", target, "test operation"):
                             pass
+
+    def test_operation_lock_uses_global_user_scoped_mutex_on_windows(self) -> None:
+        import ctypes
+
+        kernel32 = SimpleNamespace(
+            CreateMutexW=mock.MagicMock(return_value=123),
+            WaitForSingleObject=mock.MagicMock(return_value=0),
+            ReleaseMutex=mock.MagicMock(),
+            CloseHandle=mock.MagicMock(),
+        )
+        target = Path("C:/Warframe")
+        with (
+            mock.patch.object(common.sys, "platform", "win32"),
+            mock.patch.object(common, "windows_user_sid", return_value="S-1-5-21-42"),
+            mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel32),
+        ):
+            with common.operation_lock("installation", target, "test operation"):
+                pass
+        mutex_name = kernel32.CreateMutexW.call_args.args[2]
+        self.assertTrue(
+            mutex_name.startswith(r"Global\DarkLotus.NinjaPatchTool.operation.S-1-5-21-42.installation.")
+        )
 
     @unittest.skipUnless(sys.platform == "win32", "Windows mutex test")
     def test_operation_lock_can_be_reacquired_after_release(self) -> None:

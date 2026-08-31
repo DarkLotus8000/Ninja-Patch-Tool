@@ -12,6 +12,7 @@ from common import (
     install_termination_handlers,
     is_steam_manifest_id,
     load_index,
+    operation_activity_lock,
     operation_lock,
     resolve_base_name,
     scan_tree,
@@ -50,57 +51,58 @@ def main() -> int:
     args = parser.parse_args(argv)
 
     try:
-        update_result = handle_automatic_update(args, argv)
-        if update_result is not None:
-            return update_result
+        with operation_activity_lock():
+            update_result = handle_automatic_update(args, argv)
+            if update_result is not None:
+                return update_result
 
-        base = args.path.resolve()
-        name = args.name.strip()
-        manifest_id = args.manifest_id
+            base = args.path.resolve()
+            name = args.name.strip()
+            manifest_id = args.manifest_id
 
-        if not base.is_dir():
-            print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
-            return 1
-        if not validate_warframe_installation(base, "Base"):
-            return 1
+            if not base.is_dir():
+                print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
+                return 1
+            if not validate_warframe_installation(base, "Base"):
+                return 1
 
-        if not name:
-            print("ERROR: Base name cannot be empty.", file=sys.stderr)
-            return 1
-        if not is_steam_manifest_id(manifest_id):
-            print("ERROR: Steam manifest ID must be a valid unsigned 64-bit integer.", file=sys.stderr)
-            return 1
+            if not name:
+                print("ERROR: Base name cannot be empty.", file=sys.stderr)
+                return 1
+            if not is_steam_manifest_id(manifest_id):
+                print("ERROR: Steam manifest ID must be a valid unsigned 64-bit integer.", file=sys.stderr)
+                return 1
 
-        # Reject conflicts that can be determined from the index before doing a potentially very expensive full-tree hash.
-        # The same checks are repeated after hashing because another add_base process may update the index meanwhile.
-        with operation_lock("index", INDEX_FILE, "base index update"):
-            conflict = _existing_base_conflict(load_index(), name, manifest_id)
-        if conflict is not None:
-            print(f"ERROR: {conflict}\nNo changes were made.", file=sys.stderr)
-            return 1
-
-        with operation_lock("installation", base, "operation using this installation"):
-            print(f'Hashing base "{name}"...\n' "This may take a while for large installations.")
-            files, root_hash = scan_tree(base, "Hashing base")
-
-            # Keep the installation locked until its verified identity is committed to the index.
+            # Reject conflicts that can be determined from the index before doing a potentially very expensive full-tree hash.
+            # The same checks are repeated after hashing because another add_base process may update the index meanwhile.
             with operation_lock("index", INDEX_FILE, "base index update"):
-                index = load_index()
-                conflict = _existing_base_conflict(index, name, manifest_id)
-                if conflict is not None:
-                    print(f"ERROR: {conflict}\nNo changes were made.", file=sys.stderr)
-                    return 1
+                conflict = _existing_base_conflict(load_index(), name, manifest_id)
+            if conflict is not None:
+                print(f"ERROR: {conflict}\nNo changes were made.", file=sys.stderr)
+                return 1
 
-                for existing_name, entry in index.items():
-                    if entry["sha256"].lower() == root_hash.lower():
-                        print(f'ERROR: This exact base is already indexed as "{existing_name}".\nNo changes were made.', file=sys.stderr)
+            with operation_lock("installation", base, "operation using this installation"):
+                print(f'Hashing base "{name}"...\n' "This may take a while for large installations.")
+                files, root_hash = scan_tree(base, "Hashing base")
+
+                # Keep the installation locked until its verified identity is committed to the index.
+                with operation_lock("index", INDEX_FILE, "base index update"):
+                    index = load_index()
+                    conflict = _existing_base_conflict(index, name, manifest_id)
+                    if conflict is not None:
+                        print(f"ERROR: {conflict}\nNo changes were made.", file=sys.stderr)
                         return 1
 
-                index[name] = {"steam_manifest_id": manifest_id, "sha256": root_hash, "file_count": len(files)}
-                write_index(index)
+                    for existing_name, entry in index.items():
+                        if entry["sha256"].lower() == root_hash.lower():
+                            print(f'ERROR: This exact base is already indexed as "{existing_name}".\nNo changes were made.', file=sys.stderr)
+                            return 1
 
-        print(f'\n[Added] Base "{name}"\nSteam manifest ID: {manifest_id}\nFiles: {len(files):,}\nSHA-256: {root_hash}\nIndex: {INDEX_FILE}')
-        return 0
+                    index[name] = {"steam_manifest_id": manifest_id, "sha256": root_hash, "file_count": len(files)}
+                    write_index(index)
+
+            print(f'\n[Added] Base "{name}"\nSteam manifest ID: {manifest_id}\nFiles: {len(files):,}\nSHA-256: {root_hash}\nIndex: {INDEX_FILE}')
+            return 0
     except KeyboardInterrupt:
         print("\nBase addition cancelled.", file=sys.stderr)
         return 130

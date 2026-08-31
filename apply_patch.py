@@ -31,6 +31,7 @@ from common import (
     is_steam_manifest_id,
     is_within,
     make_work_dir,
+    operation_activity_lock,
     operation_lock,
     parse_json,
     process_identity,
@@ -983,6 +984,45 @@ def run_locked_apply(
         if work is not None and not keep_work:
             cleanup_work_dir(work)
 
+def _run_operation(args, argv: list[str]) -> int:
+    update_result = handle_automatic_update(args, argv)
+    if update_result is not None:
+        return update_result
+
+    base = args.base.resolve()
+    patch = resolve_patch_path(args.patch)
+
+    if not base.is_dir():
+        print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
+        return 1
+
+    if args.in_place:
+        destination = base
+    elif args.output is not None:
+        destination = args.output.resolve()
+    else:
+        destination = base.parent / patch.stem
+
+    if not args.in_place and (
+        destination == base or is_within(destination, base) or is_within(base, destination)
+    ):
+        print("ERROR: Output and base directories must not overlap.", file=sys.stderr)
+        return 1
+
+    try:
+        with operation_lock("installation", base, "operation using this installation"):
+            if destination == base:
+                return run_locked_apply(base, patch, destination, args.in_place)
+            with operation_lock("installation", destination, "operation using this installation"):
+                return run_locked_apply(base, patch, destination, args.in_place)
+    except KeyboardInterrupt:
+        print("\nPatch application cancelled.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
 def main() -> int:
     install_termination_handlers()
     argv = sys.argv[1:]
@@ -1020,36 +1060,9 @@ def main() -> int:
     parser.add_help_argument()
     args = parser.parse_args(argv)
 
-    update_result = handle_automatic_update(args, argv)
-    if update_result is not None:
-        return update_result
-
-    base = args.base.resolve()
-    patch = resolve_patch_path(args.patch)
-
-    if not base.is_dir():
-        print(f"ERROR: Base directory does not exist: {base}", file=sys.stderr)
-        return 1
-
-    if args.in_place:
-        destination = base
-    elif args.output is not None:
-        destination = args.output.resolve()
-    else:
-        destination = base.parent / patch.stem
-
-    if not args.in_place and (
-        destination == base or is_within(destination, base) or is_within(base, destination)
-    ):
-        print("ERROR: Output and base directories must not overlap.", file=sys.stderr)
-        return 1
-
     try:
-        with operation_lock("installation", base, "operation using this installation"):
-            if destination == base:
-                return run_locked_apply(base, patch, destination, args.in_place)
-            with operation_lock("installation", destination, "operation using this installation"):
-                return run_locked_apply(base, patch, destination, args.in_place)
+        with operation_activity_lock():
+            return _run_operation(args, argv)
     except KeyboardInterrupt:
         print("\nPatch application cancelled.", file=sys.stderr)
         return 130
