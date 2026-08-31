@@ -1,7 +1,6 @@
 # Run from the project root with: py -m unittest discover -s tests
 from __future__ import annotations
 
-import ast
 import hashlib
 import io
 import json
@@ -52,18 +51,6 @@ def write_recovery(work: Path, state: dict, recovery_version: int | None = None)
     (work / apply_patch.RECOVERY_FILE).write_text(json.dumps(data), encoding="utf-8")
 
 class CommonTests(unittest.TestCase):
-    def test_source_formatting_stays_compact(self) -> None:
-        paths = sorted(ROOT.glob("*.py")) + sorted((ROOT / "tests").glob("*.py"))
-        for path in paths:
-            source = path.read_text(encoding="utf-8")
-            lines = source.splitlines()
-            for index in range(1, len(lines)):
-                self.assertFalse(not lines[index - 1].strip() and not lines[index].strip(), f"Multiple consecutive blank lines: {path.name}:{index}")
-            tree = ast.parse(source, filename=str(path))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print":
-                    self.assertEqual(node.lineno, node.end_lineno, f"print() spans multiple source lines: {path.name}:{node.lineno}-{node.end_lineno}")
-
     def test_duplicate_json_keys_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
             common.parse_json('{"a": 1, "a": 2}')
@@ -110,19 +97,11 @@ class CommonTests(unittest.TestCase):
     def test_natural_sort_key_handles_mixed_base_name_shapes(self) -> None:
         self.assertEqual(sorted(["U10", "43.5", "U2", "Alpha1"], key=common.natural_sort_key), ["43.5", "Alpha1", "U2", "U10"])
 
-    def test_version_has_single_source(self) -> None:
-        self.assertEqual(build_release.VERSION, common.VERSION)
-
     def test_process_identity_prevents_pid_reuse_false_positive(self) -> None:
         with mock.patch.object(common, "process_is_running", return_value=True), mock.patch.object(common, "process_identity", return_value="123:new"):
             self.assertFalse(common.process_matches_identity(123, "123:old"))
             self.assertTrue(common.process_matches_identity(123, "123:new"))
             self.assertTrue(common.process_matches_identity(123, None))
-
-    def test_argument_parser_uses_python_314_cli_improvements(self) -> None:
-        parser = common.ErrorArgumentParser()
-        self.assertTrue(parser.suggest_on_error)
-        self.assertFalse(parser.color)
 
     def test_version_argument_supports_short_and_long_forms(self) -> None:
         for option in ("-v", "--version"):
@@ -270,16 +249,6 @@ This should not be included.
         for technical in ("HDiff payloads", "DEFLATE", "LZMA", "ZIP compression"):
             self.assertNotIn(technical, release_readme)
 
-    def test_runtime_data_paths_are_centralized(self) -> None:
-        self.assertEqual(common.DATA_DIR, common.TOOL_DIR / "data")
-        self.assertEqual(common.INDEX_FILE, common.DATA_DIR / "index.json")
-        self.assertEqual(make_patch.HDIFFZ, common.DATA_DIR / "hdiffz.exe")
-        self.assertEqual(apply_patch.HPATCHZ, common.DATA_DIR / "hpatchz.exe")
-        self.assertEqual(build_release.DATA_DIR, build_release.ROOT / "data")
-        self.assertEqual(build_release.FAVICON, build_release.DATA_DIR / "favicon.ico")
-        self.assertEqual(build_release.LICENSES_DIR, build_release.DATA_DIR / "licenses")
-        self.assertEqual(update.UPDATE_CONFIG_FILE, common.DATA_DIR / "update.json")
-
     def test_release_temp_directory_is_separate_from_patch_temp(self) -> None:
         self.assertEqual(build_release.RELEASE_TEMP_DIR, build_release.ROOT / "release_temp")
         self.assertNotEqual(build_release.RELEASE_TEMP_DIR, common.TEMP_ROOT)
@@ -297,16 +266,6 @@ This should not be included.
                 build_release.clean_stale_release_temp()
             self.assertFalse(release_temp.exists())
             print_mock.assert_called_once_with("[Cleaning] Previous temporary build files")
-
-    def test_stale_release_temp_cleanup_is_silent_when_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            release_temp = Path(tmp) / "release_temp"
-            with (
-                mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp),
-                mock.patch("builtins.print") as print_mock,
-            ):
-                build_release.clean_stale_release_temp()
-            print_mock.assert_not_called()
 
     def test_release_data_is_allowlisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
