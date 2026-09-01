@@ -849,15 +849,29 @@ This should not be included.
                         update._record_update_check_result(result, now=3000)
                     self.assertEqual(json.loads(config.read_text(encoding="utf-8")), original)
 
-    def test_automatic_update_skips_github_during_success_cooldown(self) -> None:
-        args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+    def test_configured_auto_update_skips_github_during_success_cooldown(self) -> None:
+        args = SimpleNamespace(auto_update=False, no_auto_update=False, check_update=False)
         with (
             mock.patch.object(update.sys, "frozen", True, create=True),
+            mock.patch.object(update, "load_auto_update_setting", return_value=True),
             mock.patch.object(update, "automatic_update_check_due", return_value=False),
             mock.patch.object(update, "check_for_update") as check,
         ):
             self.assertIsNone(update.handle_automatic_update(args, []))
         check.assert_not_called()
+
+    def test_explicit_auto_update_bypasses_check_cooldown(self) -> None:
+        args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
+        with (
+            mock.patch.object(update.sys, "frozen", True, create=True),
+            mock.patch.object(update, "automatic_update_check_due") as cooldown,
+            mock.patch.object(update, "check_for_update", return_value=None) as check,
+            mock.patch.object(update, "_record_update_check_result") as record,
+        ):
+            self.assertIsNone(update.handle_automatic_update(args, []))
+        cooldown.assert_not_called()
+        check.assert_called_once_with()
+        record.assert_called_once_with("success")
 
     def test_automatic_no_update_records_successful_check(self) -> None:
         args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
@@ -897,7 +911,7 @@ This should not be included.
             self.assertIsNone(update.handle_automatic_update(args, []))
             load_config.assert_not_called()
 
-    def test_missing_current_executable_is_rejected_before_update_download(self) -> None:
+    def test_update_preparation_failure_retries_on_next_launch(self) -> None:
         args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
         release = {"version": "1.5", "assets": [], "url": "https://example.test/release"}
         stderr = io.StringIO()
@@ -923,7 +937,7 @@ This should not be included.
         download.assert_not_called()
         extract.assert_not_called()
         launch.assert_not_called()
-        record.assert_called_once_with("failure")
+        record.assert_called_once_with("update_available")
         self.assertIn("Current Ninja Patch Tool executable is missing", stderr.getvalue())
 
     def test_temporary_self_updater_version_check_accepts_matching_version(self) -> None:

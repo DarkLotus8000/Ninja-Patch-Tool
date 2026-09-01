@@ -64,7 +64,7 @@ def add_update_arguments(parser: argparse.ArgumentParser) -> None:
         "-a",
         "--auto-update",
         action=SingleUseStoreTrueAction,
-        help="Enable automatic updating for this run, overriding data/update.json",
+        help="Force an automatic update check/install for this run, overriding data/update.json",
     )
     group.add_argument(
         "-n",
@@ -812,20 +812,33 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
             print("[Update] Automatic installation is only available in the Windows release executables.", file=sys.stderr)
         return None
 
-    if not automatic_update_check_due():
+    if not args.auto_update and not automatic_update_check_due():
         return None
+
+    try:
+        release = check_for_update()
+    except KeyboardInterrupt:
+        print("\nUpdate cancelled.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        _record_update_check_result("failure")
+        print(f"[Update] Warning: Automatic update failed; continuing with v{VERSION}: {exc}", file=sys.stderr)
+        return None
+
+    if release is None:
+        _record_update_check_result("success")
+        return None
+
+    # The GitHub check itself succeeded and found an update. From this point onward, failures are installation failures,
+    # not update-check failures, so they must not start the short check cooldown. A later launch should retry the update.
+    _record_update_check_result("update_available")
 
     work: Path | None = None
     try:
-        release = check_for_update()
-        if release is None:
-            _record_update_check_result("success")
-            return None
         TEMP_ROOT.mkdir(parents=True, exist_ok=True)
         work = TEMP_ROOT / f"update_{uuid.uuid4().hex}"
         work.mkdir()
         temporary_updater = _copy_application_for_update(work)
-        _record_update_check_result("update_available")
         print(f"[Update] Ninja Patch Tool v{release['version']} is available (current: v{VERSION}).")
         archive = download_release(release, work)
         stage = extract_release_archive(archive, work / "stage", release["version"])
@@ -839,7 +852,6 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
         cleanup_temp_root_if_empty(TEMP_ROOT)
         return 130
     except Exception as exc:
-        _record_update_check_result("failure")
         print(f"[Update] Warning: Automatic update failed; continuing with v{VERSION}: {exc}", file=sys.stderr)
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)
