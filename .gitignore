@@ -7,7 +7,6 @@ release/
 # Python cache
 __pycache__/
 *.py[cod]
-.pytest_cache/
 
 # Tool working directory
 temp/
