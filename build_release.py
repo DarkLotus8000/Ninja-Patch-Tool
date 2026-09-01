@@ -34,7 +34,7 @@ DATA_DIR = ROOT / "data"
 FAVICON = DATA_DIR / "favicon.ico"
 LICENSES_DIR = DATA_DIR / "licenses"
 RELEASE_DATA_FILES = ("index.json", "update.json", "hdiffz.exe", "hpatchz.exe")
-THIRD_PARTY_LICENSE_FILES = ("Python_LICENSE.txt", "HDiffPatch_LICENSE.txt")
+THIRD_PARTY_LICENSE_FILES = ("Python-LICENSE.txt", "HDiffPatch-LICENSE.txt")
 MIN_PYINSTALLER_VERSION = (6, 15, 0)
 
 def clean_markdown_inline(text: str) -> str:
@@ -383,10 +383,11 @@ def populate_release(stage: Path, dist: Path, project_licenses: list[Path]) -> N
     release_licenses.mkdir()
     for name in THIRD_PARTY_LICENSE_FILES:
         shutil.copy2(LICENSES_DIR / name, release_licenses / name)
-    for license_file in project_licenses:
-        destination = release_licenses / license_file.name
+    for index, license_file in enumerate(project_licenses):
+        destination_name = "Ninja-Patch-Tool-LICENSE.txt" if index == 0 else f"Ninja-Patch-Tool-{license_file.name}.txt"
+        destination = release_licenses / destination_name
         if destination.exists():
-            raise RuntimeError(f"License filename collision while staging release: {license_file.name}")
+            raise RuntimeError(f"License filename collision while staging release: {destination_name}")
         shutil.copy2(license_file, destination)
 
     readme = create_release_readme((ROOT / "README.md").read_text(encoding="utf-8"))

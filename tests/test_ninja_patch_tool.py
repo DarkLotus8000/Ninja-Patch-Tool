@@ -392,7 +392,7 @@ This should not be included.
             dist.mkdir()
 
             expected_data = {"index.json", "update.json", "hdiffz.exe", "hpatchz.exe"}
-            expected_licenses = {"Python_LICENSE.txt", "HDiffPatch_LICENSE.txt", "LICENSE"}
+            expected_licenses = {"Python-LICENSE.txt", "HDiffPatch-LICENSE.txt", "Ninja-Patch-Tool-LICENSE.txt"}
             for name in expected_data:
                 if name == "index.json":
                     (data / name).write_bytes(b"{}")
@@ -406,7 +406,7 @@ This should not be included.
 
             licenses = data / "licenses"
             licenses.mkdir()
-            for name in ("Python_LICENSE.txt", "HDiffPatch_LICENSE.txt"):
+            for name in ("Python-LICENSE.txt", "HDiffPatch-LICENSE.txt"):
                 (licenses / name).write_text(name, encoding="ascii")
 
             project_license = root / "LICENSE"
@@ -1231,7 +1231,7 @@ This should not be included.
                 "data/update.json": b'{"auto_update": true}',
                 "data/hdiffz.exe": b"exe",
                 "data/hpatchz.exe": b"exe",
-                "data/licenses/LICENSE": b"license",
+                "data/licenses/Ninja-Patch-Tool-LICENSE.txt": b"license",
             }
             add_release_manifest(files, "1.5")
             with zipfile.ZipFile(archive_path, "w") as archive:
@@ -1239,7 +1239,7 @@ This should not be included.
                     archive.writestr(f"{release_root}/{name}", payload)
             stage = update.extract_release_archive(archive_path, root / "stage", "1.5")
             self.assertEqual((stage / "README.txt").read_bytes(), b"readme")
-            self.assertTrue((stage / "data" / "licenses" / "LICENSE").is_file())
+            self.assertTrue((stage / "data" / "licenses" / "Ninja-Patch-Tool-LICENSE.txt").is_file())
 
     def test_update_archive_rejects_release_manifest_hash_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1256,7 +1256,7 @@ This should not be included.
                 "data/update.json": b'{"auto_update": true}',
                 "data/hdiffz.exe": b"exe",
                 "data/hpatchz.exe": b"exe",
-                "data/licenses/LICENSE": b"license",
+                "data/licenses/Ninja-Patch-Tool-LICENSE.txt": b"license",
             }
             add_release_manifest(files, "1.5")
             files["make_patch.exe"] = b"tampered"
@@ -1281,7 +1281,7 @@ This should not be included.
                 "data/update.json": b'{"auto_update": true}',
                 "data/hdiffz.exe": b"exe",
                 "data/hpatchz.exe": b"exe",
-                "data/licenses/LICENSE": b"license",
+                "data/licenses/Ninja-Patch-Tool-LICENSE.txt": b"license",
             }
             add_release_manifest(files, "1.5")
             with zipfile.ZipFile(archive_path, "w") as archive:
