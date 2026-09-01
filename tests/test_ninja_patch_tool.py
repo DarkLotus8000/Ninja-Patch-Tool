@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import struct
 import tempfile
 import unittest
 import zipfile
@@ -467,6 +468,27 @@ This should not be included.
             with self.assertRaisesRegex(RuntimeError, "not an x86-64"):
                 build_release.validate_pe_x64(executable)
 
+    def test_release_icon_contains_all_required_resolutions(self) -> None:
+        data = build_release.FAVICON.read_bytes()
+        reserved, icon_type, count = struct.unpack_from("<HHH", data, 0)
+        self.assertEqual((reserved, icon_type, count), (0, 1, len(build_release.ICO_SIZES)))
+        sizes = []
+        for index in range(count):
+            entry_offset = 6 + index * 16
+            width = data[entry_offset] or 256
+            height = data[entry_offset + 1] or 256
+            planes, bit_count = struct.unpack_from("<HH", data, entry_offset + 4)
+            payload_size, payload_offset = struct.unpack_from("<II", data, entry_offset + 8)
+            payload = data[payload_offset:payload_offset + payload_size]
+            self.assertEqual(width, height)
+            self.assertIn(planes, {0, 1})
+            self.assertEqual(bit_count, 32)
+            self.assertTrue(payload.startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertEqual(struct.unpack_from(">II", payload, 16), (width, height))
+            self.assertIn(payload[25], {4, 6})
+            sizes.append(width)
+        self.assertEqual(tuple(sizes), build_release.ICO_SIZES)
+
     def test_release_preflight_validates_ico_structure(self) -> None:
         build_release.validate_ico(build_release.FAVICON)
         with tempfile.TemporaryDirectory() as tmp:
@@ -484,7 +506,7 @@ This should not be included.
                 + (22).to_bytes(4, "little")
                 + payload
             )
-            with self.assertRaisesRegex(RuntimeError, "transparent 256x256 PNG-compressed"):
+            with self.assertRaisesRegex(RuntimeError, "exactly these resolutions"):
                 build_release.validate_ico(old_style)
 
     def test_release_checksum_is_generated(self) -> None:
@@ -589,8 +611,10 @@ This should not be included.
                 (dist / f"{Path(script).stem}.exe").write_bytes(b"exe")
 
             calls: list[list[str]] = []
+            timeouts: list[int] = []
             def run(command, cwd, env, capture_output, text, timeout):
                 calls.append(command)
+                timeouts.append(timeout)
                 if command[1:] == ["-h"]:
                     return SimpleNamespace(returncode=0, stdout="Shows this help message", stderr="")
                 return SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{build_release.VERSION}\n", stderr="")
@@ -604,6 +628,7 @@ This should not be included.
                 expected.append([f"{Path(script).stem}.exe", "--version"])
                 expected.append([f"{Path(script).stem}.exe", "--update-installer", "--version"])
             self.assertEqual([[Path(command[0]).name, *command[1:]] for command in calls], expected)
+            self.assertEqual(timeouts, [120] * len(expected))
 
     def test_release_output_is_checked_before_building(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -950,9 +975,18 @@ This should not be included.
             cwd=update.TOOL_DIR,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=150,
             check=False,
         )
+
+    def test_installed_version_validation_allows_slow_onefile_startup(self) -> None:
+        result = SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{common.VERSION}\n", stderr="")
+        with mock.patch.object(update.subprocess, "run", return_value=result) as run:
+            self.assertEqual(
+                update._read_installed_version(Path("make_patch.exe"), Path(".")),
+                common.VERSION,
+            )
+        self.assertEqual(run.call_args.kwargs["timeout"], 150)
 
     def test_copy_application_for_update_stays_inside_update_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -990,6 +1024,7 @@ This should not be included.
         command = popen.call_args.args[0]
         self.assertEqual(command[0], str(updater_path))
         self.assertEqual(command[1], "--update-installer")
+        self.assertEqual(popen.call_args.kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
 
     def test_automatic_update_interrupt_exits_cleanly(self) -> None:
         args = SimpleNamespace(auto_update=True, no_auto_update=False, check_update=False)
@@ -1869,6 +1904,7 @@ This should not be included.
             )
 
         self.assertEqual(captured["command"][1:], ["-a", "base", "new", "out", "U1"])
+        self.assertEqual(captured["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
         self.assertEqual(captured["env"]["NPT_SKIP_UPDATE_CHECK_ONCE"], "1")
         self.assertEqual(
             captured["env"]["NPT_UPDATE_WORK_CLEANUP"],

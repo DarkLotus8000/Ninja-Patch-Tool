@@ -146,6 +146,8 @@ def validate_pe_x64(path: Path) -> None:
     if machine != 0x8664:
         raise RuntimeError(f"Release dependency is not an x86-64 Windows executable: {path}")
 
+ICO_SIZES = (16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
+
 def validate_ico(path: Path) -> None:
     try:
         data = path.read_bytes()
@@ -157,24 +159,49 @@ def validate_ico(path: Path) -> None:
     directory_end = 6 + count * 16
     if reserved != 0 or icon_type != 1 or count == 0 or len(data) < directory_end:
         raise RuntimeError(f"Invalid ICO file: {path}")
+    if count != len(ICO_SIZES):
+        raise RuntimeError(
+            f"ICO must contain exactly these resolutions: {', '.join(f'{size}x{size}' for size in ICO_SIZES)}: {path}"
+        )
 
-    has_modern_256 = False
+    found_sizes: set[int] = set()
     for index in range(count):
         entry_offset = 6 + index * 16
         width = data[entry_offset] or 256
         height = data[entry_offset + 1] or 256
+        planes, bit_count = struct.unpack_from("<HH", data, entry_offset + 4)
         size, offset = struct.unpack_from("<II", data, entry_offset + 8)
-        if size == 0 or offset < directory_end or offset + size > len(data):
-            raise RuntimeError(f"Invalid ICO file: {path}")
+        if (
+            width != height
+            or width not in ICO_SIZES
+            or width in found_sizes
+            or planes not in {0, 1}
+            or bit_count != 32
+            or size == 0
+            or offset < directory_end
+            or offset + size > len(data)
+        ):
+            raise RuntimeError(f"Invalid ICO entry in {path}")
 
         payload = data[offset:offset + size]
-        if width == 256 and height == 256 and payload.startswith(b"\x89PNG\r\n\x1a\n"):
-            # PNG color types 4 and 6 contain an alpha channel.
-            if len(payload) >= 26 and payload[12:16] == b"IHDR" and payload[25] in {4, 6}:
-                has_modern_256 = True
+        if (
+            len(payload) < 26
+            or not payload.startswith(b"\x89PNG\r\n\x1a\n")
+            or payload[12:16] != b"IHDR"
+        ):
+            raise RuntimeError(f"ICO entry {width}x{height} must be PNG-compressed: {path}")
+        png_width, png_height = struct.unpack_from(">II", payload, 16)
+        if png_width != width or png_height != height:
+            raise RuntimeError(f"ICO entry dimensions do not match its PNG payload: {path}")
+        # PNG color types 4 and 6 contain an alpha channel.
+        if payload[25] not in {4, 6}:
+            raise RuntimeError(f"ICO entry {width}x{height} must contain transparency: {path}")
+        found_sizes.add(width)
 
-    if not has_modern_256:
-        raise RuntimeError(f"ICO must contain a transparent 256x256 PNG-compressed image: {path}")
+    if found_sizes != set(ICO_SIZES):
+        raise RuntimeError(
+            f"ICO must contain exactly these resolutions: {', '.join(f'{size}x{size}' for size in ICO_SIZES)}: {path}"
+        )
 
 def validate_build_environment() -> list[Path]:
     if sys.platform != "win32":
@@ -329,13 +356,13 @@ def smoke_test_executables(dist: Path) -> None:
         executable = dist / f"{Path(script).stem}.exe"
         try:
             help_result = subprocess.run(
-                [str(executable), "-h"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30
+                [str(executable), "-h"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120
             )
             short_version_result = subprocess.run(
-                [str(executable), "-v"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30
+                [str(executable), "-v"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120
             )
             version_result = subprocess.run(
-                [str(executable), "--version"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30
+                [str(executable), "--version"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"Standalone executable smoke test timed out: {executable.name}") from exc
@@ -356,7 +383,7 @@ def smoke_test_executables(dist: Path) -> None:
                 env=environment,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=120,
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"Internal updater smoke test timed out: {executable.name}") from exc

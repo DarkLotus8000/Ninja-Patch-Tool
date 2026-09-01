@@ -645,12 +645,12 @@ def _validate_temporary_updater(executable: Path) -> None:
             cwd=TOOL_DIR,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=150,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
-            f"Temporary Ninja Patch Tool updater did not respond to --version within 15 seconds: {executable}"
+            f"Temporary Ninja Patch Tool updater did not respond to --version within 150 seconds: {executable}"
         ) from exc
     except OSError as exc:
         raise RuntimeError(f"Temporary Ninja Patch Tool updater could not be started: {executable}: {exc}") from exc
@@ -695,7 +695,9 @@ def launch_updater(temporary_updater: Path, stage: Path, argv: list[str], target
         "--",
         *argv,
     ]
-    subprocess.Popen(command, cwd=TOOL_DIR)
+    environment = os.environ.copy()
+    environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen(command, cwd=TOOL_DIR, env=environment)
 
 def _update_session_is_active(work: Path) -> bool:
     session = work / UPDATE_SESSION_FILE
@@ -1137,7 +1139,7 @@ def _read_installed_version(executable: Path, cwd: Path) -> str:
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=150,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Updated executable did not respond to --version: {executable.name}") from exc
@@ -1175,6 +1177,7 @@ def installed_executable_satisfies_target(executable: Path, target_version: str,
 
 def relaunch(executable: Path, argv: list[str], cwd: Path, cleanup_work: Path | None = None) -> subprocess.Popen:
     environment = os.environ.copy()
+    environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     # Skip exactly one update check after a handoff. Injecting --no-auto-update would conflict with an original
     # --auto-update argument, so the user's command line is left unchanged.
     environment["NPT_SKIP_UPDATE_CHECK_ONCE"] = "1"
