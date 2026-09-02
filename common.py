@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 ENTRY_SCRIPTS = {
     "add_base.py": "Add Base - Ninja Patch Tool",
     "verify_base.py": "Verify Base - Ninja Patch Tool",
@@ -31,6 +31,84 @@ RELEASE_MANIFEST_FILE = "data/release_manifest.json"
 RELEASE_MANIFEST_VERSION = 1
 PRESERVED_RELEASE_FILES = frozenset({"data/index.json", "data/update.json"})
 _OPERATION_ACTIVITY_SLOTS = 64
+
+_COLOR_SUPPORT_LOCK = threading.Lock()
+_COLOR_SUPPORT_CACHE: dict[int, bool] = {}
+_SEVERITY_TOKEN_RE = re.compile(r"(?m)^(ERROR:|WARNING:)")
+
+
+def _enable_windows_virtual_terminal(stream) -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(ctypes.c_void_p(handle), ctypes.byref(mode)):
+            return False
+        enable_virtual_terminal_processing = 0x0004
+        if mode.value & enable_virtual_terminal_processing:
+            return True
+        return bool(
+            kernel32.SetConsoleMode(
+                ctypes.c_void_p(handle),
+                mode.value | enable_virtual_terminal_processing,
+            )
+        )
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def console_supports_color(stream) -> bool:
+    """Return whether ANSI color is safe for this interactive stream."""
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    try:
+        if not stream.isatty():
+            return False
+        key = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return False
+    with _COLOR_SUPPORT_LOCK:
+        cached = _COLOR_SUPPORT_CACHE.get(key)
+        if cached is not None:
+            return cached
+        supported = _enable_windows_virtual_terminal(stream)
+        _COLOR_SUPPORT_CACHE[key] = supported
+        return supported
+
+
+def _colored(token: str, color: str) -> str:
+    return f"{color}{token}\x1b[0m"
+
+
+def style_console_text(message: str, stream) -> str:
+    """Color severity prefixes only; redirected output remains plain text."""
+    if not console_supports_color(stream):
+        return message
+
+    def severity_replacement(match: re.Match[str]) -> str:
+        token = match.group(1)
+        return _colored(token, "\x1b[91m" if token == "ERROR:" else "\x1b[93m")
+
+    return _SEVERITY_TOKEN_RE.sub(severity_replacement, message)
+
+
+def print_console(message: object = "", *, file=None, flush: bool = False) -> None:
+    stream = sys.stdout if file is None else file
+    print(style_console_text(str(message), stream), file=stream, flush=flush)
+
+
+def print_error(message: object, *, flush: bool = False) -> None:
+    print_console(f"ERROR: {message}", file=sys.stderr, flush=flush)
+
+
+def print_warning(message: object, *, flush: bool = False) -> None:
+    print_console(f"WARNING: {message}", file=sys.stderr, flush=flush)
+
 
 class ActiveOperationError(RuntimeError):
     pass
@@ -200,7 +278,7 @@ def is_ignored_file(path: Path) -> bool:
 def validate_warframe_installation(path: Path, label: str) -> bool:
     if (path / "Cache.Windows").is_dir() and (path / "Tools").is_dir() and (path / "Warframe.x64.exe").is_file():
         return True
-    print(f'ERROR: {label} directory is not a Warframe installation root:\n{path}\nExpected at least Cache.Windows, Tools, and Warframe.x64.exe directly inside it.', file=sys.stderr)
+    print_error(f'{label} directory is not a Warframe installation root:\n{path}\nExpected at least Cache.Windows, Tools, and Warframe.x64.exe directly inside it.')
     return False
 
 def natural_sort_key(value: str):
@@ -760,7 +838,7 @@ def warn_if_low_disk_space(path: Path, required_bytes: int, purpose: str) -> Non
     except OSError:
         return
     if free < required_bytes:
-        print(f'WARNING: Disk space may be insufficient for {purpose}.\nAvailable: {format_bytes(free)}\nEstimated required: {format_bytes(required_bytes)}', file=sys.stderr)
+        print_warning(f'Disk space may be insufficient for {purpose}.\nAvailable: {format_bytes(free)}\nEstimated required: {format_bytes(required_bytes)}')
 
 def warn_if_low_disk_space_groups(requirements: list[tuple[Path, int, str]]) -> None:
     grouped: dict[int, tuple[Path, int, list[str]]] = {}
@@ -854,7 +932,8 @@ class ErrorArgumentParser(argparse.ArgumentParser):
 
     def error(self, message: str) -> None:
         self.print_usage(sys.stderr)
-        self.exit(2, f"ERROR: {message}\n")
+        print_error(message)
+        self.exit(2)
 
 class SingleUseStoreAction(argparse.Action):
     """Store an option value, but reject repeated use of either alias."""

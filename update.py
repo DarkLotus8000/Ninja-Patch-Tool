@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from common import (
+    print_error,
+    print_warning,
     ActiveOperationError,
     DATA_DIR,
     PRESERVED_RELEASE_FILES,
@@ -141,10 +143,10 @@ def load_auto_update_setting() -> bool:
         return _read_update_config()["auto_update"]
     except OSError as exc:
         message = "Could not create" if not UPDATE_CONFIG_FILE.exists() else "Could not read"
-        print(f'[Update] Warning: {message} {UPDATE_CONFIG_FILE}; automatic updating is disabled for this run: {exc}', file=sys.stderr)
+        print_warning(f'{message} {UPDATE_CONFIG_FILE}; automatic updating is disabled for this run: {exc}')
         return False
     except ValueError as exc:
-        print(f'[Update] Warning: Invalid update configuration; automatic updating is disabled for this run: {exc}', file=sys.stderr)
+        print_warning(f'Invalid update configuration; automatic updating is disabled for this run: {exc}')
         return False
 
 def _stored_check_time(config: dict[str, Any], key: str) -> int | None:
@@ -272,7 +274,7 @@ def check_update_only() -> int:
         return 130
     except Exception as exc:
         _record_update_check_result("failure")
-        print(f"ERROR: Update check failed: {exc}", file=sys.stderr)
+        print_error(f"Update check failed: {exc}")
         return 1
 
 def _legacy_updater_version_info(executable: Path) -> dict[str, str]:
@@ -377,7 +379,7 @@ def handle_early_update_request(argv: list[str]) -> int | None:
     if argv[:1] == [UPDATE_INSTALLER_ARGUMENT]:
         return run_update_installer(argv[1:])
     if UPDATE_INSTALLER_ARGUMENT in argv:
-        print("ERROR: Invalid internal updater arguments.", file=sys.stderr)
+        print_error("Invalid internal updater arguments.")
         return 1
 
     try:
@@ -824,7 +826,7 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
         return 130
     except Exception as exc:
         _record_update_check_result("failure")
-        print(f"[Update] Warning: Automatic update failed; continuing with v{VERSION}: {exc}", file=sys.stderr)
+        print_warning(f"Automatic update failed; continuing with v{VERSION}: {exc}")
         return None
 
     if release is None:
@@ -854,7 +856,7 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
         cleanup_temp_root_if_empty(TEMP_ROOT)
         return 130
     except Exception as exc:
-        print(f"[Update] Warning: Automatic update failed; continuing with v{VERSION}: {exc}", file=sys.stderr)
+        print_warning(f"Automatic update failed; continuing with v{VERSION}: {exc}")
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)
         cleanup_temp_root_if_empty(TEMP_ROOT)
@@ -1187,7 +1189,7 @@ def relaunch(executable: Path, argv: list[str], cwd: Path, cleanup_work: Path | 
 
 def run_update_installer(argv: list[str] | None = None) -> int:
     if sys.platform != "win32":
-        print("ERROR: Ninja Patch Tool updater is Windows-only.", file=sys.stderr)
+        print_error("Ninja Patch Tool updater is Windows-only.")
         return 1
 
     ignore_interrupts()
@@ -1245,21 +1247,18 @@ def run_update_installer(argv: list[str] | None = None) -> int:
                                     try:
                                         rollback_staged_release(changes, backup)
                                     except Exception as rollback_error:
-                                        print(
-                                            f"ERROR: Ninja Patch Tool update failed and rollback was incomplete: {rollback_error}",
-                                            file=sys.stderr,
+                                        print_error(
+                                            f"Ninja Patch Tool update failed and rollback was incomplete: {rollback_error}"
                                         )
                                         return 1
                                 elif _update_work_has_backup(work):
-                                    print(
-                                        f"ERROR: Ninja Patch Tool update failed and rollback was incomplete; "
-                                        f"recovery data was retained: {exc}",
-                                        file=sys.stderr,
+                                    print_error(
+                                        f"Ninja Patch Tool update failed and rollback was incomplete; "
+                                        f"recovery data was retained: {exc}"
                                     )
                                     return 1
-                                print(
-                                    f"ERROR: Ninja Patch Tool update failed; the previous installation was restored when possible: {exc}",
-                                    file=sys.stderr,
+                                print_error(
+                                    f"Ninja Patch Tool update failed; the previous installation was restored when possible: {exc}"
                                 )
                                 install_failed = True
                             else:
@@ -1291,7 +1290,7 @@ def run_update_installer(argv: list[str] | None = None) -> int:
                 prefix = "after deferring the update"
             else:
                 prefix = "after the update"
-            print(f"ERROR: Could not restart Ninja Patch Tool {prefix}: {relaunch_error}", file=sys.stderr)
+            print_error(f"Could not restart Ninja Patch Tool {prefix}: {relaunch_error}")
             return 1
 
         if defer_for_active_operation:
@@ -1312,11 +1311,11 @@ def run_update_installer(argv: list[str] | None = None) -> int:
             return 0
         raise RuntimeError("Updater reached an unexpected state.")
     except Exception as exc:
-        print(f"ERROR: Ninja Patch Tool updater could not start the installation: {exc}", file=sys.stderr)
+        print_error(f"Ninja Patch Tool updater could not start the installation: {exc}")
         if not _update_work_has_backup(work):
             try:
                 relaunch(executable, relaunch_args, relaunch_cwd, work)
             except Exception as relaunch_error:
-                print(f"ERROR: Could not restart Ninja Patch Tool after the failed update: {relaunch_error}", file=sys.stderr)
+                print_error(f"Could not restart Ninja Patch Tool after the failed update: {relaunch_error}")
         return 1
 

@@ -14,6 +14,7 @@ import zipfile
 from pathlib import Path
 
 from common import (
+    print_error,
     ENTRY_SCRIPTS,
     PRESERVED_RELEASE_FILES,
     RELEASE_MANIFEST_FILE,
@@ -36,6 +37,27 @@ LICENSES_DIR = DATA_DIR / "licenses"
 RELEASE_DATA_FILES = ("index.json", "update.json", "hdiffz.exe", "hpatchz.exe")
 THIRD_PARTY_LICENSE_FILES = ("Python-LICENSE.txt", "HDiffPatch-LICENSE.txt")
 MIN_PYINSTALLER_VERSION = (6, 15, 0)
+
+def source_tree_artifacts(root: Path = ROOT) -> list[str]:
+    artifacts: list[str] = []
+    for current_root, directories, filenames in os.walk(root):
+        current = Path(current_root)
+        for directory in list(directories):
+            if directory in {".pytest_cache", ".mypy_cache", ".ruff_cache", "htmlcov"}:
+                path = current / directory
+                artifacts.append(path.relative_to(root).as_posix() + "/")
+                directories.remove(directory)
+        for filename in filenames:
+            if filename in {".coverage", "coverage.xml"} or filename.endswith(".part"):
+                artifacts.append((current / filename).relative_to(root).as_posix())
+    return sorted(artifacts, key=str.casefold)
+
+def validate_source_tree_cleanliness(root: Path = ROOT) -> None:
+    artifacts = source_tree_artifacts(root)
+    if not artifacts:
+        return
+    details = "\n".join(f"- {path}" for path in artifacts)
+    raise RuntimeError(f"Generated/cache artifacts must be removed before building a release:\n{details}")
 
 def clean_markdown_inline(text: str) -> str:
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
@@ -216,6 +238,7 @@ def validate_build_environment() -> list[Path]:
     except importlib.metadata.PackageNotFoundError:
         raise RuntimeError("PyInstaller is not installed for Python 3.14. Run: py -3.14 -m pip install pyinstaller") from None
     validate_pyinstaller_version(pyinstaller_version)
+    validate_source_tree_cleanliness()
 
     required = [ROOT / script for script in ENTRY_SCRIPTS]
     required.extend([ROOT / "common.py", ROOT / "update.py", ROOT / "README.md", FAVICON])
@@ -548,7 +571,7 @@ def main() -> int:
         print("\nRelease creation interrupted.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_error(f"{exc}")
         return 1
 
 if __name__ == "__main__":

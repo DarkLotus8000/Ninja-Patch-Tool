@@ -13,6 +13,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from common import (
+    print_error,
+    print_warning,
+    print_console,
     ENTRY_SCRIPTS,
     ByteProgress,
     ErrorArgumentParser,
@@ -643,7 +646,7 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
             except OSError:
                 backup_has_data = True
             if backup_has_data:
-                print(f"WARNING: Abandoned Apply Patch work has recovery backup data but no usable recovery state and was left untouched:\n{work}", file=sys.stderr)
+                print_warning(f"Abandoned Apply Patch work has recovery backup data but no usable recovery state and was left untouched:\n{work}")
                 continue
             token = work.name.removeprefix("apply_patch_")
             pid_text, separator, _ = token.partition("_")
@@ -663,19 +666,19 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
         try:
             state = parse_json(recovery.read_text(encoding="utf-8"))
         except Exception as exc:
-            print(f"WARNING: Could not read recovery state:\n{recovery}\n{exc}\nThe folder was left untouched.", file=sys.stderr)
+            print_warning(f"Could not read recovery state:\n{recovery}\n{exc}\nThe folder was left untouched.")
             continue
 
         recovery_version = state.get("recovery_version") if isinstance(state, dict) else None
         if not isinstance(recovery_version, int) or isinstance(recovery_version, bool) or recovery_version not in SUPPORTED_RECOVERY_VERSIONS:
-            print(f"WARNING: Unsupported recovery state:\n{recovery}\nThe folder was left untouched.", file=sys.stderr)
+            print_warning(f"Unsupported recovery state:\n{recovery}\nThe folder was left untouched.")
             continue
 
         try:
             recovery_base = Path(state["base"]).resolve()
             recovery_destination = Path(state.get("destination", state["base"])).resolve()
         except Exception:
-            print(f"WARNING: Invalid recovery state:\n{recovery}\nThe folder was left untouched.", file=sys.stderr)
+            print_warning(f"Invalid recovery state:\n{recovery}\nThe folder was left untouched.")
             continue
 
         if recovery_base != base:
@@ -846,13 +849,13 @@ def run_locked_apply(
         print("\nPatch application cancelled.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_error(f"{exc}")
         return 1
 
     if not validate_warframe_installation(base, "Base"):
         return 1
     if not patch.is_file():
-        print(f"ERROR: Patch file does not exist: {patch}", file=sys.stderr)
+        print_error(f"Patch file does not exist: {patch}")
         return 1
 
     if completed_state is not None:
@@ -861,21 +864,21 @@ def run_locked_apply(
                 members = read_archive_members(archive)
                 completed_manifest = read_manifest(archive, members)
         except Exception as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
+            print_error(f"{exc}")
             return 1
 
         if recovery_matches_manifest(completed_state, completed_manifest):
             print(f"\n[Patched] The previous patch application had already completed successfully.\nBase: {base}\nOutput: {destination}")
             return 0
         if not in_place and destination.exists():
-            print(f"ERROR: Output path already exists and belongs to a previously completed different patch:\n{destination}", file=sys.stderr)
+            print_error(f"Output path already exists and belongs to a previously completed different patch:\n{destination}")
             return 1
 
     if not in_place and destination.exists():
-        print(f"ERROR: Output path already exists:\n{destination}", file=sys.stderr)
+        print_error(f"Output path already exists:\n{destination}")
         return 1
     if not HPATCHZ.is_file():
-        print(f"ERROR: hpatchz.exe was not found in the data folder:\n{HPATCHZ}", file=sys.stderr)
+        print_error(f"hpatchz.exe was not found in the data folder:\n{HPATCHZ}")
         return 1
 
     work = None
@@ -969,7 +972,7 @@ def run_locked_apply(
                         message = "\nPatch application interrupted.\nRolling back changes..."
                     else:
                         message = f"\nERROR: {patch_error}\nRolling back changes..."
-                    print(message, file=sys.stderr)
+                    print_console(message, file=sys.stderr)
                     try:
                         restore_in_place(base, backup, manifest["operations"], existed, manifest["old_root_sha256"], manifest["old_file_count"], temporary_token)
                     except BaseException as rollback_error:
@@ -1017,7 +1020,7 @@ def run_locked_apply(
                     if remove_incomplete_output(working_destination):
                         keep_work = False
                     else:
-                        print(f'WARNING: The incomplete temporary output could not be removed completely. Recovery data was kept at:\n{work}', file=sys.stderr)
+                        print_warning(f'The incomplete temporary output could not be removed completely. Recovery data was kept at:\n{work}')
                     raise
 
             duration = format_duration(time.perf_counter() - started)
@@ -1028,7 +1031,7 @@ def run_locked_apply(
         print("\nPatch application cancelled.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_error(f"{exc}")
         return 1
     finally:
         if work is not None and not keep_work:
@@ -1040,7 +1043,7 @@ def _run_operation(args, argv: list[str]) -> int:
         return update_result
 
     if not args.base.is_dir():
-        print(f"ERROR: Base directory does not exist: {args.base}", file=sys.stderr)
+        print_error(f"Base directory does not exist: {args.base}")
         return 1
     validate_installation_root_entry(args.base)
     base = args.base.resolve()
@@ -1057,7 +1060,7 @@ def _run_operation(args, argv: list[str]) -> int:
     if not args.in_place and (
         destination == base or is_within(destination, base) or is_within(base, destination)
     ):
-        print("ERROR: Output and base directories must not overlap.", file=sys.stderr)
+        print_error("Output and base directories must not overlap.")
         return 1
 
     try:
@@ -1070,7 +1073,7 @@ def _run_operation(args, argv: list[str]) -> int:
         print("\nPatch application cancelled.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_error(f"{exc}")
         return 1
 
 
@@ -1118,7 +1121,7 @@ def main() -> int:
         print("\nPatch application cancelled.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_error(f"{exc}")
         return 1
 
 if __name__ == "__main__":

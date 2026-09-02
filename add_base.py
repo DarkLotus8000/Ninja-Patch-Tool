@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from common import (
+    print_error,
     ENTRY_SCRIPTS,
     ErrorArgumentParser,
     INDEX_FILE,
@@ -59,7 +60,7 @@ def main() -> int:
                 return update_result
 
             if not args.path.is_dir():
-                print(f"ERROR: Base directory does not exist: {args.path}", file=sys.stderr)
+                print_error(f"Base directory does not exist: {args.path}")
                 return 1
             validate_installation_root_entry(args.path)
             base = args.path.resolve()
@@ -70,10 +71,10 @@ def main() -> int:
                 return 1
 
             if not name:
-                print("ERROR: Base name cannot be empty.", file=sys.stderr)
+                print_error("Base name cannot be empty.")
                 return 1
             if not is_steam_manifest_id(manifest_id):
-                print("ERROR: Steam manifest ID must be a valid unsigned 64-bit integer.", file=sys.stderr)
+                print_error("Steam manifest ID must be a valid unsigned 64-bit integer.")
                 return 1
 
             # Reject conflicts that can be determined from the index before doing a potentially very expensive full-tree hash.
@@ -81,7 +82,7 @@ def main() -> int:
             with index_update_lock(INDEX_FILE):
                 conflict = _existing_base_conflict(load_index(), name, manifest_id)
             if conflict is not None:
-                print(f"ERROR: {conflict}\nNo changes were made.", file=sys.stderr)
+                print_error(f"{conflict}\nNo changes were made.")
                 return 1
 
             with operation_lock("installation", base, "operation using this installation"):
@@ -93,12 +94,12 @@ def main() -> int:
                     index = load_index()
                     conflict = _existing_base_conflict(index, name, manifest_id)
                     if conflict is not None:
-                        print(f"ERROR: {conflict}\nNo changes were made.", file=sys.stderr)
+                        print_error(f"{conflict}\nNo changes were made.")
                         return 1
 
                     for existing_name, entry in index.items():
                         if entry["sha256"].lower() == root_hash.lower():
-                            print(f'ERROR: This exact base is already indexed as "{existing_name}".\nNo changes were made.', file=sys.stderr)
+                            print_error(f'This exact base is already indexed as "{existing_name}".\nNo changes were made.')
                             return 1
 
                     index[name] = {"steam_manifest_id": manifest_id, "sha256": root_hash, "file_count": len(files)}
@@ -110,7 +111,7 @@ def main() -> int:
         print("\nBase addition cancelled.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_error(f"{exc}")
         return 1
 
 if __name__ == "__main__":

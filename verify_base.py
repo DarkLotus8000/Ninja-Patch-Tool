@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from common import (
+    print_error,
     ENTRY_SCRIPTS,
     ErrorArgumentParser,
     console_title,
@@ -40,7 +41,7 @@ def main() -> int:
                 return update_result
 
             if not args.path.is_dir():
-                print(f"ERROR: Base directory does not exist: {args.path}", file=sys.stderr)
+                print_error(f"Base directory does not exist: {args.path}")
                 return 1
             validate_installation_root_entry(args.path)
             base = args.path.resolve()
@@ -58,21 +59,21 @@ def main() -> int:
                 files, actual_hash = scan_tree(base, "Hashing base")
 
             if actual_hash.lower() != expected["sha256"].lower() or len(files) != expected["file_count"]:
-                print(f"ERROR: Base verification failed.\nExpected files: {expected['file_count']:,}\nActual files: {len(files):,}\nExpected SHA-256: {expected['sha256']}\nActual SHA-256: {actual_hash}", file=sys.stderr)
+                print_error(f"Base verification failed.\nExpected files: {expected['file_count']:,}\nActual files: {len(files):,}\nExpected SHA-256: {expected['sha256']}\nActual SHA-256: {actual_hash}")
                 return 1
 
             print(f'\n[Verified] Base "{canonical_name}" is valid and unmodified.\nSteam manifest ID: {expected["steam_manifest_id"]}\nFiles: {len(files):,}\nSHA-256: {actual_hash}')
             return 0
 
     except KeyError:
-        print(f'ERROR: Base "{args.name}" is not present in data/index.json.', file=sys.stderr)
+        print_error(f'Base "{args.name}" is not present in data/index.json.')
         return 1
 
     except KeyboardInterrupt:
         print("\nBase verification cancelled.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_error(f"{exc}")
         return 1
 
 if __name__ == "__main__":

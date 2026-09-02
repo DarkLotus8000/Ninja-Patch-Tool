@@ -7,6 +7,14 @@ release/
 # Python cache
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage artifacts
+.coverage
+coverage.xml
+htmlcov/
 
 # Tool working directory
 temp/
@@ -20,6 +28,7 @@ release_temp/
 
 # Temporary files
 *.tmp
+*.part
 
 # Python virtual environments
 .venv/
@@ -29,3 +38,4 @@ env/
 # IDE settings
 .vscode/
 .idea/
+.vs/

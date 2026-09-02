@@ -1,6 +1,7 @@
 # Run from the project root with: py -m unittest discover -s tests
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import io
@@ -98,6 +99,33 @@ def write_recovery(work: Path, state: dict, recovery_version: int | None = None)
     (work / apply_patch.RECOVERY_FILE).write_text(json.dumps(data), encoding="utf-8")
 
 class CommonTests(unittest.TestCase):
+    def test_console_severity_colors_are_restrained(self) -> None:
+        stream = io.StringIO()
+        message = "WARNING: warning\nERROR: error\n[Verified] stays plain"
+        with mock.patch.object(common, "console_supports_color", return_value=True):
+            styled = common.style_console_text(message, stream)
+        self.assertIn("\x1b[93mWARNING:\x1b[0m", styled)
+        self.assertIn("\x1b[91mERROR:\x1b[0m", styled)
+        self.assertIn("[Verified]", styled)
+        self.assertNotIn("\x1b[91m[Verified]", styled)
+        self.assertNotIn("\x1b[93m[Verified]", styled)
+
+    def test_console_colors_are_disabled_for_non_tty_output(self) -> None:
+        message = "ERROR: failure"
+        self.assertEqual(common.style_console_text(message, io.StringIO()), message)
+
+    def test_argument_parser_colors_startup_error_prefix_on_tty(self) -> None:
+        stderr = io.StringIO()
+        parser = common.ErrorArgumentParser()
+        parser.add_argument("--known")
+        with (
+            mock.patch.object(common, "console_supports_color", return_value=True),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit),
+        ):
+            parser.parse_args(["--definitely-invalid"])
+        self.assertIn("\x1b[91mERROR:\x1b[0m", stderr.getvalue())
+
     def test_duplicate_json_keys_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
             common.parse_json('{"a": 1, "a": 2}')
@@ -540,6 +568,41 @@ This should not be included.
         with self.assertRaisesRegex(RuntimeError, "6.15.0 or newer"):
             build_release.validate_pyinstaller_version("6.14.2")
 
+    def test_source_tree_cleanliness_detects_generated_artifacts_but_allows_runtime_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".pytest_cache").mkdir()
+            (root / ".mypy_cache").mkdir()
+            (root / ".ruff_cache").mkdir()
+            (root / "htmlcov").mkdir()
+            (root / ".coverage").write_text("coverage", encoding="ascii")
+            (root / "coverage.xml").write_text("coverage", encoding="ascii")
+            (root / "nested").mkdir()
+            (root / "nested" / "download.zip.part").write_bytes(b"partial")
+            (root / "data").mkdir()
+            (root / "data" / ".index.lock").write_text("1", encoding="ascii")
+
+            self.assertEqual(
+                build_release.source_tree_artifacts(root),
+                [
+                    ".coverage",
+                    ".mypy_cache/",
+                    ".pytest_cache/",
+                    ".ruff_cache/",
+                    "coverage.xml",
+                    "htmlcov/",
+                    "nested/download.zip.part",
+                ],
+            )
+            with self.assertRaisesRegex(RuntimeError, "Generated/cache artifacts must be removed"):
+                build_release.validate_source_tree_cleanliness(root)
+
+    def test_gitignore_covers_source_tree_hygiene_artifacts(self) -> None:
+        patterns = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        for pattern in ("*.part", ".coverage", "coverage.xml", "htmlcov/", ".vs/"):
+            with self.subTest(pattern=pattern):
+                self.assertIn(pattern, patterns)
+
     def test_release_builder_requires_python_314(self) -> None:
         for version in ((3, 13, 9), (3, 15, 0)):
             with self.subTest(version=version):
@@ -712,7 +775,7 @@ This should not be included.
 
     def test_check_update_reports_newer_release(self) -> None:
         stdout = io.StringIO()
-        release = {"version": "1.5", "url": "https://example.test/release"}
+        release = {"version": "1.6", "url": "https://example.test/release"}
         with (
             mock.patch.object(update, "latest_release", return_value=release),
             mock.patch.object(update, "_record_update_check_result") as record,
@@ -722,7 +785,7 @@ This should not be included.
         record.assert_called_once_with("update_available")
         self.assertEqual(
             stdout.getvalue(),
-            "[Update] Ninja Patch Tool v1.5 is available.\n"
+            "[Update] Ninja Patch Tool v1.6 is available.\n"
             f"Current version: v{common.VERSION}\n"
             "Release: https://example.test/release\n",
         )

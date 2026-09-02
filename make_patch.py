@@ -12,6 +12,8 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from common import (
+    print_error,
+    print_warning,
     ENTRY_SCRIPTS,
     ByteProgress,
     ErrorArgumentParser,
@@ -298,7 +300,7 @@ def measure_full_file_compressed_size(file_info: dict, compression: str, work: P
         with zipfile.ZipFile(candidate, "r") as archive:
             return archive.getinfo("candidate.bin").compress_size
     except Exception as exc:
-        print(f"WARNING: Could not test compressed full-file candidate for {file_info['path']}: {exc}", file=sys.stderr)
+        print_warning(f"Could not test compressed full-file candidate for {file_info['path']}: {exc}")
         return None
     finally:
         candidate.unlink(missing_ok=True)
@@ -362,10 +364,10 @@ def _run_operation(args, argv: list[str]) -> int:
         return update_result
 
     if not args.base.is_dir():
-        print(f"ERROR: Base directory does not exist: {args.base}", file=sys.stderr)
+        print_error(f"Base directory does not exist: {args.base}")
         return 1
     if not args.new.is_dir():
-        print(f"ERROR: New directory does not exist: {args.new}", file=sys.stderr)
+        print_error(f"New directory does not exist: {args.new}")
         return 1
     validate_installation_root_entry(args.base)
     validate_installation_root_entry(args.new)
@@ -378,28 +380,28 @@ def _run_operation(args, argv: list[str]) -> int:
     if not validate_warframe_installation(new, "New"):
         return 1
     if base == new:
-        print("ERROR: Base and new directories are the same.", file=sys.stderr)
+        print_error("Base and new directories are the same.")
         return 1
     if is_within(output, base) or is_within(output, new):
-        print(f"ERROR: Patch output must not be inside the base or new installation:\n{output}", file=sys.stderr)
+        print_error(f"Patch output must not be inside the base or new installation:\n{output}")
         return 1
     if not HDIFFZ.is_file():
-        print(f"ERROR: hdiffz.exe was not found in the data folder:\n{HDIFFZ}", file=sys.stderr)
+        print_error(f"hdiffz.exe was not found in the data folder:\n{HDIFFZ}")
         return 1
     if output.exists():
-        print(f'ERROR: Patch output already exists:\n{output}\nChoose a different output name or remove the existing patch first.\nNo patch was generated.', file=sys.stderr)
+        print_error(f'Patch output already exists:\n{output}\nChoose a different output name or remove the existing patch first.\nNo patch was generated.')
         return 1
 
     try:
         resolve_base_name(load_index(), args.base_name)
     except KeyError:
-        print(f'ERROR: Base "{args.base_name}" is not present in data/index.json.', file=sys.stderr)
+        print_error(f'Base "{args.base_name}" is not present in data/index.json.')
         return 1
     except KeyboardInterrupt:
         print("\nPatch creation cancelled.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_error(f"{exc}")
         return 1
 
     work = None
@@ -570,13 +572,13 @@ def _run_operation(args, argv: list[str]) -> int:
         return 0
 
     except KeyError:
-        print(f'ERROR: Base "{args.base_name}" is not present in data/index.json.', file=sys.stderr)
+        print_error(f'Base "{args.base_name}" is not present in data/index.json.')
         return 1
     except KeyboardInterrupt:
         print("\nPatch creation cancelled.\nCleaning up temporary patch data...", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_error(f"{exc}")
         return 1
     finally:
         if work is not None:
@@ -620,7 +622,7 @@ def main() -> int:
         print("\nPatch creation cancelled.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_error(f"{exc}")
         return 1
 
 if __name__ == "__main__":
