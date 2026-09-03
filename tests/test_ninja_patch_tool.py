@@ -2216,8 +2216,8 @@ This should not be included.
                 common.validate_installation_root_entry(link)
 
     def test_reparse_attribute_is_detected(self) -> None:
-        self.assertTrue(common._is_reparse_stat(SimpleNamespace(st_file_attributes=0x400)))
-        self.assertFalse(common._is_reparse_stat(SimpleNamespace(st_file_attributes=0)))
+        self.assertTrue(common.is_reparse_stat(SimpleNamespace(st_file_attributes=0x400)))
+        self.assertFalse(common.is_reparse_stat(SimpleNamespace(st_file_attributes=0)))
 
     def test_scan_tree_rejects_case_insensitive_path_collisions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3367,9 +3367,6 @@ class ApplyPatchTests(unittest.TestCase):
                 update.install_staged_release(stage, install)
             self.assertEqual(list(external.iterdir()), [])
 
-    def test_updater_reparse_attribute_is_detected(self) -> None:
-        self.assertTrue(update._is_reparse_stat(SimpleNamespace(st_file_attributes=0x400)))
-        self.assertFalse(update._is_reparse_stat(SimpleNamespace(st_file_attributes=0)))
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,7 @@ from common import (
     compare_versions,
     exclusive_operation_activity_lock,
     format_bytes,
+    is_reparse_stat,
     is_sha256,
     natural_sort_key,
     parse_json,
@@ -952,10 +953,6 @@ def write_update_session(work: Path) -> None:
     finally:
         temporary.unlink(missing_ok=True)
 
-def _is_reparse_stat(stat_result) -> bool:
-    attributes = int(getattr(stat_result, "st_file_attributes", 0))
-    return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)))
-
 def _validate_update_destination_path(install_dir: Path, relative: Path = Path()) -> None:
     # Never traverse an existing symlink/junction/reparse point while replacing installation files. In particular,
     # an existing directory junction such as data/licenses must not redirect updater writes outside the tool folder.
@@ -969,7 +966,7 @@ def _validate_update_destination_path(install_dir: Path, relative: Path = Path()
             break
         except OSError as exc:
             raise RuntimeError(f"Could not inspect Ninja Patch Tool update destination:\n{current}") from exc
-        if stat.S_ISLNK(current_stat.st_mode) or _is_reparse_stat(current_stat):
+        if stat.S_ISLNK(current_stat.st_mode) or is_reparse_stat(current_stat):
             raise RuntimeError(
                 f"Ninja Patch Tool update destination contains a symlink, junction, or reparse point:\n{current}"
             )

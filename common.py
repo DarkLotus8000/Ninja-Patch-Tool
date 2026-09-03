@@ -316,7 +316,7 @@ def _stat_identity(stat_result) -> tuple[int, int, int]:
         creation_ns = stat_result.st_ctime_ns
     return int(stat_result.st_dev), int(stat_result.st_ino), int(creation_ns)
 
-def _is_reparse_stat(stat_result) -> bool:
+def is_reparse_stat(stat_result) -> bool:
     attributes = int(getattr(stat_result, "st_file_attributes", 0))
     return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)))
 
@@ -325,7 +325,7 @@ def validate_installation_root_entry(root: Path) -> None:
         root_stat = root.lstat()
     except OSError as exc:
         raise RuntimeError(f"Could not inspect installation root:\n{root}") from exc
-    if root.is_symlink() or _is_reparse_stat(root_stat):
+    if root.is_symlink() or is_reparse_stat(root_stat):
         raise RuntimeError(
             f"Warframe installation root must not be a symlink, junction, or reparse point:\n{root}"
         )
@@ -347,7 +347,7 @@ def validated_tree_paths(root: Path) -> tuple[list[Path], list[Path]]:
                 entry_stat = entry.stat(follow_symlinks=False)
             except OSError as exc:
                 raise RuntimeError(f"Could not inspect installation path:\n{path}") from exc
-            if entry.is_symlink() or _is_reparse_stat(entry_stat):
+            if entry.is_symlink() or is_reparse_stat(entry_stat):
                 raise RuntimeError(
                     "Warframe installation contains a symlink, junction, or reparse point, which Ninja Patch Tool "
                     f"does not support:\n{path}"
