@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -414,6 +415,121 @@ def smoke_test_executables(dist: Path) -> None:
             details = updater_result.stderr.strip() or updater_result.stdout.strip() or "No output was produced."
             raise RuntimeError(f"Internal updater smoke test failed for {executable.name}:\n{details}")
 
+def run_release_workflow_command(
+    executable: Path,
+    arguments: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+) -> None:
+    command = [str(executable), *arguments]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Release round-trip smoke test timed out: {executable.name}") from exc
+    if result.returncode != 0:
+        details = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip()) or "No output was produced."
+        raise RuntimeError(f"Release round-trip smoke test failed for {executable.name}:\n{details}")
+
+def release_smoke_tree_hashes(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): sha256_file(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+def smoke_test_release_round_trip(stage: Path, workspace: Path) -> None:
+    print("[Testing] Release patch round trip")
+    workspace.mkdir(parents=True)
+    tool = workspace / "tool"
+    shutil.copytree(stage, tool)
+
+    base = workspace / "base"
+    new = workspace / "new"
+    for root in (base, new):
+        (root / "Cache.Windows").mkdir(parents=True)
+        (root / "Tools").mkdir()
+
+    base_executable = b"NPT release smoke base executable\n" * 1024
+    new_executable = base_executable[:-64] + b"NPT release smoke updated executable\n" * 2
+    base_cache = bytes(range(256)) * 256
+    new_cache = base_cache[:32768] + (b"updated-cache-block" * 512) + base_cache[43008:]
+
+    (base / "Warframe.x64.exe").write_bytes(base_executable)
+    (new / "Warframe.x64.exe").write_bytes(new_executable)
+    (base / "Cache.Windows" / "F.TextureDx9.cache").write_bytes(base_cache)
+    (new / "Cache.Windows" / "F.TextureDx9.cache").write_bytes(new_cache)
+    (base / "Tools" / "build-smoke-tool.bin").write_bytes(b"unchanged-tool-data" * 256)
+    (new / "Tools" / "build-smoke-tool.bin").write_bytes(b"unchanged-tool-data" * 256)
+    (base / "Cache.Windows" / "removed.cache").write_bytes(b"removed by smoke patch")
+    (new / "Cache.Windows" / "added.cache").write_bytes(b"added by smoke patch")
+
+    base_before = release_smoke_tree_hashes(base)
+    expected = release_smoke_tree_hashes(new)
+    patch = workspace / "roundtrip.patch"
+    applied = workspace / "applied"
+    base_name = "NPT-BUILD-SMOKE-BASE"
+    environment = build_environment(workspace / "runtime")
+    environment["NO_COLOR"] = "1"
+
+    run_release_workflow_command(
+        tool / "add_base.exe",
+        [str(base), base_name, "18446744073709551615", "-n"],
+        cwd=tool,
+        environment=environment,
+    )
+    run_release_workflow_command(
+        tool / "verify_base.exe",
+        [str(base), base_name, "-n"],
+        cwd=tool,
+        environment=environment,
+    )
+    run_release_workflow_command(
+        tool / "make_patch.exe",
+        [str(base), str(new), str(patch), base_name, "-c", "normal", "-n"],
+        cwd=tool,
+        environment=environment,
+    )
+    if not patch.is_file():
+        raise RuntimeError("Release round-trip smoke test did not create the expected patch file.")
+    run_release_workflow_command(
+        tool / "apply_patch.exe",
+        [str(base), str(patch), "-o", str(applied), "-n"],
+        cwd=tool,
+        environment=environment,
+    )
+    if not applied.is_dir():
+        raise RuntimeError("Release round-trip smoke test did not create the expected patched installation.")
+    if release_smoke_tree_hashes(applied) != expected:
+        raise RuntimeError("Release round-trip smoke test produced files that do not match the expected installation.")
+    if release_smoke_tree_hashes(base) != base_before:
+        raise RuntimeError("Release round-trip smoke test unexpectedly modified the base installation.")
+
+    # Exercise the riskier in-place path separately on a disposable base copy.
+    # This covers backup creation/verification, replacement, final verification,
+    # and successful recovery-work cleanup in the actual packaged executable.
+    in_place = workspace / "in-place"
+    shutil.copytree(base, in_place)
+    run_release_workflow_command(
+        tool / "apply_patch.exe",
+        [str(in_place), str(patch), "-i", "-n"],
+        cwd=tool,
+        environment=environment,
+    )
+    if release_smoke_tree_hashes(in_place) != expected:
+        raise RuntimeError("Release in-place smoke test produced files that do not match the expected installation.")
+    if release_smoke_tree_hashes(base) != base_before:
+        raise RuntimeError("Release in-place smoke test unexpectedly modified the original base installation.")
+    if (tool / "temp").exists():
+        raise RuntimeError("Release in-place smoke test left temporary recovery data behind after successful completion.")
+
 def populate_release(stage: Path, dist: Path, project_licenses: list[Path]) -> None:
     stage.mkdir(parents=True)
     for script in ENTRY_SCRIPTS:
@@ -490,6 +606,51 @@ def publish_without_overwrite(temporary: Path, output: Path) -> None:
     except FileExistsError:
         raise FileExistsError(f"Release output appeared while the release was being created: {output}") from None
 
+def validate_release_archive(archive: Path, stage: Path) -> None:
+    prefix = stage.name + "/"
+    expected_names = {
+        prefix + path.relative_to(stage).as_posix()
+        for path in stage.rglob("*")
+        if path.is_file()
+    }
+    with zipfile.ZipFile(archive, "r") as zip_file:
+        bad_member = zip_file.testzip()
+        if bad_member is not None:
+            raise RuntimeError(f"Release archive CRC validation failed: {bad_member}")
+        names = zip_file.namelist()
+        if len(names) != len(set(names)):
+            raise RuntimeError("Release archive contains duplicate members.")
+        actual_names = set(names)
+        if actual_names != expected_names:
+            missing = sorted(expected_names - actual_names, key=str.casefold)
+            extra = sorted(actual_names - expected_names, key=str.casefold)
+            details = []
+            if missing:
+                details.append("Missing: " + ", ".join(missing))
+            if extra:
+                details.append("Unexpected: " + ", ".join(extra))
+            raise RuntimeError("Release archive member set does not match the staged release. " + " ".join(details))
+
+        manifest_name = prefix + RELEASE_MANIFEST_FILE
+        try:
+            archived_manifest = parse_json(zip_file.read(manifest_name).decode("utf-8"))
+            staged_manifest = parse_json((stage / RELEASE_MANIFEST_FILE).read_text(encoding="utf-8"))
+        except (KeyError, UnicodeDecodeError, OSError, ValueError) as exc:
+            raise RuntimeError(f"Release archive manifest is invalid: {exc}") from exc
+        if archived_manifest != staged_manifest:
+            raise RuntimeError("Release archive manifest does not match the staged release manifest.")
+        files = archived_manifest.get("files") if isinstance(archived_manifest, dict) else None
+        if not isinstance(files, dict):
+            raise RuntimeError("Release archive manifest contains invalid file metadata.")
+        for relative, expected_digest in files.items():
+            try:
+                with zip_file.open(prefix + relative, "r") as member:
+                    actual_digest = hashlib.file_digest(member, "sha256").hexdigest()
+            except KeyError as exc:
+                raise RuntimeError(f"Release archive is missing managed file: {relative}") from exc
+            if actual_digest != expected_digest:
+                raise RuntimeError(f"Release archive hash mismatch: {relative}")
+
 def create_release_archive(stage: Path) -> Path:
     RELEASE_DIR.mkdir(parents=True, exist_ok=True)
     archive = validate_release_output_available()
@@ -502,6 +663,11 @@ def create_release_archive(stage: Path) -> Path:
         publish_without_overwrite(temporary, archive)
     except BaseException:
         temporary.unlink(missing_ok=True)
+        raise
+    try:
+        validate_release_archive(archive, stage)
+    except BaseException:
+        archive.unlink(missing_ok=True)
         raise
     return archive
 
@@ -556,6 +722,7 @@ def main() -> int:
                         build_executable(ROOT / script, dist, work, specs)
                     smoke_test_executables(dist)
                     populate_release(stage, dist, project_licenses)
+                    smoke_test_release_round_trip(stage, temporary / "roundtrip")
                     write_release_manifest(stage)
                     archive, checksum, digest = create_release_outputs(stage)
             finally:

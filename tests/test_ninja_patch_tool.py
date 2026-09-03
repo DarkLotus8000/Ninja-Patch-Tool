@@ -104,11 +104,11 @@ class CommonTests(unittest.TestCase):
         message = "WARNING: warning\nERROR: error\n[Verified] stays plain"
         with mock.patch.object(common, "console_supports_color", return_value=True):
             styled = common.style_console_text(message, stream)
-        self.assertIn("\x1b[93mWARNING:\x1b[0m", styled)
-        self.assertIn("\x1b[91mERROR:\x1b[0m", styled)
+        self.assertIn("\x1b[33mWARNING:\x1b[0m", styled)
+        self.assertIn("\x1b[31mERROR:\x1b[0m", styled)
         self.assertIn("[Verified]", styled)
-        self.assertNotIn("\x1b[91m[Verified]", styled)
-        self.assertNotIn("\x1b[93m[Verified]", styled)
+        self.assertNotIn("\x1b[31m[Verified]", styled)
+        self.assertNotIn("\x1b[33m[Verified]", styled)
 
     def test_console_colors_are_disabled_for_non_tty_output(self) -> None:
         message = "ERROR: failure"
@@ -124,7 +124,7 @@ class CommonTests(unittest.TestCase):
             self.assertRaises(SystemExit),
         ):
             parser.parse_args(["--definitely-invalid"])
-        self.assertIn("\x1b[91mERROR:\x1b[0m", stderr.getvalue())
+        self.assertIn("\x1b[31mERROR:\x1b[0m", stderr.getvalue())
 
     def test_duplicate_json_keys_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
@@ -481,6 +481,43 @@ This should not be included.
             )
             self.assertEqual(manifest["files"]["make_patch.exe"], sha256_bytes(b"exe"))
 
+    def test_release_archive_validates_exact_members_and_manifest_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / f"NinjaPatchTool-v{common.VERSION}"
+            (stage / "data").mkdir(parents=True)
+            (stage / "make_patch.exe").write_bytes(b"expected-exe")
+            (stage / "data" / "index.json").write_text("{}", encoding="utf-8")
+            build_release.write_release_manifest(stage)
+            prefix = stage.name + "/"
+
+            valid = root / "valid.zip"
+            with zipfile.ZipFile(valid, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for path in stage.rglob("*"):
+                    if path.is_file():
+                        archive.write(path, prefix + path.relative_to(stage).as_posix())
+            build_release.validate_release_archive(valid, stage)
+
+            extra = root / "extra.zip"
+            with zipfile.ZipFile(extra, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for path in stage.rglob("*"):
+                    if path.is_file():
+                        archive.write(path, prefix + path.relative_to(stage).as_posix())
+                archive.writestr(prefix + "unexpected.bin", b"extra")
+            with self.assertRaisesRegex(RuntimeError, "member set"):
+                build_release.validate_release_archive(extra, stage)
+
+            tampered = root / "tampered.zip"
+            with zipfile.ZipFile(tampered, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for path in stage.rglob("*"):
+                    if not path.is_file():
+                        continue
+                    relative = path.relative_to(stage).as_posix()
+                    payload = b"tampered" if relative == "make_patch.exe" else path.read_bytes()
+                    archive.writestr(prefix + relative, payload)
+            with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
+                build_release.validate_release_archive(tampered, stage)
+
     def test_release_preflight_validates_x64_pe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "tool.exe"
@@ -692,6 +729,72 @@ This should not be included.
                 expected.append([f"{Path(script).stem}.exe", "--update-installer", "--version"])
             self.assertEqual([[Path(command[0]).name, *command[1:]] for command in calls], expected)
             self.assertEqual(timeouts, [120] * len(expected))
+
+    def test_release_round_trip_smoke_runs_full_cli_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / "stage"
+            stage.mkdir()
+            for script in build_release.ENTRY_SCRIPTS:
+                (stage / f"{Path(script).stem}.exe").write_bytes(b"exe")
+
+            calls: list[list[str]] = []
+            environments: list[dict[str, str]] = []
+            newer: Path | None = None
+
+            def run(command, cwd, env, capture_output, text, timeout):
+                nonlocal newer
+                calls.append(command)
+                environments.append(env)
+                name = Path(command[0]).name
+                if name == "make_patch.exe":
+                    newer = Path(command[2])
+                    Path(command[3]).write_bytes(b"patch")
+                elif name == "apply_patch.exe":
+                    self.assertIsNotNone(newer)
+                    if "-o" in command:
+                        shutil.copytree(newer, Path(command[4]))
+                    else:
+                        target = Path(command[1])
+                        shutil.rmtree(target)
+                        shutil.copytree(newer, target)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(build_release.subprocess, "run", side_effect=run):
+                build_release.smoke_test_release_round_trip(stage, root / "roundtrip")
+
+            self.assertEqual(
+                [Path(command[0]).name for command in calls],
+                ["add_base.exe", "verify_base.exe", "make_patch.exe", "apply_patch.exe", "apply_patch.exe"],
+            )
+            self.assertTrue(all("-n" in command for command in calls))
+            self.assertTrue(all(env.get("NO_COLOR") == "1" for env in environments))
+            self.assertEqual([call[-1] for call in calls[:2]], ["-n", "-n"])
+            self.assertEqual(calls[2][-3:], ["-c", "normal", "-n"])
+            self.assertEqual(calls[3][-3], "-o")
+            self.assertEqual(calls[4][-2:], ["-i", "-n"])
+
+    def test_release_round_trip_smoke_rejects_incorrect_applied_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / "stage"
+            stage.mkdir()
+            for script in build_release.ENTRY_SCRIPTS:
+                (stage / f"{Path(script).stem}.exe").write_bytes(b"exe")
+
+            def run(command, cwd, env, capture_output, text, timeout):
+                name = Path(command[0]).name
+                if name == "make_patch.exe":
+                    Path(command[3]).write_bytes(b"patch")
+                elif name == "apply_patch.exe":
+                    output = Path(command[4])
+                    output.mkdir()
+                    (output / "wrong.bin").write_bytes(b"wrong")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(build_release.subprocess, "run", side_effect=run):
+                with self.assertRaisesRegex(RuntimeError, "do not match the expected installation"):
+                    build_release.smoke_test_release_round_trip(stage, root / "roundtrip")
 
     def test_release_output_is_checked_before_building(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

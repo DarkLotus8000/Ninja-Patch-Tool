@@ -92,7 +92,7 @@ def style_console_text(message: str, stream) -> str:
 
     def severity_replacement(match: re.Match[str]) -> str:
         token = match.group(1)
-        return _colored(token, "\x1b[91m" if token == "ERROR:" else "\x1b[93m")
+        return _colored(token, "\x1b[31m" if token == "ERROR:" else "\x1b[33m")
 
     return _SEVERITY_TOKEN_RE.sub(severity_replacement, message)
 
