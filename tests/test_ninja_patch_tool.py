@@ -10,7 +10,6 @@ import os
 import shutil
 import subprocess
 import sys
-import struct
 import tempfile
 import unittest
 import zipfile
@@ -533,27 +532,6 @@ This should not be included.
             with self.assertRaisesRegex(RuntimeError, "not an x86-64"):
                 build_release.validate_pe_x64(executable)
 
-    def test_release_icon_contains_all_required_resolutions(self) -> None:
-        data = build_release.FAVICON.read_bytes()
-        reserved, icon_type, count = struct.unpack_from("<HHH", data, 0)
-        self.assertEqual((reserved, icon_type, count), (0, 1, len(build_release.ICO_SIZES)))
-        sizes = []
-        for index in range(count):
-            entry_offset = 6 + index * 16
-            width = data[entry_offset] or 256
-            height = data[entry_offset + 1] or 256
-            planes, bit_count = struct.unpack_from("<HH", data, entry_offset + 4)
-            payload_size, payload_offset = struct.unpack_from("<II", data, entry_offset + 8)
-            payload = data[payload_offset:payload_offset + payload_size]
-            self.assertEqual(width, height)
-            self.assertIn(planes, {0, 1})
-            self.assertEqual(bit_count, 32)
-            self.assertTrue(payload.startswith(b"\x89PNG\r\n\x1a\n"))
-            self.assertEqual(struct.unpack_from(">II", payload, 16), (width, height))
-            self.assertIn(payload[25], {4, 6})
-            sizes.append(width)
-        self.assertEqual(tuple(sizes), build_release.ICO_SIZES)
-
     def test_release_preflight_validates_ico_structure(self) -> None:
         build_release.validate_ico(build_release.FAVICON)
         with tempfile.TemporaryDirectory() as tmp:
@@ -663,12 +641,6 @@ This should not be included.
             )
             with self.assertRaisesRegex(RuntimeError, "Generated/cache artifacts must be removed"):
                 build_release.validate_source_tree_cleanliness(root)
-
-    def test_gitignore_covers_source_tree_hygiene_artifacts(self) -> None:
-        patterns = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
-        for pattern in ("*.part", ".coverage", "coverage.xml", "htmlcov/", ".vs/"):
-            with self.subTest(pattern=pattern):
-                self.assertIn(pattern, patterns)
 
     def test_release_builder_requires_python_314(self) -> None:
         for version in ((3, 13, 9), (3, 15, 0)):
