@@ -3384,6 +3384,5 @@ class ApplyPatchTests(unittest.TestCase):
                 update.install_staged_release(stage, install)
             self.assertEqual(list(external.iterdir()), [])
 
-
 if __name__ == "__main__":
     unittest.main()

@@ -585,7 +585,6 @@ def _run_operation(args, argv: list[str]) -> int:
             cleanup_work_dir(work)
         locks.close()
 
-
 def main() -> int:
     install_termination_handlers()
     argv = sys.argv[1:]

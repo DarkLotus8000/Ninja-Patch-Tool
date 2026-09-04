@@ -36,7 +36,6 @@ _COLOR_SUPPORT_LOCK = threading.Lock()
 _COLOR_SUPPORT_CACHE: dict[int, bool] = {}
 _SEVERITY_TOKEN_RE = re.compile(r"(?m)^(ERROR:|WARNING:)")
 
-
 def _enable_windows_virtual_terminal(stream) -> bool:
     if os.name != "nt":
         return True
@@ -61,7 +60,6 @@ def _enable_windows_virtual_terminal(stream) -> bool:
     except (AttributeError, OSError, ValueError):
         return False
 
-
 def console_supports_color(stream) -> bool:
     """Return whether ANSI color is safe for this interactive stream."""
     if os.environ.get("NO_COLOR") is not None:
@@ -80,10 +78,8 @@ def console_supports_color(stream) -> bool:
         _COLOR_SUPPORT_CACHE[key] = supported
         return supported
 
-
 def _colored(token: str, color: str) -> str:
     return f"{color}{token}\x1b[0m"
-
 
 def style_console_text(message: str, stream) -> str:
     """Color severity prefixes only; redirected output remains plain text."""
@@ -96,19 +92,15 @@ def style_console_text(message: str, stream) -> str:
 
     return _SEVERITY_TOKEN_RE.sub(severity_replacement, message)
 
-
 def print_console(message: object = "", *, file=None, flush: bool = False) -> None:
     stream = sys.stdout if file is None else file
     print(style_console_text(str(message), stream), file=stream, flush=flush)
 
-
 def print_error(message: object, *, flush: bool = False) -> None:
     print_console(f"ERROR: {message}", file=sys.stderr, flush=flush)
 
-
 def print_warning(message: object, *, flush: bool = False) -> None:
     print_console(f"WARNING: {message}", file=sys.stderr, flush=flush)
-
 
 class ActiveOperationError(RuntimeError):
     pass

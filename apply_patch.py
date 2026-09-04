@@ -1049,7 +1049,6 @@ def _run_operation(args, argv: list[str]) -> int:
     base = args.base.resolve()
     patch = resolve_patch_path(args.patch)
 
-
     if args.in_place:
         destination = base
     elif args.output is not None:
@@ -1075,7 +1074,6 @@ def _run_operation(args, argv: list[str]) -> int:
     except Exception as exc:
         print_error(f"{exc}")
         return 1
-
 
 def main() -> int:
     install_termination_handlers()
