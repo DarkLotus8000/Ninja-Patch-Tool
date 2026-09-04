@@ -126,17 +126,6 @@ def release_checksum_path() -> Path:
     archive = release_archive_path()
     return archive.with_name(archive.name + ".sha256")
 
-def validate_release_output_available() -> Path:
-    archive = release_archive_path()
-    checksum = release_checksum_path()
-    for output in (archive, checksum):
-        temporary = output.with_name(output.name + ".tmp")
-        if output.exists():
-            raise FileExistsError(f"Release output already exists: {output}")
-        if temporary.exists():
-            raise FileExistsError(f"Release output temporary file already exists: {temporary}")
-    return archive
-
 def clean_stale_release_temp() -> None:
     if not RELEASE_TEMP_DIR.exists():
         return
@@ -600,12 +589,6 @@ def validate_release_manifest(stage: Path) -> None:
     if files != release_managed_file_hashes(stage):
         raise RuntimeError("Release manifest does not match the staged release files.")
 
-def publish_without_overwrite(temporary: Path, output: Path) -> None:
-    try:
-        temporary.rename(output)
-    except FileExistsError:
-        raise FileExistsError(f"Release output appeared while the release was being created: {output}") from None
-
 def validate_release_archive(archive: Path, stage: Path) -> None:
     prefix = stage.name + "/"
     expected_names = {
@@ -651,59 +634,57 @@ def validate_release_archive(archive: Path, stage: Path) -> None:
             if actual_digest != expected_digest:
                 raise RuntimeError(f"Release archive hash mismatch: {relative}")
 
-def create_release_archive(stage: Path) -> Path:
+def create_release_outputs(stage: Path) -> tuple[Path, Path, str, str]:
+    validate_release_manifest(stage)
     RELEASE_DIR.mkdir(parents=True, exist_ok=True)
-    archive = validate_release_output_available()
-    temporary = archive.with_name(archive.name + ".tmp")
+    archive = release_archive_path()
+    checksum = release_checksum_path()
+    temporary_archive = archive.with_name(archive.name + ".tmp")
+    temporary_checksum = checksum.with_name(checksum.name + ".tmp")
+
+    temporary_archive.unlink(missing_ok=True)
+    temporary_checksum.unlink(missing_ok=True)
     try:
-        with zipfile.ZipFile(temporary, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as output:
+        with zipfile.ZipFile(temporary_archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as output:
             for path in sorted(stage.rglob("*")):
                 if path.is_file():
                     output.write(path, f"{stage.name}/{path.relative_to(stage).as_posix()}")
-        publish_without_overwrite(temporary, archive)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    try:
-        validate_release_archive(archive, stage)
-    except BaseException:
-        archive.unlink(missing_ok=True)
-        raise
-    return archive
+        validate_release_archive(temporary_archive, stage)
+        digest = sha256_file(temporary_archive)
+        checksum_text = f"{digest}  {archive.name}\n"
+        temporary_checksum.write_text(checksum_text, encoding="ascii", newline="\n")
 
-def create_release_checksum(archive: Path) -> tuple[Path, str]:
-    checksum = release_checksum_path()
-    temporary = checksum.with_name(checksum.name + ".tmp")
-    if checksum.exists():
-        raise FileExistsError(f"Release output already exists: {checksum}")
-    if temporary.exists():
-        raise FileExistsError(f"Release output temporary file already exists: {temporary}")
-    digest = sha256_file(archive)
-    try:
-        with temporary.open("x", encoding="ascii", newline="\n") as file:
-            file.write(f"{digest}  {archive.name}\n")
-        publish_without_overwrite(temporary, checksum)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    return checksum, digest
+        if archive.exists() and not archive.is_file():
+            raise RuntimeError(f"Release archive path is not a file: {archive}")
+        if checksum.exists() and not checksum.is_file():
+            raise RuntimeError(f"Release checksum path is not a file: {checksum}")
 
-def create_release_outputs(stage: Path) -> tuple[Path, Path, str]:
-    validate_release_manifest(stage)
-    archive = create_release_archive(stage)
-    try:
-        checksum, digest = create_release_checksum(archive)
+        archive_existed = archive.is_file()
+        if archive_existed and sha256_file(archive) == digest:
+            temporary_archive.unlink()
+            try:
+                checksum_matches = checksum.read_text(encoding="ascii") == checksum_text
+            except (OSError, UnicodeError):
+                checksum_matches = False
+            if checksum_matches:
+                temporary_checksum.unlink()
+            else:
+                temporary_checksum.replace(checksum)
+            return archive, checksum, digest, "unchanged"
+
+        temporary_archive.replace(archive)
+        temporary_checksum.replace(checksum)
+        return archive, checksum, digest, "replaced" if archive_existed else "created"
     except BaseException:
-        archive.unlink(missing_ok=True)
+        temporary_archive.unlink(missing_ok=True)
+        temporary_checksum.unlink(missing_ok=True)
         raise
-    return archive, checksum, digest
 
 def main() -> int:
     try:
         project_licenses = validate_build_environment()
         archive = release_archive_path()
         with operation_lock("release", archive, "release build for this version"):
-            validate_release_output_available()
             clean_stale_release_temp()
             run_source_tests()
             RELEASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -724,14 +705,14 @@ def main() -> int:
                     populate_release(stage, dist, project_licenses)
                     smoke_test_release_round_trip(stage, temporary / "roundtrip")
                     write_release_manifest(stage)
-                    archive, checksum, digest = create_release_outputs(stage)
+                    archive, checksum, digest, result = create_release_outputs(stage)
             finally:
                 try:
                     RELEASE_TEMP_DIR.rmdir()
                 except OSError:
                     pass
 
-        print(f"\n[Created] {archive}")
+        print(f"\n[{result.capitalize()}] {archive}")
         print(f'Version: {VERSION}\nSize: {format_bytes(archive.stat().st_size)}\nSHA-256: {digest}\nChecksum: {checksum}')
         return 0
     except KeyboardInterrupt:

@@ -574,30 +574,60 @@ This should not be included.
             with self.assertRaisesRegex(RuntimeError, "exactly these resolutions"):
                 build_release.validate_ico(old_style)
 
-    def test_release_checksum_is_generated(self) -> None:
+    def test_release_outputs_keep_identical_archive_repair_checksum_and_replace_changed_build(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            release_dir = Path(tmp)
+            root = Path(tmp)
+            release_dir = root / "release"
+            stage = root / f"NinjaPatchTool-v{common.VERSION}"
+            stage.mkdir()
+            (stage / "NinjaPatchTool.exe").write_bytes(b"exe")
+            build_release.write_release_manifest(stage)
+
             with mock.patch.object(build_release, "RELEASE_DIR", release_dir):
-                archive = build_release.release_archive_path()
-                archive.write_bytes(b"release")
-                checksum, digest = build_release.create_release_checksum(archive)
-                self.assertEqual(digest, hashlib.sha256(b"release").hexdigest())
+                archive, checksum, digest, result = build_release.create_release_outputs(stage)
+                self.assertEqual(result, "created")
+                original_archive = archive.read_bytes()
                 self.assertEqual(checksum.read_text(encoding="ascii"), f"{digest}  {archive.name}\n")
 
-    def test_release_output_archive_is_removed_if_checksum_fails(self) -> None:
+                checksum.write_text("wrong\n", encoding="ascii")
+                same_archive, same_checksum, same_digest, result = build_release.create_release_outputs(stage)
+                self.assertEqual(result, "unchanged")
+                self.assertEqual(same_archive.read_bytes(), original_archive)
+                self.assertEqual(same_digest, digest)
+                self.assertEqual(same_checksum.read_text(encoding="ascii"), f"{digest}  {archive.name}\n")
+
+                (stage / "NinjaPatchTool.exe").write_bytes(b"changed-exe")
+                build_release.write_release_manifest(stage)
+                _, checksum, changed_digest, result = build_release.create_release_outputs(stage)
+                self.assertEqual(result, "replaced")
+                self.assertNotEqual(changed_digest, digest)
+                self.assertNotEqual(archive.read_bytes(), original_archive)
+                self.assertEqual(checksum.read_text(encoding="ascii"), f"{changed_digest}  {archive.name}\n")
+
+    def test_release_output_failure_preserves_existing_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            archive = Path(tmp) / "release.zip"
-            archive.write_bytes(b"release")
-            stage = Path(tmp) / "stage"
+            root = Path(tmp)
+            release_dir = root / "release"
+            stage = root / f"NinjaPatchTool-v{common.VERSION}"
             stage.mkdir()
+            (stage / "NinjaPatchTool.exe").write_bytes(b"exe")
             build_release.write_release_manifest(stage)
-            with (
-                mock.patch.object(build_release, "create_release_archive", return_value=archive),
-                mock.patch.object(build_release, "create_release_checksum", side_effect=RuntimeError("checksum failed")),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "checksum failed"):
-                    build_release.create_release_outputs(stage)
-            self.assertFalse(archive.exists())
+
+            with mock.patch.object(build_release, "RELEASE_DIR", release_dir):
+                archive, checksum, _, _ = build_release.create_release_outputs(stage)
+                existing_archive = archive.read_bytes()
+                existing_checksum = checksum.read_bytes()
+                (stage / "NinjaPatchTool.exe").write_bytes(b"changed-exe")
+                build_release.write_release_manifest(stage)
+
+                with mock.patch.object(build_release, "validate_release_archive", side_effect=RuntimeError("validation failed")):
+                    with self.assertRaisesRegex(RuntimeError, "validation failed"):
+                        build_release.create_release_outputs(stage)
+
+                self.assertEqual(archive.read_bytes(), existing_archive)
+                self.assertEqual(checksum.read_bytes(), existing_checksum)
+                self.assertFalse(archive.with_name(archive.name + ".tmp").exists())
+                self.assertFalse(checksum.with_name(checksum.name + ".tmp").exists())
 
     def test_pyinstaller_minimum_version_for_python_314(self) -> None:
         build_release.validate_pyinstaller_version("6.15.0")
@@ -795,19 +825,6 @@ This should not be included.
             with mock.patch.object(build_release.subprocess, "run", side_effect=run):
                 with self.assertRaisesRegex(RuntimeError, "do not match the expected installation"):
                     build_release.smoke_test_release_round_trip(stage, root / "roundtrip")
-
-    def test_release_output_is_checked_before_building(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            release_dir = Path(tmp)
-            with mock.patch.object(build_release, "RELEASE_DIR", release_dir):
-                archive = build_release.release_archive_path()
-                archive.write_bytes(b"existing")
-                with self.assertRaisesRegex(FileExistsError, "already exists"):
-                    build_release.validate_release_output_available()
-                archive.unlink()
-                build_release.release_checksum_path().write_text("existing", encoding="ascii")
-                with self.assertRaisesRegex(FileExistsError, "already exists"):
-                    build_release.validate_release_output_available()
 
     def test_windows_version_tuple_pads_to_four_components(self) -> None:
         with mock.patch.object(build_release, "VERSION", "1.4.5"):
