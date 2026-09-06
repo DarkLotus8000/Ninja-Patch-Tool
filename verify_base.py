@@ -28,7 +28,7 @@ def main() -> int:
         return early_update_result
     parser = ErrorArgumentParser(description="Verify a Steam manifest base against its entry in data/index.json.")
     parser.add_argument("path", type=Path, help="Path to the Steam manifest base")
-    parser.add_argument("name", help="Indexed Warframe version, for example U43.5.1 or Pre-U43.0.0")
+    parser.add_argument("name", help="Indexed Warframe version, for example U43.5.0 or Pre-U43.0.0")
     add_update_arguments(parser)
     parser.add_version_argument()
     parser.add_help_argument()

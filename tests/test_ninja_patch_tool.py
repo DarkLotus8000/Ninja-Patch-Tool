@@ -378,7 +378,7 @@ class CommonTests(unittest.TestCase):
                 self.assertIn("installation", active)
                 self.assertIn("index", active)
 
-            argv = ["add_base.py", str(base), "U43.5.1", "4895911296145320793"]
+            argv = ["add_base.py", str(base), "U43.5.0", "4895911296145320793"]
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(add_base, "operation_lock", side_effect=fake_lock),
@@ -1277,14 +1277,14 @@ This should not be included.
             base = Path(tmp) / "base"
             make_warframe_root(base)
             entry = {"steam_manifest_id": 123, "sha256": "a" * 64, "file_count": 1}
-            argv = ["add_base.py", str(base), "U43.5.1", "456"]
+            argv = ["add_base.py", str(base), "U43.5.0", "456"]
             stderr = io.StringIO()
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(add_base, "install_termination_handlers"),
                 mock.patch.object(add_base, "handle_early_update_request", return_value=None),
                 mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
-                mock.patch.object(add_base, "load_index", return_value={"U43.5.1": entry}),
+                mock.patch.object(add_base, "load_index", return_value={"U43.5.0": entry}),
                 mock.patch.object(add_base, "handle_automatic_update", return_value=None) as auto_update,
                 mock.patch.object(add_base, "scan_tree") as scan,
                 mock.patch("sys.stderr", stderr),
@@ -1292,7 +1292,7 @@ This should not be included.
                 self.assertEqual(add_base.main(), 1)
             auto_update.assert_called_once()
             scan.assert_not_called()
-            self.assertIn('Base "U43.5.1" already exists', stderr.getvalue())
+            self.assertIn('Base "U43.5.0" already exists', stderr.getvalue())
 
     def test_add_base_existing_manifest_is_rejected_after_update_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1306,7 +1306,7 @@ This should not be included.
                 mock.patch.object(add_base, "install_termination_handlers"),
                 mock.patch.object(add_base, "handle_early_update_request", return_value=None),
                 mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
-                mock.patch.object(add_base, "load_index", return_value={"U43.5.1": entry}),
+                mock.patch.object(add_base, "load_index", return_value={"U43.5.0": entry}),
                 mock.patch.object(add_base, "handle_automatic_update", return_value=None) as auto_update,
                 mock.patch.object(add_base, "scan_tree") as scan,
                 mock.patch("sys.stderr", stderr),
@@ -1314,7 +1314,7 @@ This should not be included.
                 self.assertEqual(add_base.main(), 1)
             auto_update.assert_called_once()
             scan.assert_not_called()
-            self.assertIn('Steam manifest ID 456 is already indexed as "U43.5.1"', stderr.getvalue())
+            self.assertIn('Steam manifest ID 456 is already indexed as "U43.5.0"', stderr.getvalue())
 
     def test_add_base_rechecks_index_after_hash_to_close_race(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1344,12 +1344,12 @@ This should not be included.
             base = Path(tmp) / "base"
             make_warframe_root(base)
             entry = {"steam_manifest_id": 123, "sha256": "a" * 64, "file_count": 1}
-            argv = ["verify_base.py", str(base), "U43.5.1", "-a"]
+            argv = ["verify_base.py", str(base), "U43.5.0", "-a"]
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(verify_base, "install_termination_handlers"),
                 mock.patch.object(verify_base, "handle_early_update_request", return_value=None),
-                mock.patch.object(verify_base, "load_index", return_value={"U43.5.1": entry}),
+                mock.patch.object(verify_base, "load_index", return_value={"U43.5.0": entry}),
                 mock.patch.object(verify_base, "handle_automatic_update", return_value=0) as auto_update,
                 mock.patch.object(verify_base, "scan_tree") as scan,
             ):
@@ -1361,7 +1361,7 @@ This should not be included.
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "base"
             make_warframe_root(base)
-            argv = ["verify_base.py", str(base), "U43.5.1"]
+            argv = ["verify_base.py", str(base), "U43.5.0"]
             stderr = io.StringIO()
             with (
                 mock.patch.object(sys, "argv", argv),
@@ -1375,7 +1375,7 @@ This should not be included.
                 self.assertEqual(verify_base.main(), 1)
             auto_update.assert_called_once()
             scan.assert_not_called()
-            self.assertIn('Base "U43.5.1" is not present', stderr.getvalue())
+            self.assertIn('Base "U43.5.0" is not present', stderr.getvalue())
 
     def test_shared_version_comparison_handles_short_feature_versions(self) -> None:
         self.assertGreater(common.compare_versions("1.4", "1.3.1.2"), 0)
@@ -2506,13 +2506,13 @@ class MakePatchTests(unittest.TestCase):
             hdiffz = root / "hdiffz.exe"
             hdiffz.write_bytes(b"fake")
             entry = {"steam_manifest_id": 1, "sha256": "a" * 64, "file_count": 1}
-            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.1", "-a"]
+            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.0", "-a"]
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(make_patch, "HDIFFZ", hdiffz),
                 mock.patch.object(make_patch, "install_termination_handlers"),
                 mock.patch.object(make_patch, "handle_early_update_request", return_value=None),
-                mock.patch.object(make_patch, "load_index", return_value={"U43.5.1": entry}),
+                mock.patch.object(make_patch, "load_index", return_value={"U43.5.0": entry}),
                 mock.patch.object(make_patch, "handle_automatic_update", return_value=0) as auto_update,
                 mock.patch.object(make_patch, "operation_lock") as operation_lock,
                 mock.patch.object(make_patch, "scan_tree") as scan,
@@ -2539,7 +2539,7 @@ class MakePatchTests(unittest.TestCase):
                 locks.append((kind, target))
                 yield
 
-            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.1"]
+            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.0"]
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(make_patch, "HDIFFZ", hdiffz),
@@ -2549,7 +2549,7 @@ class MakePatchTests(unittest.TestCase):
                     make_patch,
                     "load_index",
                     side_effect=[
-                        {"U43.5.1": {"steam_manifest_id": 1, "sha256": "a" * 64, "file_count": 1}},
+                        {"U43.5.0": {"steam_manifest_id": 1, "sha256": "a" * 64, "file_count": 1}},
                         RuntimeError("stop"),
                     ],
                 ),
@@ -2589,7 +2589,7 @@ class MakePatchTests(unittest.TestCase):
             make_warframe_root(new)
             output = base / "bad.patch"
             stderr = io.StringIO()
-            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.1"]
+            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.0"]
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(make_patch, "install_termination_handlers"),
@@ -2611,7 +2611,7 @@ class MakePatchTests(unittest.TestCase):
             base_files, base_hash = common.scan_tree(base)
             index_path = root / "index.json"
             index_path.write_text(json.dumps({
-                "U43.5.1": {
+                "U43.5.0": {
                     "steam_manifest_id": 4895911296145320793,
                     "sha256": base_hash,
                     "file_count": len(base_files),
@@ -2622,7 +2622,7 @@ class MakePatchTests(unittest.TestCase):
             hdiffz.write_bytes(b"fake")
             output = root / "out.patch"
             temp_root = root / "temp"
-            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.1"]
+            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.0"]
             stderr = io.StringIO()
 
             with (
@@ -2657,7 +2657,7 @@ class MakePatchTests(unittest.TestCase):
             base_files, base_hash = common.scan_tree(base)
             index_path = root / "index.json"
             index_path.write_text(json.dumps({
-                "U43.5.1": {
+                "U43.5.0": {
                     "steam_manifest_id": 4895911296145320793,
                     "sha256": base_hash,
                     "file_count": len(base_files),
@@ -2673,7 +2673,7 @@ class MakePatchTests(unittest.TestCase):
                 diff_path.write_bytes(b"d")
                 target.write_bytes(b"changed after scan")
 
-            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.1"]
+            argv = ["make_patch.py", str(base), str(new), str(output), "U43.5.0"]
             stderr = io.StringIO()
             with (
                 mock.patch.object(sys, "argv", argv),
@@ -2751,7 +2751,7 @@ class ApplyPatchTests(unittest.TestCase):
     def minimal_manifest(self, operation: dict, old_count: int = 0, new_count: int = 1) -> dict:
         return {
             "version": 1,
-            "base": "U43.5.1",
+            "base": "U43.5.0",
             "base_steam_manifest_id": 4895911296145320793,
             "old_root_sha256": "1" * 64,
             "new_root_sha256": "2" * 64,
@@ -3006,7 +3006,7 @@ class ApplyPatchTests(unittest.TestCase):
             base_files = {"a.bin": {"size": 3}}
             manifest = {
                 "version": 1,
-                "base": "U43.5.1",
+                "base": "U43.5.0",
                 "base_steam_manifest_id": 4895911296145320793,
                 "old_root_sha256": "a" * 64,
                 "new_root_sha256": "b" * 64,
@@ -3242,7 +3242,7 @@ class ApplyPatchTests(unittest.TestCase):
             index_path = root / "index.json"
             index_path.write_text(
                 json.dumps({
-                    "U43.5.1": {
+                    "U43.5.0": {
                         "steam_manifest_id": 4895911296145320793,
                         "sha256": base_hash,
                         "file_count": len(base_files),
@@ -3266,7 +3266,7 @@ class ApplyPatchTests(unittest.TestCase):
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_bytes(b"d")
 
-            make_argv = ["make_patch.py", str(base), str(new), str(patch_path), "U43.5.1"]
+            make_argv = ["make_patch.py", str(base), str(new), str(patch_path), "U43.5.0"]
             make_stdout = io.StringIO()
             with (
                 mock.patch.object(sys, "argv", make_argv),

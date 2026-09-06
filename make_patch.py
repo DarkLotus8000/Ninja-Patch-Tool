@@ -599,7 +599,7 @@ def main() -> int:
         type=Path,
         help="Patch filename or output path; .patch is appended automatically. A bare filename is saved in the tool's output folder.",
     )
-    parser.add_argument("base_name", help="Base name from data/index.json, for example U43.5.1 or Pre-U43.0.0")
+    parser.add_argument("base_name", help="Base name from data/index.json, for example U43.5.0 or Pre-U43.0.0")
     parser.add_argument(
         "-c",
         "--compression",

@@ -46,7 +46,7 @@ def main() -> int:
         return early_update_result
     parser = ErrorArgumentParser(description="Add a clean, unmodified Steam manifest base to data/index.json.")
     parser.add_argument("path", type=Path, help="Path to the clean Steam manifest base")
-    parser.add_argument("name", help="Warframe version, for example U43.5.1 or Pre-U43.0.0")
+    parser.add_argument("name", help="Warframe version, for example U43.5.0 or Pre-U43.0.0")
     parser.add_argument("manifest_id", type=int, help="Steam manifest ID of the base")
     add_update_arguments(parser)
     parser.add_version_argument()

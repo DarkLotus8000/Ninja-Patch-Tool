@@ -16,7 +16,7 @@ No packages need to be installed to run the tool from source. Building a release
 
 The commands below use the release executables. When running from source, use the corresponding `.py` script with Python 3.14 instead.
 
-Path arguments may be absolute or relative to the current working directory. For example, if `U43.5.1` is a folder in the directory where the command is run, `U43.5.1` can be used instead of its full path.
+Path arguments may be absolute or relative to the current working directory. For example, if `U43.5.0` is a folder in the directory where the command is run, `U43.5.0` can be used instead of its full path.
 
 Update options available on all main executables:
 
@@ -34,13 +34,13 @@ add_base path name manifest_id [-a | -n]
 ```
 
 - `path` - Path to the clean Steam manifest base
-- `name` - Warframe version, for example `U43.5.1` or `Pre-U43.0.0`
+- `name` - Warframe version, for example `U43.5.0` or `Pre-U43.0.0`
 - `manifest_id` - Steam manifest ID of the base
 
 Example:
 
 ```bat
-add_base "D:\WF\U43.5.1" U43.5.1 4895911296145320793
+add_base "D:\WF\U43.5.0" U43.5.0 4895911296145320793
 ```
 
 ## Verify a base
@@ -52,7 +52,7 @@ verify_base path name [-a | -n]
 ```
 
 - `path` - Path to the Steam manifest base
-- `name` - Indexed Warframe version, for example `U43.5.1` or `Pre-U43.0.0`
+- `name` - Indexed Warframe version, for example `U43.5.0` or `Pre-U43.0.0`
 
 ## Create a Ninja Patch (Diff Patch)
 
@@ -68,13 +68,13 @@ make_patch base new output base_name [-c PRESET] [-a | -n]
 - `base` - Clean indexed Steam manifest base
 - `new` - Newer installation
 - `output` - Patch filename or output path; `.patch` is appended automatically. A bare filename is saved in the tool's `output` folder.
-- `base_name` - Base name from `data/index.json`, for example `U43.5.1` or `Pre-U43.0.0`
+- `base_name` - Base name from `data/index.json`, for example `U43.5.0` or `Pre-U43.0.0`
 - `-c, --compression PRESET` - Compression preset (default: `normal`): `normal`, `high`, `higher`, `maximum`
 
 Example:
 
 ```bat
-make_patch "D:\WF\U43.5.1" "D:\WF\U43.5.2" "U43.5.2.patch" U43.5.1
+make_patch "D:\WF\U43.5.0" "D:\WF\U43.5.2" "U43.5.2.patch" U43.5.0
 ```
 
 An existing patch is never overwritten automatically.
@@ -95,7 +95,7 @@ apply_patch base patch [-o OUTPUT | -i] [-a | -n]
 Example:
 
 ```bat
-apply_patch "D:\WF\U43.5.1" "U43.5.2.patch"
+apply_patch "D:\WF\U43.5.0" "U43.5.2.patch"
 ```
 
 Close Warframe and the Warframe Launcher before applying a patch, especially when using `--in-place`.
