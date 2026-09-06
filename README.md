@@ -27,14 +27,14 @@ Update options available on all main executables:
 
 ## Add a base
 
-Add a clean, unmodified Steam manifest base to `data/index.json`.
+Add a clean, unmodified Steam manifest base to `data/index.json`. Pre-release manifests can use names such as `Pre-U43.0.0`.
 
 ```text
 add_base path name manifest_id [-a | -n]
 ```
 
 - `path` - Path to the clean Steam manifest base
-- `name` - Warframe version, for example `U43.5.1`
+- `name` - Warframe version, for example `U43.5.1` or `Pre-U43.0.0`
 - `manifest_id` - Steam manifest ID of the base
 
 Example:
@@ -52,7 +52,7 @@ verify_base path name [-a | -n]
 ```
 
 - `path` - Path to the Steam manifest base
-- `name` - Indexed Warframe version, for example `U43.5.1`
+- `name` - Indexed Warframe version, for example `U43.5.1` or `Pre-U43.0.0`
 
 ## Create a Ninja Patch (Diff Patch)
 
@@ -68,7 +68,7 @@ make_patch base new output base_name [-c PRESET] [-a | -n]
 - `base` - Clean indexed Steam manifest base
 - `new` - Newer installation
 - `output` - Patch filename or output path; `.patch` is appended automatically. A bare filename is saved in the tool's `output` folder.
-- `base_name` - Base name from `data/index.json`, for example `U43.5.1`
+- `base_name` - Base name from `data/index.json`, for example `U43.5.1` or `Pre-U43.0.0`
 - `-c, --compression PRESET` - Compression preset (default: `normal`): `normal`, `high`, `higher`, `maximum`
 
 Example:

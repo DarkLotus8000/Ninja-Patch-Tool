@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-VERSION = "1.4.7"
+VERSION = "1.4.8"
 ENTRY_SCRIPTS = {
     "add_base.py": "Add Base - Ninja Patch Tool",
     "verify_base.py": "Verify Base - Ninja Patch Tool",
@@ -276,6 +276,13 @@ def validate_warframe_installation(path: Path, label: str) -> bool:
 def natural_sort_key(value: str):
     return tuple((0, int(part)) if part.isdigit() else (1, part.casefold()) for part in re.split(r"(\d+)", value) if part)
 
+def base_name_sort_key(value: str):
+    match = re.fullmatch(r"(?i)(pre-)?u(\d+(?:\.\d+)*)", value.strip())
+    if match is None:
+        return natural_sort_key(value), 1, (), 0
+    version = tuple(int(part) for part in match.group(2).split("."))
+    return natural_sort_key("U"), 0, version, 0 if match.group(1) else 1
+
 def parse_version(value: str) -> tuple[int, ...]:
     text = value.strip()
     if text[:1].lower() == "v":
@@ -515,7 +522,7 @@ def load_index() -> dict[str, Any]:
 
 def write_index(index: dict[str, Any]) -> None:
     validate_index(index)
-    sorted_index = {name: index[name] for name in sorted(index, key=natural_sort_key)}
+    sorted_index = {name: index[name] for name in sorted(index, key=base_name_sort_key)}
 
     temporary = INDEX_FILE.with_name(f".{INDEX_FILE.name}.{uuid.uuid4().hex}.tmp")
     try:

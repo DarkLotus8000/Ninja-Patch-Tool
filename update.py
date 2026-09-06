@@ -38,7 +38,7 @@ from common import (
     format_bytes,
     is_reparse_stat,
     is_sha256,
-    natural_sort_key,
+    base_name_sort_key,
     parse_json,
     parse_version,
     process_identity,
@@ -1017,7 +1017,7 @@ def _write_merged_index(release_path: Path, installed_path: Path, output_path: P
         merged[release_name] = release_entry
 
     validate_index(merged)
-    sorted_index = {name: merged[name] for name in sorted(merged, key=natural_sort_key)}
+    sorted_index = {name: merged[name] for name in sorted(merged, key=base_name_sort_key)}
     output_path.write_text(json.dumps(sorted_index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
 
 def rollback_staged_release(changes: list[tuple[Path, Path | None]], backup: Path) -> None:

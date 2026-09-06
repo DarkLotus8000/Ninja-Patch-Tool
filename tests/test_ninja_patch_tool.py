@@ -171,6 +171,13 @@ class CommonTests(unittest.TestCase):
     def test_natural_sort_key_handles_mixed_base_name_shapes(self) -> None:
         self.assertEqual(sorted(["U10", "43.5", "U2", "Alpha1"], key=common.natural_sort_key), ["43.5", "Alpha1", "U2", "U10"])
 
+    def test_base_name_sort_key_places_pre_release_before_matching_release(self) -> None:
+        names = ["U43.0.0", "Pre-U42.0.0", "U42.0.1", "U41.9.9", "U42.0.0", "Alpha1"]
+        self.assertEqual(
+            sorted(names, key=common.base_name_sort_key),
+            ["Alpha1", "U41.9.9", "Pre-U42.0.0", "U42.0.0", "U42.0.1", "U43.0.0"],
+        )
+
     def test_process_identity_prevents_pid_reuse_false_positive(self) -> None:
         with mock.patch.object(common, "process_is_running", return_value=True), mock.patch.object(common, "process_identity", return_value="123:new"):
             self.assertFalse(common.process_matches_identity(123, "123:old"))
@@ -327,11 +334,27 @@ class CommonTests(unittest.TestCase):
             self.assertEqual(json.loads(index_file.read_text(encoding="utf-8")), {})
             self.assertEqual(list(index_file.parent.glob(".index.json.*.tmp")), [])
 
+    def test_write_index_sorts_pre_release_before_matching_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            index_file = Path(tmp) / "index.json"
+            names = ["U42.0.1", "U42.0.0", "Pre-U42.0.0", "U41.9.9"]
+            index = {
+                name: {"steam_manifest_id": i + 1, "sha256": f"{i + 1:064x}", "file_count": i}
+                for i, name in enumerate(names)
+            }
+            with mock.patch.object(common, "INDEX_FILE", index_file):
+                common.write_index(index)
+            self.assertEqual(
+                list(json.loads(index_file.read_text(encoding="utf-8"))),
+                ["U41.9.9", "Pre-U42.0.0", "U42.0.0", "U42.0.1"],
+            )
+
     def test_add_base_keeps_installation_locked_until_index_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "base"
             base.mkdir()
             active: list[str] = []
+            index_lock_timeouts: list[int] = []
 
             from contextlib import contextmanager
             @contextmanager
@@ -344,6 +367,7 @@ class CommonTests(unittest.TestCase):
 
             @contextmanager
             def fake_index_lock(index_file: Path, timeout_seconds: int = 0):
+                index_lock_timeouts.append(timeout_seconds)
                 active.append("index")
                 try:
                     yield
@@ -365,6 +389,7 @@ class CommonTests(unittest.TestCase):
                 mock.patch.object(add_base, "write_index", side_effect=write_index),
             ):
                 self.assertEqual(add_base.main(), 0)
+            self.assertEqual(index_lock_timeouts, [0, 5])
 
     def test_frozen_tool_dir_uses_executable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -409,6 +434,12 @@ This should not be included.
             with mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp):
                 build_release.clean_stale_release_temp()
             self.assertFalse(release_temp.exists())
+
+    def test_release_console_close_event_cleans_release_temp(self) -> None:
+        with mock.patch.object(build_release, "remove_release_temp") as cleanup:
+            self.assertFalse(build_release._release_console_control_handler(2))
+            self.assertFalse(build_release._release_console_control_handler(0))
+        cleanup.assert_called_once_with()
 
     def test_release_data_is_allowlisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

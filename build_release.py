@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import hashlib
 import importlib.metadata
 import json
@@ -11,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -126,14 +129,55 @@ def release_checksum_path() -> Path:
     archive = release_archive_path()
     return archive.with_name(archive.name + ".sha256")
 
+def remove_release_temp() -> None:
+    for attempt in range(20):
+        try:
+            shutil.rmtree(RELEASE_TEMP_DIR)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == 19:
+                raise
+            time.sleep(0.1)
+
 def clean_stale_release_temp() -> None:
     if not RELEASE_TEMP_DIR.exists():
         return
     print("[Cleaning] Previous temporary build files")
     try:
-        shutil.rmtree(RELEASE_TEMP_DIR)
+        remove_release_temp()
     except OSError as exc:
         raise RuntimeError(f"Could not remove previous temporary build files: {RELEASE_TEMP_DIR}") from exc
+
+def _release_console_control_handler(control_type: int) -> bool:
+    # Ctrl+C follows Python's normal KeyboardInterrupt path. Window close, logoff,
+    # and shutdown events may terminate the process without unwinding finally blocks.
+    if control_type not in {2, 5, 6}:
+        return False
+    try:
+        remove_release_temp()
+    except OSError:
+        pass
+    return False
+
+@contextlib.contextmanager
+def release_temp_console_cleanup():
+    if sys.platform != "win32":
+        yield
+        return
+
+    handler_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+    handler = handler_type(_release_console_control_handler)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetConsoleCtrlHandler.argtypes = [handler_type, ctypes.c_bool]
+    kernel32.SetConsoleCtrlHandler.restype = ctypes.c_bool
+    if not kernel32.SetConsoleCtrlHandler(handler, True):
+        raise OSError(ctypes.get_last_error(), "Could not install release build console cleanup handler.")
+    try:
+        yield
+    finally:
+        kernel32.SetConsoleCtrlHandler(handler, False)
 
 def find_project_licenses() -> list[Path]:
     licenses: set[Path] = set()
@@ -685,32 +729,30 @@ def main() -> int:
         project_licenses = validate_build_environment()
         archive = release_archive_path()
         with operation_lock("release", archive, "release build for this version"):
-            clean_stale_release_temp()
-            run_source_tests()
-            RELEASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-            try:
-                with tempfile.TemporaryDirectory(prefix="npt_release_", dir=RELEASE_TEMP_DIR) as temporary_dir:
-                    temporary = Path(temporary_dir)
-                    dist = temporary / "dist"
-                    work = temporary / "build"
-                    specs = temporary / "spec"
-                    stage = temporary / f"NinjaPatchTool-v{VERSION}"
-                    dist.mkdir()
-                    work.mkdir()
-                    specs.mkdir()
-
-                    for script in ENTRY_SCRIPTS:
-                        build_executable(ROOT / script, dist, work, specs)
-                    smoke_test_executables(dist)
-                    populate_release(stage, dist, project_licenses)
-                    smoke_test_release_round_trip(stage, temporary / "roundtrip")
-                    write_release_manifest(stage)
-                    archive, checksum, digest, result = create_release_outputs(stage)
-            finally:
+            with release_temp_console_cleanup():
+                clean_stale_release_temp()
+                run_source_tests()
+                RELEASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
                 try:
-                    RELEASE_TEMP_DIR.rmdir()
-                except OSError:
-                    pass
+                    with tempfile.TemporaryDirectory(prefix="npt_release_", dir=RELEASE_TEMP_DIR) as temporary_dir:
+                        temporary = Path(temporary_dir)
+                        dist = temporary / "dist"
+                        work = temporary / "build"
+                        specs = temporary / "spec"
+                        stage = temporary / f"NinjaPatchTool-v{VERSION}"
+                        dist.mkdir()
+                        work.mkdir()
+                        specs.mkdir()
+
+                        for script in ENTRY_SCRIPTS:
+                            build_executable(ROOT / script, dist, work, specs)
+                        smoke_test_executables(dist)
+                        populate_release(stage, dist, project_licenses)
+                        smoke_test_release_round_trip(stage, temporary / "roundtrip")
+                        write_release_manifest(stage)
+                        archive, checksum, digest, result = create_release_outputs(stage)
+                finally:
+                    remove_release_temp()
 
         print(f"\n[{result.capitalize()}] {archive}")
         print(f'Version: {VERSION}\nSize: {format_bytes(archive.stat().st_size)}\nSHA-256: {digest}\nChecksum: {checksum}')
