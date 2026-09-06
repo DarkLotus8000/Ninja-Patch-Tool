@@ -16,6 +16,8 @@ No packages need to be installed to run the tool from source. Building a release
 
 The commands below use the release executables. When running from source, use the corresponding `.py` script with Python 3.14 instead.
 
+Path arguments may be absolute or relative to the current working directory. For example, if `U43.5.1` is a folder in the directory where the command is run, `U43.5.1` can be used instead of its full path.
+
 Update options available on all main executables:
 
 - `-a, --auto-update` - Force an automatic update check/install for this run, overriding `data/update.json` and update-check cooldowns
