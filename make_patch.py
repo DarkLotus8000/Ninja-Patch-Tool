@@ -20,6 +20,7 @@ from common import (
     SingleUseStoreAction,
     DATA_DIR,
     TEMP_ROOT,
+    cleanup_temporary_file,
     cleanup_work_dir,
     display_relative_path,
     format_bytes,
@@ -239,7 +240,7 @@ def run_hdiff(old: Path, new: Path, output: Path, compression: str) -> None:
                 run_hdiff_command(old, new, candidate, mode_options, preset["common"])
                 candidate_size = candidate.stat().st_size
             except Exception as exc:
-                candidate.unlink(missing_ok=True)
+                cleanup_temporary_file(candidate)
                 failures.append(f"{' '.join(mode_options)}: {exc}")
                 print(f" [Maximum] Candidate failed: {exc}", file=sys.stderr)
                 continue
@@ -262,7 +263,7 @@ def run_hdiff(old: Path, new: Path, output: Path, compression: str) -> None:
         print(f" [Maximum] Selected: {' '.join(best_options)} ({best_size:,} bytes)")
     except BaseException:
         for candidate in output.parent.glob(f"{output.name}.candidate-*"):
-            candidate.unlink(missing_ok=True)
+            cleanup_temporary_file(candidate)
         raise
 
 def reproducible_zip_info(name: str, compression: int, compresslevel: int | None = None) -> zipfile.ZipInfo:
@@ -303,7 +304,7 @@ def measure_full_file_compressed_size(file_info: dict, compression: str, work: P
         print_warning(f"Could not test compressed full-file candidate for {file_info['path']}: {exc}")
         return None
     finally:
-        candidate.unlink(missing_ok=True)
+        cleanup_temporary_file(candidate)
 
 def should_store_full_file(diff_path: Path, new_info: dict, compression: str, work: Path, item_id: str) -> bool:
     diff_size = diff_path.stat().st_size
@@ -355,7 +356,7 @@ def create_patch_archive(
             raise FileExistsError(f"Patch output appeared while the patch was being created: {output}")
         publish_patch_archive(temporary, output)
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        cleanup_temporary_file(temporary)
         raise
 
 def _run_operation(args, argv: list[str]) -> int:

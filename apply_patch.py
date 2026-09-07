@@ -23,6 +23,7 @@ from common import (
     SingleUseStoreTrueAction,
     DATA_DIR,
     TEMP_ROOT,
+    cleanup_temporary_file,
     cleanup_work_dir,
     display_relative_path,
     format_duration,
@@ -394,8 +395,8 @@ def apply_operations(
                 os.replace(temporary, target)
                 track_new_file(tracked_files, operation, target)
             finally:
-                payload_file.unlink(missing_ok=True)
-                temporary.unlink(missing_ok=True)
+                cleanup_temporary_file(payload_file)
+                cleanup_temporary_file(temporary)
 
             print(f"[Patched {operation_number}/{total_operations}] {display_relative_path(relative_path)}")
             continue
@@ -411,7 +412,7 @@ def apply_operations(
             os.replace(temporary, target)
             track_new_file(tracked_files, operation, target)
         finally:
-            temporary.unlink(missing_ok=True)
+            cleanup_temporary_file(temporary)
 
         if operation_type == "replace":
             action = "Patched"
@@ -518,12 +519,15 @@ def write_recovery_state(work: Path, state: dict) -> None:
     temporary = recovery.with_name(recovery.name + ".tmp")
     state = {"recovery_version": RECOVERY_VERSION, "pid": os.getpid(), "process_identity": process_identity(os.getpid()), **state}
 
-    with temporary.open("w", encoding="utf-8", newline="\n") as output:
-        json.dump(state, output, indent=2, ensure_ascii=False)
-        output.write("\n")
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary, recovery)
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as output:
+            json.dump(state, output, indent=2, ensure_ascii=False)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, recovery)
+    finally:
+        cleanup_temporary_file(temporary)
 
 def make_recovery_state(
     mode: str,

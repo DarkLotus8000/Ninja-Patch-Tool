@@ -334,6 +334,14 @@ class CommonTests(unittest.TestCase):
             self.assertEqual(json.loads(index_file.read_text(encoding="utf-8")), {})
             self.assertEqual(list(index_file.parent.glob(".index.json.*.tmp")), [])
 
+            with (
+                mock.patch.object(common, "INDEX_FILE", index_file),
+                mock.patch.object(Path, "replace", side_effect=RuntimeError("primary index failure")),
+                mock.patch.object(Path, "unlink", side_effect=OSError("cleanup failure")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "primary index failure"):
+                    common.write_index({})
+
     def test_write_index_sorts_pre_release_before_matching_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             index_file = Path(tmp) / "index.json"

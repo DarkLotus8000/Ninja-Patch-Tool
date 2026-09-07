@@ -513,6 +513,14 @@ def validate_index(index: dict[str, Any]) -> None:
             raise ValueError(f'Bases "{seen_hashes[digest_lower]}" and "{name}" have the same root SHA-256 and appear to be duplicates.')
         seen_hashes[digest_lower] = name
 
+def cleanup_temporary_file(path: Path) -> None:
+    primary_error_active = sys.exception() is not None
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        if not primary_error_active:
+            raise
+
 def load_index() -> dict[str, Any]:
     if not INDEX_FILE.exists():
         return {}
@@ -530,7 +538,7 @@ def write_index(index: dict[str, Any]) -> None:
             file.write(json.dumps(sorted_index, indent=2, ensure_ascii=False) + "\n")
         temporary.replace(INDEX_FILE)
     finally:
-        temporary.unlink(missing_ok=True)
+        cleanup_temporary_file(temporary)
 
 def resolve_base_name(index: dict[str, Any], requested: str) -> str:
     requested_folded = requested.casefold()

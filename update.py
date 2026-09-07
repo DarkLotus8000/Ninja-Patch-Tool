@@ -33,6 +33,7 @@ from common import (
     ErrorArgumentParser,
     SingleUseStoreTrueAction,
     cleanup_temp_root_if_empty,
+    cleanup_temporary_file,
     compare_versions,
     exclusive_operation_activity_lock,
     format_bytes,
@@ -119,7 +120,7 @@ def _create_default_update_config() -> None:
             except FileExistsError:
                 pass
     finally:
-        temporary.unlink(missing_ok=True)
+        cleanup_temporary_file(temporary)
 
 def _read_update_config() -> dict[str, Any]:
     if not UPDATE_CONFIG_FILE.exists():
@@ -137,7 +138,7 @@ def _write_update_config(config: dict[str, Any]) -> None:
             file.write(json.dumps(config, indent=2) + "\n")
         temporary.replace(UPDATE_CONFIG_FILE)
     finally:
-        temporary.unlink(missing_ok=True)
+        cleanup_temporary_file(temporary)
 
 def load_auto_update_setting() -> bool:
     try:
@@ -442,7 +443,7 @@ def _download_file(
             progress.finish()
         temporary.replace(destination)
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        cleanup_temporary_file(temporary)
         raise
 
 def _read_expected_checksum(path: Path, archive_name: str) -> str:
@@ -951,7 +952,7 @@ def write_update_session(work: Path) -> None:
         temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
         temporary.replace(session)
     finally:
-        temporary.unlink(missing_ok=True)
+        cleanup_temporary_file(temporary)
 
 def _validate_update_destination_path(install_dir: Path, relative: Path = Path()) -> None:
     # Never traverse an existing symlink/junction/reparse point while replacing installation files. In particular,
