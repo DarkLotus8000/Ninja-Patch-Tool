@@ -150,15 +150,25 @@ def clean_stale_release_temp() -> None:
     except OSError as exc:
         raise RuntimeError(f"Could not remove previous temporary build files: {RELEASE_TEMP_DIR}") from exc
 
+def remove_release_output_temps() -> None:
+    archive = release_archive_path()
+    checksum = release_checksum_path()
+    for path in (archive.with_name(archive.name + ".tmp"), checksum.with_name(checksum.name + ".tmp")):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
 def _release_console_control_handler(control_type: int) -> bool:
     # Ctrl+C follows Python's normal KeyboardInterrupt path. Window close, logoff,
     # and shutdown events may terminate the process without unwinding finally blocks.
     if control_type not in {2, 5, 6}:
         return False
-    try:
-        remove_release_temp()
-    except OSError:
-        pass
+    for cleanup in (remove_release_temp, remove_release_output_temps):
+        try:
+            cleanup()
+        except OSError:
+            pass
     return False
 
 @contextlib.contextmanager
@@ -736,6 +746,7 @@ def main() -> int:
         with operation_lock("release", archive, "release build for this version"):
             with release_temp_console_cleanup():
                 clean_stale_release_temp()
+                remove_release_output_temps()
                 run_source_tests()
                 RELEASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
                 try:
@@ -756,8 +767,20 @@ def main() -> int:
                         smoke_test_release_round_trip(stage, temporary / "roundtrip")
                         write_release_manifest(stage)
                         archive, checksum, digest, result = create_release_outputs(stage)
-                finally:
-                    remove_release_temp()
+                except BaseException:
+                    try:
+                        remove_release_temp()
+                    except OSError as cleanup_exc:
+                        print(
+                            f"WARNING: Could not remove temporary build files after the build failed: {RELEASE_TEMP_DIR}: {cleanup_exc}",
+                            file=sys.stderr,
+                        )
+                    raise
+                else:
+                    try:
+                        remove_release_temp()
+                    except OSError as exc:
+                        raise RuntimeError(f"Could not remove temporary build files: {RELEASE_TEMP_DIR}") from exc
 
         print(
             f"\n[{result.capitalize()}] Release completed successfully.\n"

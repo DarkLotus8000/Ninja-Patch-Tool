@@ -435,11 +435,15 @@ This should not be included.
                 build_release.clean_stale_release_temp()
             self.assertFalse(release_temp.exists())
 
-    def test_release_console_close_event_cleans_release_temp(self) -> None:
-        with mock.patch.object(build_release, "remove_release_temp") as cleanup:
+    def test_release_console_close_event_cleans_all_temporary_outputs(self) -> None:
+        with (
+            mock.patch.object(build_release, "remove_release_temp") as cleanup_temp,
+            mock.patch.object(build_release, "remove_release_output_temps") as cleanup_outputs,
+        ):
             self.assertFalse(build_release._release_console_control_handler(2))
             self.assertFalse(build_release._release_console_control_handler(0))
-        cleanup.assert_called_once_with()
+        cleanup_temp.assert_called_once_with()
+        cleanup_outputs.assert_called_once_with()
 
     def test_release_data_is_allowlisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -637,6 +641,26 @@ This should not be included.
                 self.assertEqual(checksum.read_bytes(), existing_checksum)
                 self.assertFalse(archive.with_name(archive.name + ".tmp").exists())
                 self.assertFalse(checksum.with_name(checksum.name + ".tmp").exists())
+
+    def test_release_main_preserves_build_error_when_temp_cleanup_also_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release_temp = root / "release_temp"
+            archive = root / "release.zip"
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp),
+                mock.patch.object(build_release, "validate_build_environment", return_value=[]),
+                mock.patch.object(build_release, "release_archive_path", return_value=archive),
+                mock.patch.object(build_release, "operation_lock", return_value=nullcontext()),
+                mock.patch.object(build_release, "run_source_tests"),
+                mock.patch.object(build_release, "build_executable", side_effect=RuntimeError("build failed")),
+                mock.patch.object(build_release, "remove_release_temp", side_effect=OSError("cleanup failed")),
+                contextlib.redirect_stderr(stderr),
+            ):
+                self.assertEqual(build_release.main(), 1)
+            self.assertIn("build failed", stderr.getvalue())
+            self.assertIn("cleanup failed", stderr.getvalue())
 
     def test_pyinstaller_minimum_version_for_python_314(self) -> None:
         build_release.validate_pyinstaller_version("6.15.0")
