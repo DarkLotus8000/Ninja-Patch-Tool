@@ -77,7 +77,7 @@ def create_release_readme(markdown: str) -> str:
         if line.startswith("```"):
             in_code = not in_code
             continue
-        if line == "The commands below use the release executables. When running from source, use the corresponding `.py` script with Python 3.14 instead.":
+        if line == "The commands below use the release executables. When running from source, prefix the corresponding `.py` script with `py -3.14`; for example, `py -3.14 add_base.py ...`.":
             continue
 
         if line.startswith("# "):

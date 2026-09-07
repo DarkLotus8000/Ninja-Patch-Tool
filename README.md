@@ -14,7 +14,7 @@ Ninja Patch Tool targets Windows. On non-Windows systems, use the Windows releas
 
 No packages need to be installed to run the tool from source. Building a release additionally requires PyInstaller.
 
-The commands below use the release executables. When running from source, use the corresponding `.py` script with Python 3.14 instead.
+The commands below use the release executables. When running from source, prefix the corresponding `.py` script with `py -3.14`; for example, `py -3.14 add_base.py ...`.
 
 Path arguments may be absolute or relative to the current working directory. For example, if `U43.5.0` is a folder in the directory where the command is run, `U43.5.0` can be used instead of its full path.
 
