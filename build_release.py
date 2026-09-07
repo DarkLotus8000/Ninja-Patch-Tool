@@ -265,7 +265,7 @@ def validate_build_environment() -> list[Path]:
     if struct.calcsize("P") != 8:
         raise RuntimeError("A 64-bit Python installation is required to build the Windows x64 release.")
     if sys.version_info[:2] != (3, 14):
-        raise RuntimeError("Python 3.14 is required to build releases. Run the builder with: py -3.14 build_release.py")
+        raise RuntimeError("Python 3.14 is required to build releases. Run: py -3.14 build_release.py")
     version_tuple()
     try:
         pyinstaller_version = importlib.metadata.version("pyinstaller")
@@ -350,7 +350,7 @@ def build_environment(workspace: Path) -> dict[str, str]:
 
 def build_executable(script: Path, dist: Path, work: Path, specs: Path) -> Path:
     name = script.stem
-    print(f"[Compiling] {script.name}")
+    print(f"[Compiling] {name}.exe")
     version_file = create_version_file(script, specs)
     command = [
         sys.executable,
@@ -378,7 +378,7 @@ def build_executable(script: Path, dist: Path, work: Path, specs: Path) -> Path:
     ]
     result = subprocess.run(command, cwd=ROOT, env=build_environment(dist.parent))
     if result.returncode != 0:
-        raise RuntimeError(f"PyInstaller failed for {script.name} with exit code {result.returncode}.")
+        raise RuntimeError(f"PyInstaller failed for {name}.exe with exit code {result.returncode}.")
     executable = dist / f"{name}.exe"
     if not executable.is_file():
         raise RuntimeError(f"PyInstaller did not create the expected executable: {executable}")
@@ -759,8 +759,14 @@ def main() -> int:
                 finally:
                     remove_release_temp()
 
-        print(f"\n[{result.capitalize()}] {archive}")
-        print(f'Version: {VERSION}\nSize: {format_bytes(archive.stat().st_size)}\nSHA-256: {digest}\nChecksum: {checksum}')
+        print(
+            f"\n[{result.capitalize()}] Release completed successfully.\n"
+            f"Version: {VERSION}\n"
+            f"Archive: {archive}\n"
+            f"Size: {format_bytes(archive.stat().st_size)}\n"
+            f"SHA-256: {digest}\n"
+            f"Checksum: {checksum}"
+        )
         return 0
     except KeyboardInterrupt:
         print("\nRelease creation interrupted.", file=sys.stderr)
