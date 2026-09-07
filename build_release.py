@@ -765,4 +765,17 @@ def main() -> int:
         return 1
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetConsoleTitleW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+        kernel32.GetConsoleTitleW.restype = ctypes.c_uint
+        kernel32.SetConsoleTitleW.argtypes = [ctypes.c_wchar_p]
+        kernel32.SetConsoleTitleW.restype = ctypes.c_bool
+        previous_title = ctypes.create_unicode_buffer(32768)
+        kernel32.GetConsoleTitleW(previous_title, len(previous_title))
+        if kernel32.SetConsoleTitleW("Building latest release... - Ninja Patch Tool"):
+            try:
+                raise SystemExit(main())
+            finally:
+                kernel32.SetConsoleTitleW(previous_title.value)
     raise SystemExit(main())
