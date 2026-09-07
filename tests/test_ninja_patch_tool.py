@@ -745,9 +745,11 @@ This should not be included.
 
             calls: list[list[str]] = []
             timeouts: list[int] = []
-            def run(command, cwd, env, capture_output, text, timeout):
+            child_creationflags: list[int] = []
+            def run(command, cwd, env, capture_output, text, creationflags, timeout):
                 calls.append(command)
                 timeouts.append(timeout)
+                child_creationflags.append(creationflags)
                 if command[1:] == ["-h"]:
                     return SimpleNamespace(returncode=0, stdout="Shows this help message", stderr="")
                 return SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{build_release.VERSION}\n", stderr="")
@@ -762,6 +764,10 @@ This should not be included.
                 expected.append([f"{Path(script).stem}.exe", "--update-installer", "--version"])
             self.assertEqual([[Path(command[0]).name, *command[1:]] for command in calls], expected)
             self.assertEqual(timeouts, [120] * len(expected))
+            self.assertEqual(
+                child_creationflags,
+                [getattr(build_release.subprocess, "CREATE_NO_WINDOW", 0)] * len(expected),
+            )
 
     def test_release_round_trip_smoke_runs_full_cli_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -775,8 +781,9 @@ This should not be included.
             environments: list[dict[str, str]] = []
             newer: Path | None = None
 
-            def run(command, cwd, env, capture_output, text, timeout):
+            def run(command, cwd, env, capture_output, text, creationflags, timeout):
                 nonlocal newer
+                self.assertEqual(creationflags, getattr(build_release.subprocess, "CREATE_NO_WINDOW", 0))
                 calls.append(command)
                 environments.append(env)
                 name = Path(command[0]).name
@@ -815,7 +822,8 @@ This should not be included.
             for script in build_release.ENTRY_SCRIPTS:
                 (stage / f"{Path(script).stem}.exe").write_bytes(b"exe")
 
-            def run(command, cwd, env, capture_output, text, timeout):
+            def run(command, cwd, env, capture_output, text, creationflags, timeout):
+                self.assertEqual(creationflags, getattr(build_release.subprocess, "CREATE_NO_WINDOW", 0))
                 name = Path(command[0]).name
                 if name == "make_patch.exe":
                     Path(command[3]).write_bytes(b"patch")

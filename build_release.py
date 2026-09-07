@@ -413,13 +413,16 @@ def smoke_test_executables(dist: Path) -> None:
         executable = dist / f"{Path(script).stem}.exe"
         try:
             help_result = subprocess.run(
-                [str(executable), "-h"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120
+                [str(executable), "-h"], cwd=ROOT, env=environment, capture_output=True, text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=120
             )
             short_version_result = subprocess.run(
-                [str(executable), "-v"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120
+                [str(executable), "-v"], cwd=ROOT, env=environment, capture_output=True, text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=120
             )
             version_result = subprocess.run(
-                [str(executable), "--version"], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120
+                [str(executable), "--version"], cwd=ROOT, env=environment, capture_output=True, text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=120
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"Standalone executable smoke test timed out: {executable.name}") from exc
@@ -440,6 +443,7 @@ def smoke_test_executables(dist: Path) -> None:
                 env=environment,
                 capture_output=True,
                 text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 timeout=120,
             )
         except subprocess.TimeoutExpired as exc:
@@ -463,6 +467,7 @@ def run_release_workflow_command(
             env=environment,
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             timeout=180,
         )
     except subprocess.TimeoutExpired as exc:
