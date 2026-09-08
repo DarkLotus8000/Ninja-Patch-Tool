@@ -239,7 +239,7 @@ def copy_verified_base(base: Path, destination: Path, total_size: int | None = N
     for source in source_files:
         target = destination / source.relative_to(base)
         target.parent.mkdir(parents=True, exist_ok=True)
-        if is_ignored_file(source):
+        if is_ignored_file(source, base):
             before = source.lstat()
             if source.is_symlink():
                 raise RuntimeError(f"Installation changed while it was being copied:\n{source}")

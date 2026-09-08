@@ -257,6 +257,14 @@ INDEX_FILE = DATA_DIR / "index.json"
 TEMP_ROOT = TOOL_DIR / "temp"
 # Files intentionally excluded from installation identity and patches.
 IGNORED_FILENAMES = {"launcher.zip", "launcher.exe", "remotecrashsender.exe"}
+IGNORED_ROOT_FILENAMES = {
+    "bootstrapper setup.exe",
+    "dwmapi.dll",
+    "wtsapi32.dll",
+    "version.dll",
+    "launch with openwf.bat",
+}
+IGNORED_ROOT_DIRECTORIES = {"openwf"}
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: set[str] = set()
 
@@ -264,8 +272,26 @@ def sha256_file(path: Path) -> str:
     with path.open("rb") as file:
         return hashlib.file_digest(file, "sha256").hexdigest()
 
-def is_ignored_file(path: Path) -> bool:
-    return path.name.casefold() in IGNORED_FILENAMES
+def is_ignored_file(path: Path, root: Path | None = None) -> bool:
+    if path.name.casefold() in IGNORED_FILENAMES:
+        return True
+
+    if root is not None:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            return False
+    elif path.is_absolute():
+        return False
+    else:
+        relative = path
+
+    parts = relative.parts
+    if not parts:
+        return False
+    if len(parts) == 1 and parts[0].casefold() in IGNORED_ROOT_FILENAMES:
+        return True
+    return parts[0].casefold() in IGNORED_ROOT_DIRECTORIES
 
 def validate_warframe_installation(path: Path, label: str) -> bool:
     if (path / "Cache.Windows").is_dir() and (path / "Tools").is_dir() and (path / "Warframe.x64.exe").is_file():
@@ -329,7 +355,9 @@ def validate_installation_root_entry(root: Path) -> None:
             f"Warframe installation root must not be a symlink, junction, or reparse point:\n{root}"
         )
 
-def validated_tree_paths(root: Path) -> tuple[list[Path], list[Path]]:
+def validated_tree_paths(
+    root: Path, *, prune_ignored_root_directories: bool = False
+) -> tuple[list[Path], list[Path]]:
     validate_installation_root_entry(root)
     directories: list[Path] = []
     files: list[Path] = []
@@ -353,7 +381,12 @@ def validated_tree_paths(root: Path) -> tuple[list[Path], list[Path]]:
                 )
             if stat.S_ISDIR(entry_stat.st_mode):
                 directories.append(path)
-                pending.append(path)
+                if not (
+                    prune_ignored_root_directories
+                    and directory == root
+                    and entry.name.casefold() in IGNORED_ROOT_DIRECTORIES
+                ):
+                    pending.append(path)
             elif stat.S_ISREG(entry_stat.st_mode):
                 files.append(path)
 
@@ -362,8 +395,8 @@ def validated_tree_paths(root: Path) -> tuple[list[Path], list[Path]]:
     return directories, files
 
 def _validated_scan_paths(root: Path) -> tuple[list[Path], list[str]]:
-    _, all_files = validated_tree_paths(root)
-    paths = [path for path in all_files if not is_ignored_file(path)]
+    _, all_files = validated_tree_paths(root, prune_ignored_root_directories=True)
+    paths = [path for path in all_files if not is_ignored_file(path, root)]
     relative_paths: list[str] = []
     seen_casefold: dict[str, str] = {}
     for path in paths:

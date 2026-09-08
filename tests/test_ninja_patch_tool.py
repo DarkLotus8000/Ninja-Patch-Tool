@@ -323,6 +323,44 @@ class CommonTests(unittest.TestCase):
                     common.relative_path_parts(path)
         self.assertEqual(common.relative_path_parts("Cache.Windows/B.Misc.cache"), ("Cache.Windows", "B.Misc.cache"))
 
+    def test_openwf_client_files_are_ignored_at_installation_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_warframe_root(root)
+            (root / "OpenWF" / "config").mkdir(parents=True)
+            (root / "OpenWF" / "config" / "client.json").write_text("ignored", encoding="utf-8")
+            for name in ("Bootstrapper Setup.exe", "dwmapi.dll", "wtsapi32.dll", "version.dll", "Launch with OpenWF.bat"):
+                (root / name).write_bytes(b"ignored")
+            (root / "Tools" / "version.dll").write_bytes(b"tracked")
+            (root / "Cache.Windows" / "OpenWF").mkdir()
+            (root / "Cache.Windows" / "OpenWF" / "nested.bin").write_bytes(b"tracked")
+
+            files, _ = common.scan_tree(root)
+
+            self.assertNotIn("OpenWF/config/client.json", files)
+            for name in ("Bootstrapper Setup.exe", "dwmapi.dll", "wtsapi32.dll", "version.dll", "Launch with OpenWF.bat"):
+                self.assertNotIn(name, files)
+            self.assertIn("Tools/version.dll", files)
+            self.assertIn("Cache.Windows/OpenWF/nested.bin", files)
+
+    def test_tracked_scan_prunes_root_openwf_without_descending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_warframe_root(root)
+            openwf = root / "OpenWF"
+            (openwf / "nested").mkdir(parents=True)
+            (openwf / "nested" / "client.bin").write_bytes(b"ignored")
+            original_scandir = common.os.scandir
+
+            def guarded_scandir(path):
+                if Path(path) == openwf:
+                    raise AssertionError("tracked scan descended into ignored root OpenWF directory")
+                return original_scandir(path)
+
+            with mock.patch.object(common.os, "scandir", side_effect=guarded_scandir):
+                files, _ = common.scan_tree(root)
+            self.assertNotIn("OpenWF/nested/client.bin", files)
+
     def test_write_index_uses_unique_owned_temporary_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             index_file = Path(tmp) / "index.json"
@@ -2866,10 +2904,18 @@ class ApplyPatchTests(unittest.TestCase):
         self.assertEqual(validated["operations"], [remove, add])
 
     def test_manifest_rejects_operations_targeting_ignored_files(self) -> None:
-        operation = {"type": "remove", "path": "Tools/Launcher.exe", "old_size": 1, "old_sha256": "a" * 64}
+        for path in ("Tools/Launcher.exe", "OpenWF/config/client.json", "version.dll", "Launch with OpenWF.bat"):
+            with self.subTest(path=path):
+                operation = {"type": "remove", "path": path, "old_size": 1, "old_sha256": "a" * 64}
+                manifest = self.minimal_manifest(operation, old_count=1, new_count=0)
+                with self.assertRaisesRegex(RuntimeError, "intentionally ignores"):
+                    apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json")})
+
+    def test_manifest_allows_root_only_ignore_names_below_other_directories(self) -> None:
+        operation = {"type": "remove", "path": "Tools/version.dll", "old_size": 1, "old_sha256": "a" * 64}
         manifest = self.minimal_manifest(operation, old_count=1, new_count=0)
-        with self.assertRaisesRegex(RuntimeError, "intentionally ignores"):
-            apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json")})
+        validated = apply_patch.validate_manifest(manifest, {"manifest.json": zipfile.ZipInfo("manifest.json")})
+        self.assertEqual(validated["operations"], [operation])
 
     def test_manifest_rejects_windows_reserved_target(self) -> None:
         operation = {"type": "remove", "path": "CON.txt", "old_size": 1, "old_sha256": "a" * 64}
