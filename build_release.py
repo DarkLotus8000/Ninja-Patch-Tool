@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import contextlib
 import ctypes
 import hashlib
@@ -129,6 +130,64 @@ def release_checksum_path() -> Path:
     archive = release_archive_path()
     return archive.with_name(archive.name + ".sha256")
 
+def release_extract_path() -> Path:
+    return RELEASE_DIR / f"NinjaPatchTool-v{VERSION}"
+
+def release_extract_temp_path() -> Path:
+    return RELEASE_DIR / f".NinjaPatchTool-v{VERSION}.extract.tmp"
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+def extract_release_archive(archive: Path) -> Path:
+    destination = release_extract_path()
+    temporary_root = release_extract_temp_path()
+    backup = destination.with_name(destination.name + ".extract.backup")
+
+    RELEASE_DIR.mkdir(parents=True, exist_ok=True)
+    _remove_path(temporary_root)
+    if backup.exists() or backup.is_symlink():
+        if destination.exists() or destination.is_symlink():
+            _remove_path(backup)
+        else:
+            backup.replace(destination)
+
+    try:
+        with zipfile.ZipFile(archive, "r") as zip_file:
+            zip_file.extractall(temporary_root)
+        extracted = temporary_root / destination.name
+        children = list(temporary_root.iterdir())
+        if children != [extracted] or not extracted.is_dir() or extracted.is_symlink():
+            raise RuntimeError("Release archive did not extract to the expected top-level directory.")
+
+        had_destination = destination.exists() or destination.is_symlink()
+        if had_destination:
+            destination.replace(backup)
+        try:
+            extracted.replace(destination)
+        except BaseException:
+            if had_destination and backup.exists() and not destination.exists():
+                backup.replace(destination)
+            raise
+        if backup.exists() or backup.is_symlink():
+            _remove_path(backup)
+        return destination
+    finally:
+        _remove_path(temporary_root)
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build the Ninja Patch Tool Windows release.")
+    parser.add_argument(
+        "-e",
+        "--extract",
+        action="store_true",
+        help="Also extract the completed release ZIP beside the archive.",
+    )
+    return parser.parse_args(argv)
+
 def remove_release_temp() -> None:
     for attempt in range(20):
         try:
@@ -158,6 +217,7 @@ def remove_release_output_temps() -> None:
             path.unlink()
         except FileNotFoundError:
             pass
+    _remove_path(release_extract_temp_path())
 
 def _release_console_control_handler(control_type: int) -> bool:
     # Ctrl+C follows Python's normal KeyboardInterrupt path. Window close, logoff,
@@ -739,7 +799,9 @@ def create_release_outputs(stage: Path) -> tuple[Path, Path, str, str]:
         temporary_checksum.unlink(missing_ok=True)
         raise
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args([] if argv is None else argv)
+    extracted: Path | None = None
     try:
         project_licenses = validate_build_environment()
         archive = release_archive_path()
@@ -767,6 +829,8 @@ def main() -> int:
                         smoke_test_release_round_trip(stage, temporary / "roundtrip")
                         write_release_manifest(stage)
                         archive, checksum, digest, result = create_release_outputs(stage)
+                        if args.extract:
+                            extracted = extract_release_archive(archive)
                 except BaseException:
                     try:
                         remove_release_temp()
@@ -789,6 +853,7 @@ def main() -> int:
             f"Size: {format_bytes(archive.stat().st_size)}\n"
             f"SHA-256: {digest}\n"
             f"Checksum: {checksum}"
+            + (f"\nExtracted: {extracted}" if extracted is not None else "")
         )
         return 0
     except KeyboardInterrupt:
@@ -809,7 +874,7 @@ if __name__ == "__main__":
         kernel32.GetConsoleTitleW(previous_title, len(previous_title))
         if kernel32.SetConsoleTitleW("Building latest release... - Ninja Patch Tool"):
             try:
-                raise SystemExit(main())
+                raise SystemExit(main(sys.argv[1:]))
             finally:
                 kernel32.SetConsoleTitleW(previous_title.value)
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

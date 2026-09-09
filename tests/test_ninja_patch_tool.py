@@ -688,6 +688,34 @@ This should not be included.
                 self.assertFalse(archive.with_name(archive.name + ".tmp").exists())
                 self.assertFalse(checksum.with_name(checksum.name + ".tmp").exists())
 
+    def test_release_builder_extract_argument_aliases(self) -> None:
+        self.assertTrue(build_release.parse_args(["-e"]).extract)
+        self.assertTrue(build_release.parse_args(["--extract"]).extract)
+        self.assertFalse(build_release.parse_args([]).extract)
+
+    def test_release_builder_extracts_archive_and_replaces_previous_extracted_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release_dir = root / "release"
+            release_dir.mkdir()
+            archive = release_dir / f"NinjaPatchTool-v{common.VERSION}-Windows-x64.zip"
+            top_level = f"NinjaPatchTool-v{common.VERSION}"
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+                zip_file.writestr(f"{top_level}/NinjaPatchTool.exe", b"new-exe")
+
+            previous = release_dir / top_level
+            previous.mkdir()
+            (previous / "old.txt").write_text("old", encoding="ascii")
+
+            with mock.patch.object(build_release, "RELEASE_DIR", release_dir):
+                extracted = build_release.extract_release_archive(archive)
+
+            self.assertEqual(extracted, previous)
+            self.assertEqual((extracted / "NinjaPatchTool.exe").read_bytes(), b"new-exe")
+            self.assertFalse((extracted / "old.txt").exists())
+            self.assertFalse((release_dir / f".{top_level}.extract.tmp").exists())
+            self.assertFalse((release_dir / f"{top_level}.extract.backup").exists())
+
     def test_release_main_preserves_build_error_when_temp_cleanup_also_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

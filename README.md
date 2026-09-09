@@ -111,6 +111,12 @@ py -3.14 -m pip install pyinstaller
 py -3.14 build_release.py
 ```
 
+Add `-e` / `--extract` to also extract the completed release ZIP beside the archive while still producing the normal ZIP and SHA-256 checksum:
+
+```bat
+py -3.14 build_release.py -e
+```
+
 Upload both generated files to the matching GitHub Release (`vVERSION`):
 
 ```text
