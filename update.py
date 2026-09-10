@@ -1316,4 +1316,3 @@ def run_update_installer(argv: list[str] | None = None) -> int:
             except Exception as relaunch_error:
                 print_error(f"Could not restart Ninja Patch Tool after the failed update: {relaunch_error}")
         return 1
-
