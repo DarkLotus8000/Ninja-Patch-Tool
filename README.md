@@ -89,7 +89,7 @@ apply_patch base patch [-o OUTPUT | -i] [-a | -n]
 
 - `base` - Base installation
 - `patch` - Patch filename or path; `.patch` is appended automatically. A bare filename is looked up in the tool's `output` folder.
-- `-o, --output OUTPUT` - Create a separate installation at `OUTPUT`; if omitted, creates one next to the base named after the patch (cannot be used with `--in-place`)
+- `-o, --output OUTPUT` - Create a separate installation at `OUTPUT`; the path may not exist yet or may already be a truly empty directory (cannot be used with `--in-place`)
 - `-i, --in-place` - Modify the base installation instead (cannot be used with `--output`)
 
 Example:
@@ -99,6 +99,8 @@ apply_patch "D:\WF\U43.5.0" "U43.5.2.patch"
 ```
 
 Close Warframe and the Warframe Launcher before applying a patch, especially when using `--in-place`.
+
+For a separate output, Ninja Patch Tool still builds and verifies the installation in a randomized sibling staging directory. If the requested final output directory already exists, it must be literally empty. Immediately before publication Ninja Patch Tool checks it again and removes it with a non-recursive directory removal; if anything appeared inside meanwhile, publication stops without deleting that data. The completed staging directory is then renamed into place.
 
 In-place mode creates a recovery backup of only the files the patch may modify or remove before changing the base. Interrupted operations are cleaned up or recovered automatically when possible.
 

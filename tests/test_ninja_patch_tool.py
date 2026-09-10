@@ -3160,7 +3160,20 @@ class ApplyPatchTests(unittest.TestCase):
             self.assertIn("verified recovery backup was kept", stderr.getvalue())
             self.assertIn(str(work), stderr.getvalue())
 
-    def test_separate_output_publication_refuses_existing_destination(self) -> None:
+    def test_separate_output_publication_accepts_existing_truly_empty_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            working, destination = root / "working", root / "final"
+            working.mkdir()
+            destination.mkdir()
+            (working / "ours.bin").write_bytes(b"ours")
+
+            apply_patch.publish_output_directory(working, destination)
+
+            self.assertFalse(working.exists())
+            self.assertEqual((destination / "ours.bin").read_bytes(), b"ours")
+
+    def test_separate_output_publication_refuses_existing_nonempty_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             working, destination = root / "working", root / "final"
@@ -3168,10 +3181,36 @@ class ApplyPatchTests(unittest.TestCase):
             destination.mkdir()
             (working / "ours.bin").write_bytes(b"ours")
             (destination / "theirs.bin").write_bytes(b"theirs")
-            with self.assertRaisesRegex(FileExistsError, "Output path appeared"):
+            with self.assertRaisesRegex(FileExistsError, "already exists and is not empty"):
                 apply_patch.publish_output_directory(working, destination)
             self.assertTrue((working / "ours.bin").is_file())
             self.assertEqual((destination / "theirs.bin").read_bytes(), b"theirs")
+
+    def test_separate_output_publication_rechecks_empty_directory_before_claiming_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            working, destination = root / "working", root / "final"
+            working.mkdir()
+            destination.mkdir()
+            (working / "ours.bin").write_bytes(b"ours")
+
+            original = apply_patch.require_output_missing_or_empty
+            checked = False
+
+            def race(path: Path) -> bool:
+                nonlocal checked
+                result = original(path)
+                if result and not checked:
+                    checked = True
+                    (path / "appeared.bin").write_bytes(b"external")
+                return result
+
+            with mock.patch.object(apply_patch, "require_output_missing_or_empty", side_effect=race):
+                with self.assertRaisesRegex(FileExistsError, "no longer an empty directory"):
+                    apply_patch.publish_output_directory(working, destination)
+
+            self.assertTrue((working / "ours.bin").is_file())
+            self.assertEqual((destination / "appeared.bin").read_bytes(), b"external")
 
     def test_prepared_in_place_recovery_never_rolls_back_external_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

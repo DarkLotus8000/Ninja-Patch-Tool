@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import sys
 import time
 import zipfile
@@ -31,6 +32,7 @@ from common import (
     install_termination_handlers,
     is_ignored_file,
     is_nonnegative_int,
+    is_reparse_stat,
     is_sha256,
     is_steam_manifest_id,
     is_within,
@@ -608,14 +610,42 @@ def separate_working_destination(destination: Path, work: Path) -> Path:
     token = work.name.removeprefix("apply_patch_")
     return destination.with_name(f".{destination.name}.npt-{token}.tmp")
 
+def require_output_missing_or_empty(destination: Path) -> bool:
+    try:
+        entry_stat = destination.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError(f"Could not inspect output path:\n{destination}") from exc
+
+    if stat.S_ISLNK(entry_stat.st_mode) or is_reparse_stat(entry_stat) or not stat.S_ISDIR(entry_stat.st_mode):
+        raise FileExistsError(f"Output path already exists and is not a regular empty directory:\n{destination}")
+    try:
+        with os.scandir(destination) as entries:
+            if next(entries, None) is not None:
+                raise FileExistsError(f"Output path already exists and is not empty:\n{destination}")
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(f"Could not inspect output directory:\n{destination}") from exc
+    return True
+
 def publish_output_directory(working_destination: Path, destination: Path) -> None:
-    if destination.exists():
-        raise FileExistsError(f"Output path appeared while the patch was being applied:\n{destination}")
+    existed_empty = require_output_missing_or_empty(destination)
+    if existed_empty:
+        try:
+            # Claim only a still-empty directory. rmdir() cannot remove a directory
+            # if another process has placed anything inside it since the earlier check.
+            destination.rmdir()
+        except OSError as exc:
+            raise FileExistsError(
+                f"Output path is no longer an empty directory and was left untouched:\n{destination}"
+            ) from exc
     try:
         # Windows directory rename is atomic on the same volume and refuses to replace an existing destination.
         working_destination.rename(destination)
     except OSError as exc:
-        if destination.exists():
+        if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Output path appeared while the patch was being applied:\n{destination}") from exc
         raise
 
@@ -874,13 +904,19 @@ def run_locked_apply(
         if recovery_matches_manifest(completed_state, completed_manifest):
             print(f"\n[Patched] The previous patch application had already completed successfully.\nBase: {base}\nOutput: {destination}")
             return 0
-        if not in_place and destination.exists():
-            print_error(f"Output path already exists and belongs to a previously completed different patch:\n{destination}")
-            return 1
+        if not in_place and (destination.exists() or destination.is_symlink()):
+            try:
+                require_output_missing_or_empty(destination)
+            except (FileExistsError, RuntimeError):
+                print_error(f"Output path already exists and belongs to a previously completed different patch:\n{destination}")
+                return 1
 
-    if not in_place and destination.exists():
-        print_error(f"Output path already exists:\n{destination}")
-        return 1
+    if not in_place:
+        try:
+            require_output_missing_or_empty(destination)
+        except (FileExistsError, RuntimeError) as exc:
+            print_error(exc)
+            return 1
     if not HPATCHZ.is_file():
         print_error(f"hpatchz.exe was not found in the data folder:\n{HPATCHZ}")
         return 1
@@ -1103,7 +1139,7 @@ def main() -> int:
         "--output",
         type=Path,
         action=SingleUseStoreAction,
-        help="Create a separate installation at OUTPUT; if omitted, creates one next to the base named after the patch (cannot be used with --in-place)",
+        help="Create a separate installation at OUTPUT; OUTPUT may be absent or an existing truly empty directory (cannot be used with --in-place)",
     )
     mode.add_argument(
         "-i",
