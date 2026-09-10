@@ -35,6 +35,7 @@ _OPERATION_ACTIVITY_SLOTS = 64
 _COLOR_SUPPORT_LOCK = threading.Lock()
 _COLOR_SUPPORT_CACHE: dict[int, bool] = {}
 _SEVERITY_TOKEN_RE = re.compile(r"(?m)^(ERROR:|WARNING:)")
+_TRANSIENT_PROGRESS_RE = re.compile(r"(?m)^(\[Update\] )(.+?)( \| )")
 
 def _enable_windows_virtual_terminal(stream) -> bool:
     if os.name != "nt":
@@ -81,8 +82,8 @@ def console_supports_color(stream) -> bool:
 def _colored(token: str, color: str) -> str:
     return f"{color}{token}\x1b[0m"
 
-def style_console_text(message: str, stream) -> str:
-    """Color severity prefixes only; redirected output remains plain text."""
+def style_console_text(message: str, stream, *, status_tokens: bool = False) -> str:
+    """Color semantic console tokens; redirected output remains plain text."""
     if not console_supports_color(stream):
         return message
 
@@ -90,7 +91,13 @@ def style_console_text(message: str, stream) -> str:
         token = match.group(1)
         return _colored(token, "\x1b[31m" if token == "ERROR:" else "\x1b[33m")
 
-    return _SEVERITY_TOKEN_RE.sub(severity_replacement, message)
+    styled = _SEVERITY_TOKEN_RE.sub(severity_replacement, message)
+    if status_tokens:
+        styled = _TRANSIENT_PROGRESS_RE.sub(
+            lambda match: match.group(1) + _colored(match.group(2), "\x1b[36m") + match.group(3),
+            styled,
+        )
+    return styled
 
 def print_console(message: object = "", *, file=None, flush: bool = False) -> None:
     stream = sys.stdout if file is None else file

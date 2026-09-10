@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import errno
 import json
 import os
@@ -29,7 +30,6 @@ from common import (
     TEMP_ROOT,
     TOOL_DIR,
     VERSION,
-    ByteProgress,
     ErrorArgumentParser,
     SingleUseStoreTrueAction,
     cleanup_temp_root_if_empty,
@@ -46,6 +46,7 @@ from common import (
     process_matches_identity,
     relative_path_parts,
     sha256_file,
+    style_console_text,
     validate_index,
 )
 
@@ -409,6 +410,129 @@ def _ensure_free_space(path: Path, required: int, purpose: str) -> None:
             f"Not enough free disk space to {purpose}: {format_bytes(required)} required, {format_bytes(free)} available."
         )
 
+class _UpdateProgress:
+    DISPLAY_DELAY_SECONDS = 0.5
+    REPORT_INTERVAL_SECONDS = 0.25
+    SPEED_WINDOW_SECONDS = 1.5
+
+    def __init__(self, label: str, total: int, path: str) -> None:
+        self.label = label
+        self.total = max(0, total)
+        self.path = path
+        self.completed = 0
+        self.started_at = time.monotonic()
+        self.last_report = 0.0
+        self.speed_samples: deque[tuple[float, int]] = deque([(self.started_at, 0)])
+        self.progress_width = 0
+        self.finished = False
+        self.last_plain_percent = -10
+        self.last_plain_time = self.started_at
+
+    @staticmethod
+    def _interactive_console() -> bool:
+        try:
+            return sys.stdout.isatty()
+        except (AttributeError, OSError, ValueError):
+            return False
+
+    def _record_speed_sample(self, now: float) -> None:
+        self.speed_samples.append((now, self.completed))
+        cutoff = now - self.SPEED_WINDOW_SECONDS
+        while len(self.speed_samples) > 2 and self.speed_samples[1][0] <= cutoff:
+            self.speed_samples.popleft()
+
+    def _message(self, now: float) -> str:
+        sample_time, sample_size = self.speed_samples[0]
+        elapsed = max(1e-6, now - sample_time)
+        speed_bps = max(0, int((self.completed - sample_size) / elapsed))
+        if self.total > 0:
+            percent = min(100.0, self.completed * 100.0 / self.total)
+            return (
+                f"{self.label} {format_bytes(self.completed)} / {format_bytes(self.total)} ({percent:.1f}%)"
+                f" | {format_bytes(speed_bps)}/s | {self.path}"
+            )
+        return f"{self.label} {format_bytes(self.completed)} | {format_bytes(speed_bps)}/s | {self.path}"
+
+    @staticmethod
+    def _truncate(message: str, width: int) -> str:
+        if len(message) <= width:
+            return message
+        separator = " | "
+        if separator in message:
+            prefix, path = message.rsplit(separator, 1)
+            available = width - len(prefix) - len(separator)
+            if available >= 4:
+                message = prefix + separator + "..." + path[-(available - 3):]
+        if len(message) > width:
+            message = message[:width] if width <= 3 else message[: width - 3] + "..."
+        return message
+
+    def _render_interactive(self, now: float) -> None:
+        try:
+            width = max(1, shutil.get_terminal_size(fallback=(120, 24)).columns - 1)
+        except OSError:
+            width = 119
+        message = self._truncate(self._message(now), width)
+        styled = style_console_text(message, sys.stdout, status_tokens=True)
+        padding = max(0, self.progress_width - len(message))
+        try:
+            sys.stdout.write("\r" + styled + (" " * padding))
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            self.progress_width = 0
+            return
+        self.progress_width = len(message)
+
+    def update(self, amount: int) -> None:
+        self.completed += max(0, amount)
+        now = time.monotonic()
+        self._record_speed_sample(now)
+        if self._interactive_console():
+            if now - self.started_at < self.DISPLAY_DELAY_SECONDS and self.completed < self.total:
+                return
+            if now - self.last_report < self.REPORT_INTERVAL_SECONDS and self.completed < self.total:
+                return
+            self.last_report = now
+            self._render_interactive(now)
+            return
+
+        if self.total <= 0:
+            return
+        percent = min(100, self.completed * 100 // self.total)
+        if percent >= self.last_plain_percent + 10 or now - self.last_plain_time >= 5 or self.completed >= self.total:
+            print(self._message(now))
+            self.last_plain_percent = percent
+            self.last_plain_time = now
+
+    def finish(self) -> None:
+        if self.finished:
+            return
+        self.completed = self.total if self.total > 0 else self.completed
+        now = time.monotonic()
+        self._record_speed_sample(now)
+        if self._interactive_console():
+            self._render_interactive(now)
+            try:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
+            self.progress_width = 0
+        elif self.total > 0 and self.last_plain_percent < 100:
+            print(self._message(now))
+        self.finished = True
+
+    def abort(self) -> None:
+        if self.progress_width <= 0:
+            return
+        try:
+            sys.stdout.write("\r" + (" " * self.progress_width) + "\r")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+        self.progress_width = 0
+
+
 def _download_file(
     url: str,
     destination: Path,
@@ -419,7 +543,11 @@ def _download_file(
     temporary = destination.with_name(destination.name + ".part")
     temporary.unlink(missing_ok=True)
     written = 0
-    progress = ByteProgress(progress_label, expected_size) if progress_label is not None and expected_size is not None else None
+    progress = (
+        _UpdateProgress(progress_label, expected_size, destination.name)
+        if progress_label is not None and expected_size is not None
+        else None
+    )
     try:
         with _request(url, 30) as response, temporary.open("xb") as output:
             while chunk := response.read(8 * 1024 * 1024):
@@ -443,6 +571,8 @@ def _download_file(
             progress.finish()
         temporary.replace(destination)
     except BaseException:
+        if progress is not None:
+            progress.abort()
         cleanup_temporary_file(temporary)
         raise
 
@@ -622,7 +752,7 @@ def download_release(release: dict[str, Any], work: Path) -> Path:
         try:
             print(f"[Update] Downloading Ninja Patch Tool v{version} (attempt {attempt}/{UPDATE_ATTEMPTS})...")
             _download_file(checksum_url, checksum_path, checksum_size, max_size=MAX_CHECKSUM_BYTES)
-            _download_file(archive_url, archive_path, archive_size, "[Update] Download")
+            _download_file(archive_url, archive_path, archive_size, "[Update]")
             expected = _read_expected_checksum(checksum_path, archive_name)
             actual = sha256_file(archive_path)
             if actual.lower() != expected:

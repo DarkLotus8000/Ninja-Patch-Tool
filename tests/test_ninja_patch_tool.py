@@ -109,6 +109,43 @@ class CommonTests(unittest.TestCase):
         self.assertNotIn("\x1b[31m[Verified]", styled)
         self.assertNotIn("\x1b[33m[Verified]", styled)
 
+    def test_update_progress_uses_capture_style_cyan_transfer_segment(self) -> None:
+        stream = io.StringIO()
+        message = (
+            "[Update] 30.0 MiB / 60.0 MiB (50.0%) | 6.0 MiB/s | "
+            "NinjaPatchTool-v1.4.11-Windows-x64.zip"
+        )
+        with mock.patch.object(common, "console_supports_color", return_value=True):
+            styled = common.style_console_text(message, stream, status_tokens=True)
+        self.assertEqual(
+            styled,
+            "[Update] \x1b[36m30.0 MiB / 60.0 MiB (50.0%)\x1b[0m | 6.0 MiB/s | "
+            "NinjaPatchTool-v1.4.11-Windows-x64.zip",
+        )
+        self.assertNotIn("\x1b[36m[Update]", styled)
+
+    def test_update_progress_matches_capture_progress_layout(self) -> None:
+        progress = update._UpdateProgress(
+            "[Update]",
+            60 * 1024 * 1024,
+            "NinjaPatchTool-v1.4.11-Windows-x64.zip",
+        )
+        progress.completed = 30 * 1024 * 1024
+        progress.speed_samples.clear()
+        progress.speed_samples.append((100.0, 24 * 1024 * 1024))
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(common, "console_supports_color", return_value=True),
+            mock.patch.object(update.shutil, "get_terminal_size", return_value=os.terminal_size((160, 24))),
+            contextlib.redirect_stdout(stdout),
+        ):
+            progress._render_interactive(101.0)
+        self.assertEqual(
+            stdout.getvalue(),
+            "\r[Update] \x1b[36m30.0 MiB / 60.0 MiB (50.0%)\x1b[0m | 6.0 MiB/s | "
+            "NinjaPatchTool-v1.4.11-Windows-x64.zip",
+        )
+
     def test_console_colors_are_disabled_for_non_tty_output(self) -> None:
         message = "ERROR: failure"
         self.assertEqual(common.style_console_text(message, io.StringIO()), message)
