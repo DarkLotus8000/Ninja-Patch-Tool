@@ -550,7 +550,7 @@ def _download_file(
     )
     try:
         with _request(url, 30) as response, temporary.open("xb") as output:
-            while chunk := response.read(8 * 1024 * 1024):
+            while chunk := response.read(256 * 1024):
                 limits = [value for value in (expected_size, max_size) if value is not None]
                 limit = min(limits) if limits else None
                 if limit is not None and written + len(chunk) > limit:
