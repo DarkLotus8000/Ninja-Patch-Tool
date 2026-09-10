@@ -541,6 +541,7 @@ def make_recovery_state(
     existed: dict[str, bool] | None = None,
     working_destination: Path | None = None,
     temporary_token: str | None = None,
+    destination_preexisting_empty: bool = False,
 ) -> dict:
     state = {
         "mode": mode,
@@ -560,6 +561,7 @@ def make_recovery_state(
         state["existed"] = existed or {}
     elif working_destination is not None:
         state["working_destination"] = str(working_destination)
+        state["destination_preexisting_empty"] = destination_preexisting_empty
     return state
 
 def recovery_matches_manifest(state: dict, manifest: dict) -> bool:
@@ -804,6 +806,10 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
             if working_destination != separate_working_destination(recovery_destination, work).resolve():
                 raise RuntimeError(f"Interrupted separate-output recovery data contains an unexpected temporary output path.\nRecovery state: {recovery}")
 
+            destination_preexisting_empty = state.get("destination_preexisting_empty", False)
+            if not isinstance(destination_preexisting_empty, bool):
+                raise RuntimeError(f"Interrupted separate-output recovery data contains an invalid destination ownership flag.\nRecovery state: {recovery}")
+
             if recovery_destination.exists():
                 if tree_matches(recovery_destination, new_hash, new_count):
                     print("[Recovery] The previous output had already completed successfully.")
@@ -814,10 +820,19 @@ def recover_interrupted_operations(base: Path, destination: Path) -> dict | None
                         raise RuntimeError("More than one completed recovery state with different patch identities was found for this base/output.")
                     completed_state = state
                     continue
-                raise RuntimeError(
-                    "The final output path exists but cannot be identified as Ninja Patch Tool's completed output, so it was left untouched.\n"
-                    f"Output: {recovery_destination}\nRecovery folder: {work}"
-                )
+                if destination_preexisting_empty:
+                    try:
+                        require_output_missing_or_empty(recovery_destination)
+                    except (FileExistsError, RuntimeError) as exc:
+                        raise RuntimeError(
+                            "The final output path was originally accepted as empty, but it is no longer an empty regular directory, so it was left untouched.\n"
+                            f"Output: {recovery_destination}\nRecovery folder: {work}"
+                        ) from exc
+                else:
+                    raise RuntimeError(
+                        "The final output path exists but cannot be identified as Ninja Patch Tool's completed output, so it was left untouched.\n"
+                        f"Output: {recovery_destination}\nRecovery folder: {work}"
+                    )
 
             if not working_destination.exists():
                 print("[Recovery] The interrupted temporary output no longer exists.")
@@ -911,9 +926,10 @@ def run_locked_apply(
                 print_error(f"Output path already exists and belongs to a previously completed different patch:\n{destination}")
                 return 1
 
+    destination_preexisting_empty = False
     if not in_place:
         try:
-            require_output_missing_or_empty(destination)
+            destination_preexisting_empty = require_output_missing_or_empty(destination)
         except (FileExistsError, RuntimeError) as exc:
             print_error(exc)
             return 1
@@ -1029,7 +1045,7 @@ def run_locked_apply(
                 working_destination = separate_working_destination(destination, work)
                 if working_destination.exists():
                     raise RuntimeError(f"Temporary output path unexpectedly exists:\n{working_destination}")
-                write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "copying", working_destination=working_destination, temporary_token=temporary_token))
+                write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "copying", working_destination=working_destination, temporary_token=temporary_token, destination_preexisting_empty=destination_preexisting_empty))
                 keep_work = True
                 scratch = work / "payload"
                 scratch.mkdir()
@@ -1050,9 +1066,9 @@ def run_locked_apply(
                         )
                     print(f'[Verified] Base "{manifest["base"]}" is valid.')
                     check_temporary_paths(working_destination, manifest["operations"], temporary_token)
-                    write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "applying", working_destination=working_destination, temporary_token=temporary_token))
+                    write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "applying", working_destination=working_destination, temporary_token=temporary_token, destination_preexisting_empty=destination_preexisting_empty))
                     apply_and_verify(working_destination, archive, members, scratch, manifest, copied_files, temporary_token=temporary_token)
-                    write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "publishing", working_destination=working_destination, temporary_token=temporary_token))
+                    write_recovery_state(work, make_recovery_state("separate", base, destination, patch, manifest, "publishing", working_destination=working_destination, temporary_token=temporary_token, destination_preexisting_empty=destination_preexisting_empty))
                     publish_output_directory(working_destination, destination)
                     keep_work = False
                 except BaseException:

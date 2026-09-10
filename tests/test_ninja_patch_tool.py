@@ -3256,6 +3256,84 @@ class ApplyPatchTests(unittest.TestCase):
             self.assertFalse(working.exists())
             self.assertEqual((destination / "new.bin").read_bytes(), b"new")
 
+    def test_v2_separate_recovery_publishes_completed_working_directory_over_original_empty_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, destination = root / "base", root / "final"
+            make_warframe_root(base)
+            destination.mkdir()
+            work = root / "temp" / "apply_patch_test"
+            working = apply_patch.separate_working_destination(destination, work)
+            shutil.copytree(base, working)
+            (working / "new.bin").write_bytes(b"new")
+            old_hash, old_count = tree_identity(base)
+            new_hash, new_count = tree_identity(working)
+            state = {
+                "mode": "separate", "phase": "publishing", "base": str(base), "destination": str(destination),
+                "working_destination": str(working), "patch": str(root / "one.patch"),
+                "old_root_sha256": old_hash, "new_root_sha256": new_hash,
+                "old_file_count": old_count, "new_file_count": new_count,
+                "destination_preexisting_empty": True,
+            }
+            write_recovery(work, state)
+            with mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"), mock.patch.object(common, "TEMP_ROOT", root / "temp"):
+                completed = apply_patch.recover_interrupted_operations(base, destination)
+            self.assertIsNotNone(completed)
+            self.assertFalse(working.exists())
+            self.assertEqual((destination / "new.bin").read_bytes(), b"new")
+
+    def test_v2_separate_recovery_leaves_original_empty_output_when_working_directory_is_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, destination = root / "base", root / "final"
+            make_warframe_root(base)
+            destination.mkdir()
+            work = root / "temp" / "apply_patch_test"
+            working = apply_patch.separate_working_destination(destination, work)
+            working.mkdir(parents=True)
+            (working / "partial.bin").write_bytes(b"partial")
+            old_hash, old_count = tree_identity(base)
+            state = {
+                "mode": "separate", "phase": "applying", "base": str(base), "destination": str(destination),
+                "working_destination": str(working), "patch": str(root / "one.patch"),
+                "old_root_sha256": old_hash, "new_root_sha256": "b" * 64,
+                "old_file_count": old_count, "new_file_count": 99,
+                "destination_preexisting_empty": True,
+            }
+            write_recovery(work, state)
+            with mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"), mock.patch.object(common, "TEMP_ROOT", root / "temp"):
+                completed = apply_patch.recover_interrupted_operations(base, destination)
+            self.assertIsNone(completed)
+            self.assertTrue(destination.is_dir())
+            self.assertEqual(list(destination.iterdir()), [])
+            self.assertFalse(working.exists())
+            self.assertFalse(work.exists())
+
+    def test_v2_separate_recovery_does_not_claim_unrecorded_empty_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, destination = root / "base", root / "final"
+            make_warframe_root(base)
+            destination.mkdir()
+            work = root / "temp" / "apply_patch_test"
+            working = apply_patch.separate_working_destination(destination, work)
+            working.mkdir(parents=True)
+            old_hash, old_count = tree_identity(base)
+            state = {
+                "mode": "separate", "phase": "applying", "base": str(base), "destination": str(destination),
+                "working_destination": str(working), "patch": str(root / "one.patch"),
+                "old_root_sha256": old_hash, "new_root_sha256": "b" * 64,
+                "old_file_count": old_count, "new_file_count": 99,
+                "destination_preexisting_empty": False,
+            }
+            write_recovery(work, state)
+            with mock.patch.object(apply_patch, "TEMP_ROOT", root / "temp"), mock.patch.object(common, "TEMP_ROOT", root / "temp"):
+                with self.assertRaisesRegex(RuntimeError, "cannot be identified"):
+                    apply_patch.recover_interrupted_operations(base, destination)
+            self.assertTrue(destination.is_dir())
+            self.assertTrue(working.is_dir())
+            self.assertTrue(work.is_dir())
+
     def test_rollback_restores_original_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
