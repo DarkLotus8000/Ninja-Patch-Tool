@@ -109,6 +109,51 @@ class CommonTests(unittest.TestCase):
         self.assertNotIn("\x1b[31m[Verified]", styled)
         self.assertNotIn("\x1b[33m[Verified]", styled)
 
+    def test_console_title_includes_tool_version_and_restores_previous_title(self) -> None:
+        calls: list[str] = []
+
+        class Function:
+            def __init__(self, callback):
+                self.callback = callback
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.callback(*args)
+
+        class Kernel32:
+            def __init__(self):
+                self.GetConsoleTitleW = Function(self.get_console_title)
+                self.SetConsoleTitleW = Function(self.set_console_title)
+
+            @staticmethod
+            def get_console_title(buffer, size):
+                buffer.value = "Original Title"
+                return len(buffer.value)
+
+            @staticmethod
+            def set_console_title(title):
+                calls.append(title)
+                return 1
+
+        expected = {
+            "add_base.py": "Add Base",
+            "verify_base.py": "Verify Base",
+            "make_patch.py": "Make Patch",
+            "apply_patch.py": "Apply Patch",
+        }
+        for script, operation in expected.items():
+            with self.subTest(script=script):
+                calls.clear()
+                with (
+                    mock.patch.object(common.sys, "platform", "win32"),
+                    mock.patch("ctypes.WinDLL", return_value=Kernel32(), create=True),
+                    common.console_title(common.ENTRY_SCRIPTS[script]),
+                ):
+                    pass
+                self.assertEqual(calls[0], f"{operation} - Ninja Patch Tool (v{common.VERSION})")
+                self.assertEqual(calls[-1], "Original Title")
+
     def test_update_progress_uses_capture_style_cyan_transfer_segment(self) -> None:
         stream = io.StringIO()
         message = (
@@ -517,6 +562,43 @@ This should not be included.
             with mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp):
                 build_release.clean_stale_release_temp()
             self.assertFalse(release_temp.exists())
+
+    def test_release_builder_console_title_includes_version_and_restores_previous_title(self) -> None:
+        calls: list[str] = []
+
+        class Function:
+            def __init__(self, callback):
+                self.callback = callback
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.callback(*args)
+
+        class Kernel32:
+            def __init__(self):
+                self.GetConsoleTitleW = Function(self.get_console_title)
+                self.SetConsoleTitleW = Function(self.set_console_title)
+
+            @staticmethod
+            def get_console_title(buffer, size):
+                buffer.value = "Original Build Title"
+                return len(buffer.value)
+
+            @staticmethod
+            def set_console_title(title):
+                calls.append(title)
+                return 1
+
+        with (
+            mock.patch.object(build_release.sys, "platform", "win32"),
+            mock.patch.object(build_release.ctypes, "WinDLL", return_value=Kernel32(), create=True),
+            mock.patch.object(build_release, "main", return_value=0) as main,
+        ):
+            self.assertEqual(build_release.run_main_with_console_title(["--extract"]), 0)
+        main.assert_called_once_with(["--extract"])
+        self.assertEqual(calls[0], f"Building latest release... - Ninja Patch Tool (v{common.VERSION})")
+        self.assertEqual(calls[-1], "Original Build Title")
 
     def test_release_console_close_event_cleans_all_temporary_outputs(self) -> None:
         with (

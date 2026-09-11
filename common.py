@@ -633,7 +633,8 @@ def console_title(title: str):
     kernel32.GetConsoleTitleW(buffer, len(buffer))
     previous = buffer.value
 
-    if not kernel32.SetConsoleTitleW(title):
+    display_title = f"{title} (v{VERSION})"
+    if not kernel32.SetConsoleTitleW(display_title):
         yield
         return
 
