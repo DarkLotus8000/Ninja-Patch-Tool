@@ -126,7 +126,10 @@ def _create_default_update_config() -> None:
 def _read_update_config() -> dict[str, Any]:
     if not UPDATE_CONFIG_FILE.exists():
         _create_default_update_config()
-    config = parse_json(UPDATE_CONFIG_FILE.read_text(encoding="utf-8"))
+    try:
+        config = parse_json(UPDATE_CONFIG_FILE.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"Invalid JSON: {exc}") from exc
     if not isinstance(config, dict) or not isinstance(config.get("auto_update"), bool):
         raise ValueError('Expected a JSON object containing boolean "auto_update".')
     return config
@@ -219,7 +222,10 @@ def _request_json(url: str) -> dict[str, Any]:
         payload = response.read(MAX_GITHUB_JSON_BYTES + 1)
     if len(payload) > MAX_GITHUB_JSON_BYTES:
         raise RuntimeError("GitHub update metadata response is unexpectedly large.")
-    result = parse_json(payload)
+    try:
+        result = parse_json(payload)
+    except ValueError as exc:
+        raise RuntimeError(f"GitHub returned invalid JSON: {exc}") from exc
     if not isinstance(result, dict):
         raise RuntimeError("GitHub returned an unexpected response.")
     return result

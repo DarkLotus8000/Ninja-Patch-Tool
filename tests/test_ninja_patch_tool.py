@@ -260,6 +260,23 @@ class CommonTests(unittest.TestCase):
             ["Alpha1", "U41.9.9", "Pre-U42.0.0", "U42.0.0", "U42.0.1", "U43.0.0"],
         )
 
+    def test_four_component_base_versions_validate_and_sort_numerically(self) -> None:
+        names = ["U43.5.4.10", "U43.5.4.1", "Pre-U43.5.4.1", "U43.5.4", "U43.5.5", "U43.5.4.2"]
+        index = {
+            name: {"steam_manifest_id": i + 1, "sha256": f"{i + 1:064x}", "file_count": i}
+            for i, name in enumerate(names)
+        }
+        common.validate_index(index)
+        with tempfile.TemporaryDirectory() as tmp:
+            index_file = Path(tmp) / "index.json"
+            with mock.patch.object(common, "INDEX_FILE", index_file):
+                common.write_index(index)
+                self.assertEqual(common.load_index(), index)
+            self.assertEqual(
+                list(json.loads(index_file.read_text(encoding="utf-8"))),
+                ["U43.5.4", "Pre-U43.5.4.1", "U43.5.4.1", "U43.5.4.2", "U43.5.4.10", "U43.5.5"],
+            )
+
     def test_process_identity_prevents_pid_reuse_false_positive(self) -> None:
         with mock.patch.object(common, "process_is_running", return_value=True), mock.patch.object(common, "process_identity", return_value="123:new"):
             self.assertFalse(common.process_matches_identity(123, "123:old"))
@@ -1173,6 +1190,18 @@ This should not be included.
                 self.assertTrue(update.load_auto_update_setting())
             self.assertEqual(json.loads(config.read_text(encoding="utf-8")), {"auto_update": True})
 
+    def test_malformed_update_config_reports_json_context_without_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "update.json"
+            original = '{"auto_update":'
+            config.write_text(original, encoding="utf-8")
+            stderr = io.StringIO()
+            with mock.patch.object(update, "UPDATE_CONFIG_FILE", config), mock.patch("sys.stderr", stderr):
+                self.assertFalse(update.load_auto_update_setting())
+            self.assertIn("Invalid JSON:", stderr.getvalue())
+            self.assertIn("automatic updating is disabled for this run", stderr.getvalue())
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+
     def test_simultaneous_update_config_creation_uses_existing_winner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "data" / "update.json"
@@ -1675,6 +1704,13 @@ This should not be included.
         with mock.patch.object(update, "_request", return_value=Response(payload)):
             with self.assertRaisesRegex(RuntimeError, "unexpectedly large"):
                 update._request_json("https://example.test/latest")
+
+    def test_malformed_update_metadata_reports_github_context(self) -> None:
+        for payload in (b'{"tag_name":', b'\xff'):
+            with self.subTest(payload=payload):
+                with mock.patch.object(update, "_request", return_value=io.BytesIO(payload)):
+                    with self.assertRaisesRegex(RuntimeError, "GitHub returned invalid JSON:"):
+                        update._request_json("https://example.test/latest")
 
     def test_update_archive_validation_and_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
