@@ -5,7 +5,7 @@ Author metadata: Rossen Georgiev
 License metadata: MIT
 
 The upstream gevent-eventemitter 2.1 wheel does not include a standalone
-LICENSE or NOTICE file. This fallback notice is included so the declared MIT
+license file. This fallback license file is included so the declared MIT
 license accompanies redistributed builds.
 
 MIT License

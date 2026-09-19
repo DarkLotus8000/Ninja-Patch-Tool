@@ -56,7 +56,7 @@ LICENSES_DIR = DATA_DIR / "licenses"
 RELEASE_DATA_FILES = ("index.json", "update.json", "hdiffz.exe", "hpatchz.exe")
 THIRD_PARTY_LICENSE_FILES = ("Python-LICENSE.txt", "HDiffPatch-LICENSE.txt")
 VERSIONED_FALLBACK_STEAM_LICENSE_FILES = {
-    ("gevent-eventemitter", "2.1"): LICENSES_DIR / "gevent_eventemitter_NOTICE.txt",
+    ("gevent-eventemitter", "2.1"): LICENSES_DIR / "gevent_eventemitter_LICENSE.txt",
 }
 MIN_PYINSTALLER_VERSION = (6, 15, 0)
 KNOWN_RUNTIME_LOCK_FILES = {
@@ -74,7 +74,7 @@ RELEASE_SOURCE_FILES = (
     "data/favicon.ico",
     *(f"data/{name}" for name in RELEASE_DATA_FILES),
     *(f"data/licenses/{name}" for name in THIRD_PARTY_LICENSE_FILES),
-    "data/licenses/gevent_eventemitter_NOTICE.txt",
+    "data/licenses/gevent_eventemitter_LICENSE.txt",
     "tests/test_ninja_patch_tool.py",
 )
 

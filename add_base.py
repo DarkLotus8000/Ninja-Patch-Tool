@@ -79,7 +79,7 @@ def main() -> int:
                 print_error("Base name cannot be empty.")
                 return 1
             if not is_steam_manifest_id(manifest_id):
-                print_error("[Steam] Manifest ID must be a valid unsigned 64-bit integer.")
+                print_error("[Steam] Manifest ID must be a valid unsigned 64-bit number.")
                 return 1
 
             # Reject conflicts that can be determined from the index before doing a potentially very expensive full-tree hash.

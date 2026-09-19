@@ -1784,7 +1784,15 @@ class ByteProgress:
 
 class CompactHelpFormatter(argparse.HelpFormatter):
     def __init__(self, prog: str) -> None:
-        super().__init__(prog, max_help_position=32)
+        super().__init__(prog, max_help_position=34)
+
+    def _format_usage(self, usage, actions, groups, prefix):
+        text = super()._format_usage(usage, actions, groups, prefix)
+        lines = text.splitlines(keepends=True)
+        for index in range(1, len(lines)):
+            if lines[index].strip():
+                lines[index] = lines[index].lstrip()
+        return "".join(lines)
 
     def _format_action_invocation(self, action: argparse.Action) -> str:
         if not action.option_strings or action.nargs == 0:

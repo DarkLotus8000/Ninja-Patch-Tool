@@ -668,6 +668,27 @@ class CommonTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("ERROR: Unrecognized arguments: --definitely-invalid", stderr.getvalue())
 
+    def test_argument_parser_help_uses_compact_consistent_layout(self) -> None:
+        parser = common.ErrorArgumentParser(prog="make_patch.exe", description="Create a Ninja Patch.")
+        parser.add_argument("base")
+        parser.add_argument("new")
+        parser.add_argument("output")
+        parser.add_argument("base_name")
+        parser.add_argument("-c", "--compression", metavar="PRESET", help="Compression preset")
+        update.add_update_arguments(parser)
+        parser.add_version_argument()
+        parser.add_help_argument()
+        usage_lines = parser.format_usage().splitlines()
+        self.assertGreater(len(usage_lines), 1)
+        self.assertTrue(all(line == line.lstrip() for line in usage_lines[1:] if line))
+        help_text = parser.format_help()
+        lines = help_text.splitlines()
+        option_lines = [line.strip() for line in lines if line.startswith("  -")]
+        option_index = lambda prefix: next(index for index, line in enumerate(option_lines) if line.startswith(prefix))
+        self.assertLess(option_index("-u, --check-update"), option_index("-v, --version"))
+        self.assertLess(option_index("-v, --version"), option_index("-h, --help"))
+        self.assertNotIn("\n\n\n", help_text)
+
     def test_argument_parser_preserves_option_leading_error_message(self) -> None:
         stderr = io.StringIO()
         parser = common.ErrorArgumentParser()
@@ -1149,7 +1170,7 @@ This should not be included.
             )
 
     def test_gevent_eventemitter_fallback_license_is_tracked(self) -> None:
-        expected = build_release.LICENSES_DIR / "gevent_eventemitter_NOTICE.txt"
+        expected = build_release.LICENSES_DIR / "gevent_eventemitter_LICENSE.txt"
         self.assertEqual(
             build_release.VERSIONED_FALLBACK_STEAM_LICENSE_FILES,
             {("gevent-eventemitter", "2.1"): expected},
@@ -1169,7 +1190,7 @@ This should not be included.
             with mock.patch.object(build_release, "dependency_closure", return_value=[distribution]):
                 build_release.collect_steam_dependency_licenses(destination)
 
-            fallback_copy = destination / "gevent-eventemitter-2.1-gevent_eventemitter_NOTICE.txt"
+            fallback_copy = destination / "gevent-eventemitter-2.1-gevent_eventemitter_LICENSE.txt"
             self.assertEqual(
                 fallback_copy.read_bytes(),
                 build_release.VERSIONED_FALLBACK_STEAM_LICENSE_FILES[("gevent-eventemitter", "2.1")].read_bytes(),
