@@ -59,7 +59,7 @@ VERSIONED_FALLBACK_STEAM_LICENSE_FILES = {
     ("gevent-eventemitter", "2.1"): LICENSES_DIR / "gevent_eventemitter_LICENSE.txt",
 }
 MIN_PYINSTALLER_VERSION = (6, 15, 0)
-_ACTIVE_COMPILE_PROCESS: subprocess.Popen | None = None
+_ACTIVE_BUILD_PROCESS: subprocess.Popen | None = None
 KNOWN_RUNTIME_LOCK_FILES = {
     "data/.index.lock",
     "data/.operation.lock",
@@ -348,8 +348,8 @@ def remove_release_output_temps() -> None:
             pass
     _remove_path_with_retry(release_extract_temp_path())
 
-def _terminate_active_compile_process() -> None:
-    process = _ACTIVE_COMPILE_PROCESS
+def _terminate_active_build_process() -> None:
+    process = _ACTIVE_BUILD_PROCESS
     if process is None or process.poll() is not None:
         return
     try:
@@ -375,7 +375,7 @@ def _release_console_control_handler(control_type: int) -> bool:
     # and shutdown events may terminate the process without unwinding finally blocks.
     if control_type not in {2, 5, 6}:
         return False
-    _terminate_active_compile_process()
+    _terminate_active_build_process()
     for cleanup in (remove_release_temp, remove_release_output_temps):
         try:
             cleanup()
@@ -577,6 +577,31 @@ def build_environment(workspace: Path) -> dict[str, str]:
     environment["PYINSTALLER_CONFIG_DIR"] = str(config)
     return environment
 
+def _run_tracked_build_process(
+    command: list[str],
+    *,
+    timeout: float | None = None,
+    capture_output: bool = False,
+    **kwargs,
+) -> subprocess.CompletedProcess:
+    global _ACTIVE_BUILD_PROCESS
+    if capture_output:
+        if "stdout" in kwargs or "stderr" in kwargs:
+            raise ValueError("capture_output cannot be combined with stdout or stderr")
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    process = subprocess.Popen(command, **kwargs)
+    _ACTIVE_BUILD_PROCESS = process
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException:
+        _terminate_active_build_process()
+        raise
+    finally:
+        if _ACTIVE_BUILD_PROCESS is process:
+            _ACTIVE_BUILD_PROCESS = None
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
 def build_executable(script: Path, dist: Path, work: Path, specs: Path) -> Path:
     name = script.stem
     print(f"[Compiling] {name}.exe")
@@ -609,17 +634,17 @@ def build_executable(script: Path, dist: Path, work: Path, specs: Path) -> Path:
         "pysteam-client",
         str(script),
     ]
-    global _ACTIVE_COMPILE_PROCESS
+    global _ACTIVE_BUILD_PROCESS
     process = subprocess.Popen(command, cwd=ROOT, env=build_environment(dist.parent))
-    _ACTIVE_COMPILE_PROCESS = process
+    _ACTIVE_BUILD_PROCESS = process
     try:
         returncode = process.wait()
     except BaseException:
-        _terminate_active_compile_process()
+        _terminate_active_build_process()
         raise
     finally:
-        if _ACTIVE_COMPILE_PROCESS is process:
-            _ACTIVE_COMPILE_PROCESS = None
+        if _ACTIVE_BUILD_PROCESS is process:
+            _ACTIVE_BUILD_PROCESS = None
     if returncode != 0:
         raise RuntimeError(f"PyInstaller failed for {name}.exe with exit code {returncode}.")
     executable = dist / f"{name}.exe"
@@ -654,7 +679,7 @@ def run_source_tests() -> None:
         raise RuntimeError(f"Source test suite failed:\n{details}")
 
 def smoke_test_steam_worker_import(executable: Path, environment: dict[str, str]) -> None:
-    result = subprocess.run(
+    result = _run_tracked_build_process(
         [str(executable), STEAM_QUERY_WORKER_SMOKE_ARGUMENT],
         cwd=ROOT,
         env=environment,
@@ -683,15 +708,15 @@ def smoke_test_executables(dist: Path) -> None:
     for script in ENTRY_SCRIPTS:
         executable = dist / f"{Path(script).stem}.exe"
         try:
-            help_result = subprocess.run(
+            help_result = _run_tracked_build_process(
                 [str(executable), "-h"], cwd=ROOT, env=environment, capture_output=True, text=True, errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=120
             )
-            short_version_result = subprocess.run(
+            short_version_result = _run_tracked_build_process(
                 [str(executable), "-v"], cwd=ROOT, env=environment, capture_output=True, text=True, errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=120
             )
-            version_result = subprocess.run(
+            version_result = _run_tracked_build_process(
                 [str(executable), "--version"], cwd=ROOT, env=environment, capture_output=True, text=True, errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=120
             )
@@ -708,7 +733,7 @@ def smoke_test_executables(dist: Path) -> None:
             raise RuntimeError(f"Standalone executable version test failed for {executable.name}:\n{details}")
 
         try:
-            updater_result = subprocess.run(
+            updater_result = _run_tracked_build_process(
                 [str(executable), "--update-installer", "--version"],
                 cwd=ROOT,
                 env=environment,
@@ -735,7 +760,7 @@ def run_release_workflow_command(
 ) -> None:
     command = [str(executable), *arguments]
     try:
-        result = subprocess.run(
+        result = _run_tracked_build_process(
             command,
             cwd=cwd,
             env=environment,

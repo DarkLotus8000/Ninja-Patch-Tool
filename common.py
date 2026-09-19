@@ -318,11 +318,10 @@ def _steam_manifest_status(size: int | None, download_size: int | None) -> str:
 def _steam_manifest_from_app_data(
     app_data: dict[str, object],
     *,
-    source: str,
     source_kind: str,
-    last_updated: int | None = None,
-    change_number: int | None = None,
 ) -> dict[str, object]:
+    if source_kind not in {"live", "cache"}:
+        raise ValueError("Steam manifest source kind must be 'live' or 'cache'.")
     root = app_data.get("appinfo") if isinstance(app_data.get("appinfo"), dict) else app_data
     depots = root.get("depots") if isinstance(root, dict) else None
     depot = depots.get(str(WARFRAME_STEAM_DEPOT_ID)) if isinstance(depots, dict) else None
@@ -342,20 +341,10 @@ def _steam_manifest_from_app_data(
 
     size = _steam_numeric_field(public, "size", "Warframe public manifest size")
     download_size = _steam_numeric_field(public, "download", "Warframe public manifest download size")
-    if change_number is None:
-        change_number = _steam_numeric_field(app_data, "_change_number", "Steam change number")
-    if last_updated is None:
-        last_updated = _steam_numeric_field(app_data, "_last_updated", "Steam last-updated value")
     return {
-        "app_id": WARFRAME_STEAM_APP_ID,
-        "depot_id": WARFRAME_STEAM_DEPOT_ID,
         "manifest_id": manifest_id,
         "size": size,
-        "download_size": download_size,
         "status": _steam_manifest_status(size, download_size),
-        "last_updated": last_updated,
-        "change_number": change_number,
-        "source": source,
         "source_kind": source_kind,
     }
 
@@ -411,21 +400,12 @@ def read_steam_cached_public_manifest(appinfo_path: Path | None = None) -> dict[
             offset = entry_end
             continue
 
-        header = data[entry_start:entry_start + 68]
-        last_updated = int.from_bytes(header[12:16], "little")
-        change_number = int.from_bytes(header[44:48], "little")
         payload = data[entry_start + 68:entry_end]
         try:
             app_data = _parse_steam_binary_vdf(payload, string_table=string_table)
         except ValueError as exc:
             raise RuntimeError(f"Could not parse Warframe Steam app info: {exc}") from exc
-        result = _steam_manifest_from_app_data(
-            app_data,
-            source=str(path),
-            source_kind="cache",
-            last_updated=last_updated,
-            change_number=change_number,
-        )
+        result = _steam_manifest_from_app_data(app_data, source_kind="cache")
         # Cache only a stable snapshot. If Steam rewrote appinfo.vdf while it was
         # being read, return what we parsed but force a fresh read next time.
         try:
@@ -444,7 +424,7 @@ def query_steam_public_manifest(timeout: float = 8.0) -> dict[str, object]:
     try:
         from steam.client import SteamClient
     except ImportError as exc:
-        raise RuntimeError("pysteam-client[client] 1.8.2 is required for live Steam manifest queries") from exc
+        raise RuntimeError(f"pysteam-client[client] {STEAM_CLIENT_VERSION} is required for live Steam manifest queries") from exc
 
     request_timeout = max(1, int(round(timeout)))
 
@@ -490,12 +470,7 @@ def query_steam_public_manifest(timeout: float = 8.0) -> dict[str, object]:
             if app_data.get("_missing_token"):
                 raise RuntimeError(f"Steam live query requires an access token for app {WARFRAME_STEAM_APP_ID}")
 
-        return _steam_manifest_from_app_data(
-            app_data,
-            source="Steam live query",
-            source_kind="live",
-            change_number=_optional_nonnegative_int(app_data.get("_change_number")),
-        )
+        return _steam_manifest_from_app_data(app_data, source_kind="live")
     except RuntimeError:
         raise
     except Exception as exc:
@@ -529,47 +504,30 @@ def _validate_steam_worker_info(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("Steam query worker returned an invalid info object")
 
-    expected_keys = {
-        "app_id",
-        "depot_id",
-        "manifest_id",
-        "size",
-        "download_size",
-        "status",
-        "last_updated",
-        "change_number",
-        "source",
-        "source_kind",
-    }
+    expected_keys = {"manifest_id", "size", "status", "source_kind"}
     if set(value) != expected_keys:
         raise ValueError("Steam query worker returned an invalid info schema")
 
-    app_id = value.get("app_id")
-    depot_id = value.get("depot_id")
     manifest_id = value.get("manifest_id")
-    if app_id != WARFRAME_STEAM_APP_ID or isinstance(app_id, bool):
-        raise ValueError("Steam query worker returned an unexpected app ID")
-    if depot_id != WARFRAME_STEAM_DEPOT_ID or isinstance(depot_id, bool):
-        raise ValueError("Steam query worker returned an unexpected depot ID")
     if not isinstance(manifest_id, int) or isinstance(manifest_id, bool) or not (0 < manifest_id <= 0xFFFFFFFFFFFFFFFF):
         raise ValueError("Steam query worker returned an invalid manifest ID")
 
-    normalized: dict[str, object] = dict(value)
-    for key in ("size", "download_size", "last_updated", "change_number"):
-        item = normalized.get(key)
-        if item is not None and (not isinstance(item, int) or isinstance(item, bool) or item < 0):
-            raise ValueError(f"Steam query worker returned an invalid {key}")
+    size = value.get("size")
+    if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):
+        raise ValueError("Steam query worker returned an invalid size")
 
-    size = normalized.get("size") if isinstance(normalized.get("size"), int) else None
-    download_size = normalized.get("download_size") if isinstance(normalized.get("download_size"), int) else None
-    expected_status = _steam_manifest_status(size, download_size)
-    if normalized.get("status") != expected_status:
+    status = value.get("status")
+    if status not in {"valid", "invalid", "unvalidated"}:
+        raise ValueError("Steam query worker returned an invalid manifest status")
+    if size is None and status == "valid":
         raise ValueError("Steam query worker returned inconsistent manifest status")
-    if normalized.get("source_kind") != "live":
+    if isinstance(size, int) and size < STEAM_MANIFEST_MIN_VALID_SIZE and status != "invalid":
+        raise ValueError("Steam query worker returned inconsistent manifest status")
+    if isinstance(size, int) and size >= STEAM_MANIFEST_MIN_VALID_SIZE and status == "unvalidated":
+        raise ValueError("Steam query worker returned inconsistent manifest status")
+    if value.get("source_kind") != "live":
         raise ValueError("Steam query worker returned an unexpected source kind")
-    if normalized.get("source") != "Steam live query":
-        raise ValueError("Steam query worker returned an unexpected source")
-    return normalized
+    return dict(value)
 
 def _emit_steam_query_worker_payload(payload: dict[str, object]) -> None:
     sys.stdout.write(STEAM_QUERY_RESULT_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")

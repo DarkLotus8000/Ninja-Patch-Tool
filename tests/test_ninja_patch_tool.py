@@ -238,10 +238,8 @@ class CommonTests(unittest.TestCase):
             info = common.query_steam_public_manifest(timeout=4)
         self.assertEqual(info["manifest_id"], 123)
         self.assertEqual(info["status"], "valid")
-        self.assertEqual(info["download_size"], 30 * 1024**3)
-        self.assertNotIn("download", info)
-        self.assertEqual(info["source"], "Steam live query")
         self.assertEqual(info["source_kind"], "live")
+        self.assertEqual(set(info), {"manifest_id", "size", "status", "source_kind"})
         self.assertEqual(token_modes, [False])
 
     def test_direct_steam_live_query_requests_access_token_only_when_required(self) -> None:
@@ -340,13 +338,9 @@ class CommonTests(unittest.TestCase):
 
     def test_hidden_steam_query_worker_returns_json_result(self) -> None:
         info = {
-            "app_id": 230410,
-            "depot_id": 230411,
             "manifest_id": 123,
             "size": 52 * 1024**3,
-            "download_size": 30 * 1024**3,
             "status": "valid",
-            "source": "Steam live query",
             "source_kind": "live",
         }
         output = io.StringIO()
@@ -364,16 +358,10 @@ class CommonTests(unittest.TestCase):
 
     def test_steam_worker_collector_ignores_noise_and_validates_tagged_schema(self) -> None:
         info = {
-            "app_id": 230410,
-            "depot_id": 230411,
             "manifest_id": 123,
             "size": 52 * 1024**3,
-            "download_size": 30 * 1024**3,
             "status": "valid",
-            "source": "Steam live query",
             "source_kind": "live",
-            "last_updated": 0,
-            "change_number": 1,
         }
 
         class Process:
@@ -390,16 +378,10 @@ class CommonTests(unittest.TestCase):
 
     def test_steam_worker_collector_rejects_inconsistent_status(self) -> None:
         info = {
-            "app_id": 230410,
-            "depot_id": 230411,
             "manifest_id": 123,
             "size": 1024,
-            "download_size": 512,
             "status": "valid",
-            "source": "Steam live query",
             "source_kind": "live",
-            "last_updated": 0,
-            "change_number": 1,
         }
 
         class Process:
@@ -414,18 +396,12 @@ class CommonTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIn("inconsistent manifest status", error)
 
-    def test_steam_worker_collector_rejects_extra_info_fields_and_wrong_source(self) -> None:
+    def test_steam_worker_collector_rejects_extra_info_fields_and_non_live_source(self) -> None:
         base = {
-            "app_id": 230410,
-            "depot_id": 230411,
             "manifest_id": 123,
             "size": 52 * 1024**3,
-            "download_size": 30 * 1024**3,
             "status": "valid",
-            "source": "Steam live query",
             "source_kind": "live",
-            "last_updated": 0,
-            "change_number": 1,
         }
 
         class Process:
@@ -442,9 +418,9 @@ class CommonTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIn("invalid info schema", error)
 
-        result, error = common.collect_steam_query_subprocess(Process(dict(base, source="unexpected")))
+        result, error = common.collect_steam_query_subprocess(Process(dict(base, source_kind="cache")))
         self.assertIsNone(result)
-        self.assertIn("unexpected source", error)
+        self.assertIn("unexpected source kind", error)
 
     def test_live_status_snapshot_uses_warframe_and_steam_labels(self) -> None:
         process = FakeSteamQueryProcess()
@@ -1116,7 +1092,7 @@ This should not be included.
     def test_release_console_close_event_cleans_all_temporary_outputs(self) -> None:
         events: list[str] = []
         with (
-            mock.patch.object(build_release, "_terminate_active_compile_process", side_effect=lambda: events.append("terminate")),
+            mock.patch.object(build_release, "_terminate_active_build_process", side_effect=lambda: events.append("terminate")),
             mock.patch.object(build_release, "remove_release_temp", side_effect=lambda: events.append("temp")),
             mock.patch.object(build_release, "remove_release_output_temps", side_effect=lambda: events.append("outputs")),
         ):
@@ -1855,7 +1831,7 @@ This should not be included.
                     return SimpleNamespace(returncode=0, stdout=common.STEAM_QUERY_RESULT_PREFIX + payload + "\n", stderr="")
                 return SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{build_release.DISPLAY_VERSION}\n", stderr="")
 
-            with mock.patch.object(build_release.subprocess, "run", side_effect=run):
+            with mock.patch.object(build_release, "_run_tracked_build_process", side_effect=run):
                 build_release.smoke_test_executables(dist)
             expected = []
             for script in build_release.ENTRY_SCRIPTS:
@@ -1912,7 +1888,7 @@ This should not be included.
                         shutil.copytree(newer, target)
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch.object(build_release.subprocess, "run", side_effect=run):
+            with mock.patch.object(build_release, "_run_tracked_build_process", side_effect=run):
                 build_release.smoke_test_release_round_trip(stage, root / "roundtrip")
 
             self.assertEqual(
@@ -1946,7 +1922,7 @@ This should not be included.
                     (output / "wrong.bin").write_bytes(b"wrong")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch.object(build_release.subprocess, "run", side_effect=run):
+            with mock.patch.object(build_release, "_run_tracked_build_process", side_effect=run):
                 with self.assertRaisesRegex(RuntimeError, "do not match the expected installation"):
                     build_release.smoke_test_release_round_trip(stage, root / "roundtrip")
 
@@ -4842,17 +4818,11 @@ class ApplyPatchTests(unittest.TestCase):
 
     def test_cached_live_status_reports_concise_dependency_failure_reason(self) -> None:
         cached = {
-            "app_id": 230410,
-            "depot_id": 230411,
             "manifest_id": 4895911296145320793,
             "size": 52 * 1024**3,
-            "download_size": 30 * 1024**3,
             "status": "valid",
-            "last_updated": 0,
-            "change_number": 0,
-            "source": "appinfo.vdf",
             "source_kind": "cache",
-            "live_error": "pysteam-client[client] 1.8.2 is required for live Steam manifest queries",
+            "live_error": f"pysteam-client[client] {common.STEAM_CLIENT_VERSION} is required for live Steam manifest queries",
         }
         with (
             mock.patch.object(common, "start_steam_query_subprocess", side_effect=RuntimeError("worker failed")),
@@ -4878,9 +4848,9 @@ class ApplyPatchTests(unittest.TestCase):
                 }
             }
         with self.assertRaisesRegex(RuntimeError, "manifest size"):
-            common._steam_manifest_from_app_data(app_data("broken", 1), source="test", source_kind="live")
+            common._steam_manifest_from_app_data(app_data("broken", 1), source_kind="live")
         with self.assertRaisesRegex(RuntimeError, "download size"):
-            common._steam_manifest_from_app_data(app_data(52 * 1024**3, -1), source="test", source_kind="live")
+            common._steam_manifest_from_app_data(app_data(52 * 1024**3, -1), source_kind="live")
 
 if __name__ == "__main__":
     unittest.main()
