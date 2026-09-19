@@ -6,6 +6,7 @@ from collections import deque
 import errno
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -35,6 +36,7 @@ from common import (
     cleanup_temp_root_if_empty,
     cleanup_temporary_file,
     compare_versions,
+    display_version,
     exclusive_operation_activity_lock,
     format_bytes,
     is_reparse_stat,
@@ -59,6 +61,11 @@ UPDATE_INSTALLER_ARGUMENT = "--update-installer"
 UPDATE_SESSION_FILE = "update_session.json"
 MAX_GITHUB_JSON_BYTES = 4 * 1024 * 1024
 MAX_CHECKSUM_BYTES = 4096
+LOCAL_DISPLAY_VERSION = display_version()
+_UPDATE_WORK_NAME_RE = re.compile(r"^update_[0-9a-f]{32}$", re.IGNORECASE)
+_UPDATE_BACKUP_NAME_RE = re.compile(r"^backup_[0-9a-f]{32}$", re.IGNORECASE)
+_PRESERVED_RELEASE_FILE_KEYS = frozenset(name.casefold() for name in PRESERVED_RELEASE_FILES)
+_RELEASE_MANIFEST_KEY = RELEASE_MANIFEST_FILE.casefold()
 
 class UpdaterBusyError(RuntimeError):
     pass
@@ -243,7 +250,7 @@ def latest_release() -> dict[str, Any]:
     if not isinstance(html_url, str) or not html_url.lower().startswith("https://github.com/"):
         html_url = GITHUB_RELEASES_URL
     version = tag[1:] if tag[:1].lower() == "v" else tag
-    return {"tag": tag, "version": version, "assets": assets, "url": html_url}
+    return {"version": version, "assets": assets, "url": html_url}
 
 def find_release_asset(release: dict[str, Any], name: str) -> tuple[str, int]:
     for asset in release["assets"]:
@@ -270,13 +277,13 @@ def check_update_only() -> int:
         comparison = compare_versions(release["version"], VERSION)
         if comparison < 0:
             _record_update_check_result("success")
-            print(f"[Update] Local Ninja Patch Tool v{VERSION} is newer than the latest release v{release['version']}.")
+            print(f"[Update] Local Ninja Patch Tool v{LOCAL_DISPLAY_VERSION} is newer than the latest release v{display_version(str(release['version']))}.")
         elif comparison == 0:
             _record_update_check_result("success")
-            print(f"[Update] Ninja Patch Tool v{VERSION} is up to date.")
+            print(f"[Update] Ninja Patch Tool v{LOCAL_DISPLAY_VERSION} is up to date.")
         else:
             _record_update_check_result("update_available")
-            print(f"[Update] Ninja Patch Tool v{release['version']} is available.\nCurrent version: v{VERSION}\nRelease: {release['url']}")
+            print(f"[Update] Ninja Patch Tool v{display_version(str(release['version']))} is available.\nCurrent version: v{LOCAL_DISPLAY_VERSION}\nRelease: {release['url']}")
         return 0
     except KeyboardInterrupt:
         print("\nUpdate check cancelled.", file=sys.stderr)
@@ -538,7 +545,6 @@ class _UpdateProgress:
             pass
         self.progress_width = 0
 
-
 def _download_file(
     url: str,
     destination: Path,
@@ -626,7 +632,7 @@ def _parse_release_manifest(path: Path) -> tuple[str, dict[str, str]]:
             raise RuntimeError(f"Release manifest contains an unsafe path: {name!r}") from exc
         canonical = "/".join(parts)
         folded = canonical.casefold()
-        if canonical != name or name in PRESERVED_RELEASE_FILES or name == RELEASE_MANIFEST_FILE:
+        if canonical != name or folded in _PRESERVED_RELEASE_FILE_KEYS or folded == _RELEASE_MANIFEST_KEY:
             raise RuntimeError(f"Release manifest contains an invalid managed path: {name!r}")
         if folded in seen:
             raise RuntimeError(f"Release manifest contains a duplicate managed path: {name!r}")
@@ -756,7 +762,7 @@ def download_release(release: dict[str, Any], work: Path) -> Path:
         archive_path.unlink(missing_ok=True)
         checksum_path.unlink(missing_ok=True)
         try:
-            print(f"[Update] Downloading Ninja Patch Tool v{version} (attempt {attempt}/{UPDATE_ATTEMPTS})...")
+            print(f"[Update] Downloading Ninja Patch Tool v{display_version(str(version))} (attempt {attempt}/{UPDATE_ATTEMPTS})...")
             _download_file(checksum_url, checksum_path, checksum_size, max_size=MAX_CHECKSUM_BYTES)
             _download_file(archive_url, archive_path, archive_size, "[Update]")
             expected = _read_expected_checksum(checksum_path, archive_name)
@@ -778,7 +784,7 @@ def _current_application_path() -> Path:
     return executable
 
 def _validate_temporary_updater(executable: Path) -> None:
-    expected = f"Ninja Patch Tool v{VERSION}"
+    expected = f"Ninja Patch Tool v{LOCAL_DISPLAY_VERSION}"
     try:
         result = subprocess.run(
             [str(executable), UPDATE_INSTALLER_ARGUMENT, "--version"],
@@ -841,30 +847,91 @@ def launch_updater(temporary_updater: Path, stage: Path, argv: list[str], target
 
 def _update_session_is_active(work: Path) -> bool:
     session = work / UPDATE_SESSION_FILE
-    if not session.is_file() or sys.platform != "win32":
+    if sys.platform != "win32":
         return False
     try:
-        state = parse_json(session.read_text(encoding="utf-8"))
-        if not isinstance(state, dict):
-            return False
-        pid = state.get("pid")
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-            return False
-        return process_matches_identity(pid, state.get("process_identity"))
-    except Exception:
-        # If process inspection itself fails, be conservative and leave the work directory alone.
+        session_stat = session.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # Metadata that cannot be inspected at all is ambiguous. Preserve the
+        # workspace rather than risking deletion of a live updater.
         return True
+    if stat.S_ISLNK(session_stat.st_mode) or is_reparse_stat(session_stat) or not stat.S_ISREG(session_stat.st_mode):
+        return False
+    try:
+        raw_state = session.read_text(encoding="utf-8")
+    except OSError:
+        return True
+    try:
+        state = parse_json(raw_state)
+    except ValueError:
+        # Malformed metadata is not a valid live-process identity. Backup
+        # recovery protection is handled separately by _update_work_backup_state().
+        return False
+    if not isinstance(state, dict):
+        return False
+    pid = state.get("pid")
+    identity = state.get("process_identity")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(identity, str)
+        or not identity
+    ):
+        return False
+    try:
+        return process_matches_identity(pid, identity)
+    except Exception:
+        # Only uncertainty while inspecting an otherwise valid process identity
+        # is treated as possibly active.
+        return True
+
+def _update_session_transaction_state(work: Path) -> str | None:
+    session = work / UPDATE_SESSION_FILE
+    try:
+        session_stat = session.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(session_stat.st_mode) or is_reparse_stat(session_stat) or not stat.S_ISREG(session_stat.st_mode):
+        return None
+    try:
+        state = parse_json(session.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    transaction_state = state.get("transaction_state")
+    return transaction_state if isinstance(transaction_state, str) else None
+
+def _update_session_backup_is_disposable(work: Path) -> bool:
+    return _update_session_transaction_state(work) in {"committed", "rolled_back"}
+
+def _update_work_backup_state(work: Path) -> bool | None:
+    """Return True for a real NPT backup, False for none, None when inspection is unsafe."""
+    try:
+        work_stat = work.lstat()
+        if stat.S_ISLNK(work_stat.st_mode) or is_reparse_stat(work_stat) or not stat.S_ISDIR(work_stat.st_mode):
+            return None
+        for path in work.iterdir():
+            if not _UPDATE_BACKUP_NAME_RE.fullmatch(path.name):
+                continue
+            path_stat = path.lstat()
+            if stat.S_ISLNK(path_stat.st_mode) or is_reparse_stat(path_stat) or not stat.S_ISDIR(path_stat.st_mode):
+                return None
+            return True
+        return False
+    except OSError:
+        return None
 
 def _update_work_has_backup(work: Path) -> bool:
-    try:
-        if not work.is_dir():
-            return False
-        return any(path.name.startswith("backup_") for path in work.iterdir())
-    except OSError:
-        # If an existing work directory cannot be inspected, preserve it rather than risking recovery data.
-        return True
+    # Unknown/unsafe state is treated conservatively as recovery data.
+    return _update_work_backup_state(work) is not False
 
 def cleanup_deferred_update_payload(work: Path) -> None:
+    if _update_work_backup_state(work) is not False:
+        return
     try:
         current_executable = Path(sys.executable).resolve()
         children = list(work.iterdir())
@@ -872,7 +939,7 @@ def cleanup_deferred_update_payload(work: Path) -> None:
         return
     for child in children:
         try:
-            if child.resolve() == current_executable or child.name == UPDATE_SESSION_FILE or child.name.startswith("backup_"):
+            if child.resolve() == current_executable or child.name == UPDATE_SESSION_FILE:
                 continue
             _remove_path(child)
         except OSError:
@@ -889,15 +956,14 @@ def cleanup_stale_update_work(max_age_seconds: int = STALE_UPDATE_AGE_SECONDS) -
         return
 
     for work in candidates:
-        if not work.name.startswith("update_"):
+        if not _UPDATE_WORK_NAME_RE.fullmatch(work.name):
             continue
         try:
             if work.is_symlink() or not work.is_dir() or work.stat().st_mtime > cutoff:
                 continue
-            # A backup means an interrupted/incomplete transaction may need manual recovery. Never remove it here.
-            if _update_work_has_backup(work):
+            backup_state = _update_work_backup_state(work)
+            if backup_state is None or (backup_state is True and not _update_session_backup_is_disposable(work)):
                 continue
-            # A self-updater now runs from inside update_<id>. Never delete its directory while that process is alive.
             if _update_session_is_active(work):
                 continue
             shutil.rmtree(work)
@@ -919,14 +985,18 @@ def cleanup_relaunched_update_work() -> None:
         work = raw_work.resolve()
     except OSError:
         return
-    if work.parent != expected_parent or not work.name.startswith("update_") or not work.is_dir():
+    if work.parent != expected_parent or not _UPDATE_WORK_NAME_RE.fullmatch(work.name) or not work.is_dir():
+        return
+    backup_state = _update_work_backup_state(work)
+    if backup_state is None or (backup_state is True and not _update_session_backup_is_disposable(work)):
         return
 
-    # This environment variable is set only after a successful handoff or after a successful rollback. An incomplete
-    # rollback never relaunches with cleanup enabled, so any transient backup still present here is safe to remove.
-    # The relaunched process can race the final few milliseconds of the temporary updater shutting down. Retry briefly
-    # until Windows releases the mapped self-copy, then leave any stubborn directory for normal stale cleanup later.
+    # The relaunched process can race the final few milliseconds of the temporary
+    # updater shutting down. Terminal transaction backups are cleanup debris.
     for _ in range(50):
+        if _update_session_is_active(work):
+            time.sleep(0.1)
+            continue
         try:
             shutil.rmtree(work)
             break
@@ -964,7 +1034,7 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
         return 130
     except Exception as exc:
         _record_update_check_result("failure")
-        print_warning(f"Automatic update failed; continuing with v{VERSION}: {exc}")
+        print_warning(f"Automatic update failed; continuing with v{LOCAL_DISPLAY_VERSION}: {exc}")
         return None
 
     if release is None:
@@ -981,7 +1051,7 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
         work = TEMP_ROOT / f"update_{uuid.uuid4().hex}"
         work.mkdir()
         temporary_updater = _copy_application_for_update(work)
-        print(f"[Update] Ninja Patch Tool v{release['version']} is available (current: v{VERSION}).")
+        print(f"[Update] Ninja Patch Tool v{display_version(str(release['version']))} is available (current: v{LOCAL_DISPLAY_VERSION}).")
         archive = download_release(release, work)
         stage = extract_release_archive(archive, work / "stage", release["version"])
         launch_updater(temporary_updater, stage, argv, release["version"])
@@ -994,7 +1064,7 @@ def handle_automatic_update(args: argparse.Namespace, argv: list[str]) -> int | 
         cleanup_temp_root_if_empty(TEMP_ROOT)
         return 130
     except Exception as exc:
-        print_warning(f"Automatic update failed; continuing with v{VERSION}: {exc}")
+        print_warning(f"Automatic update failed; continuing with v{LOCAL_DISPLAY_VERSION}: {exc}")
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)
         cleanup_temp_root_if_empty(TEMP_ROOT)
@@ -1077,18 +1147,61 @@ def wait_for_process_exit(pid: int, timeout_seconds: int = 30) -> None:
     finally:
         kernel32.CloseHandle(handle)
 
-def write_update_session(work: Path) -> None:
+def _write_update_session_state(work: Path, state: dict[str, Any]) -> None:
     session = work / UPDATE_SESSION_FILE
     temporary = session.with_name(f"{session.name}.{uuid.uuid4().hex}.tmp")
-    state = {
-        "pid": os.getpid(),
-        "process_identity": process_identity(os.getpid()),
-    }
     try:
         temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
         temporary.replace(session)
     finally:
         cleanup_temporary_file(temporary)
+
+def write_update_session(work: Path) -> None:
+    pid = os.getpid()
+    _write_update_session_state(
+        work,
+        {
+            "pid": pid,
+            "process_identity": process_identity(pid),
+            "transaction_state": "active",
+        },
+    )
+
+def _mark_update_session_transaction_state(work: Path, transaction_state: str) -> None:
+    if transaction_state not in {"committed", "rolled_back"}:
+        raise ValueError(f"Invalid updater terminal transaction state: {transaction_state!r}")
+    session = work / UPDATE_SESSION_FILE
+    try:
+        session_stat = session.lstat()
+        if stat.S_ISLNK(session_stat.st_mode) or is_reparse_stat(session_stat) or not stat.S_ISREG(session_stat.st_mode):
+            raise RuntimeError("Updater session state is not a real regular file.")
+        state = parse_json(session.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not mark the updater transaction as {transaction_state}.") from exc
+    if not isinstance(state, dict):
+        raise RuntimeError(
+            f"Could not mark the updater transaction as {transaction_state}: invalid updater session state."
+        )
+    pid = state.get("pid")
+    identity = state.get("process_identity")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(identity, str)
+        or not identity
+    ):
+        raise RuntimeError(
+            f"Could not mark the updater transaction as {transaction_state}: invalid updater session identity."
+        )
+    state["transaction_state"] = transaction_state
+    _write_update_session_state(work, state)
+
+def mark_update_session_committed(work: Path) -> None:
+    _mark_update_session_transaction_state(work, "committed")
+
+def mark_update_session_rolled_back(work: Path) -> None:
+    _mark_update_session_transaction_state(work, "rolled_back")
 
 def _validate_update_destination_path(install_dir: Path, relative: Path = Path()) -> None:
     # Never traverse an existing symlink/junction/reparse point while replacing installation files. In particular,
@@ -1157,7 +1270,11 @@ def _write_merged_index(release_path: Path, installed_path: Path, output_path: P
     sorted_index = {name: merged[name] for name in sorted(merged, key=base_name_sort_key)}
     output_path.write_text(json.dumps(sorted_index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
 
-def rollback_staged_release(changes: list[tuple[Path, Path | None]], backup: Path) -> None:
+def rollback_staged_release(
+    changes: list[tuple[Path, Path | None]],
+    backup: Path,
+    work: Path | None = None,
+) -> None:
     rollback_errors: list[str] = []
     for destination, saved in reversed(changes):
         try:
@@ -1173,9 +1290,60 @@ def rollback_staged_release(changes: list[tuple[Path, Path | None]], backup: Pat
         raise RuntimeError(
             f"Rollback was incomplete. Backup retained at {backup}. Rollback errors: {'; '.join(rollback_errors)}"
         )
+    if work is not None:
+        try:
+            mark_update_session_rolled_back(work)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Rollback restored the previous installation but could not record its terminal state. "
+                f"Backup retained at {backup}: {exc}"
+            ) from exc
     shutil.rmtree(backup, ignore_errors=True)
 
-def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[tuple[Path, Path | None]]]:
+def _validate_installed_release_manifest(
+    install_dir: Path,
+    expected_version: str,
+    expected_files: dict[str, str],
+) -> None:
+    manifest_relative = Path(*RELEASE_MANIFEST_FILE.split("/"))
+    _validate_update_destination_path(install_dir, manifest_relative)
+    manifest = install_dir / manifest_relative
+    try:
+        manifest_stat = manifest.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"Installed release manifest could not be inspected:\n{manifest}") from exc
+    if stat.S_ISLNK(manifest_stat.st_mode) or is_reparse_stat(manifest_stat) or not stat.S_ISREG(manifest_stat.st_mode):
+        raise RuntimeError(f"Installed release manifest is not a real regular file:\n{manifest}")
+
+    application_version, installed_files = _parse_release_manifest(manifest)
+    if application_version != expected_version:
+        raise RuntimeError("Installed release manifest application version does not match the expected target version.")
+    if installed_files != expected_files:
+        raise RuntimeError("Installed release manifest does not match the prevalidated staged release manifest.")
+
+    for name, expected_digest in expected_files.items():
+        relative = Path(*name.split("/"))
+        _validate_update_destination_path(install_dir, relative)
+        target = install_dir / relative
+        try:
+            target_stat = target.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"Installed release file could not be inspected: {name!r}.") from exc
+        if stat.S_ISLNK(target_stat.st_mode) or is_reparse_stat(target_stat) or not stat.S_ISREG(target_stat.st_mode):
+            raise RuntimeError(f"Installed release file is not a real regular file: {name!r}.")
+        try:
+            actual_digest = sha256_file(target).lower()
+        except OSError as exc:
+            raise RuntimeError(f"Installed release file could not be hashed: {name!r}.") from exc
+        if actual_digest != expected_digest:
+            raise RuntimeError(f"Installed release SHA-256 does not match {name!r}.")
+
+def install_staged_release(
+    stage: Path,
+    install_dir: Path,
+    target_version: str,
+    transaction_work: Path | None = None,
+) -> tuple[Path, list[tuple[Path, Path | None]]]:
     if not stage.is_dir():
         raise RuntimeError(f"Staged update directory does not exist: {stage}")
     if not install_dir.is_dir():
@@ -1183,8 +1351,7 @@ def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[t
 
     _validate_update_destination_path(install_dir)
     _validate_update_destination_path(install_dir, Path("data"))
-    staged_version, _ = _parse_release_manifest(stage / RELEASE_MANIFEST_FILE)
-    new_managed_files = _validate_staged_release_manifest(stage, staged_version)
+    new_managed_files = _validate_staged_release_manifest(stage, target_version)
     old_managed_files = _load_installed_release_manifest(install_dir)
 
     backup = stage.parent / f"backup_{uuid.uuid4().hex}"
@@ -1259,9 +1426,13 @@ def install_staged_release(stage: Path, install_dir: Path) -> tuple[Path, list[t
                     replace(merged_index, data_destination, relative)
                     continue
                 replace(data_source, data_destination, relative)
+
+        # Revalidate the installed release against the exact file map authenticated
+        # before mutation, closing the gap between staged validation and publication.
+        _validate_installed_release_manifest(install_dir, target_version, new_managed_files)
     except BaseException as install_error:
         try:
-            rollback_staged_release(changes, backup)
+            rollback_staged_release(changes, backup, transaction_work)
         except Exception as rollback_error:
             raise RuntimeError(f"Update installation failed and {rollback_error}") from install_error
         raise
@@ -1296,10 +1467,10 @@ def _read_installed_version(executable: Path, cwd: Path) -> str:
 
 def validate_installed_executable(executable: Path, target_version: str, cwd: Path) -> None:
     installed_version = _read_installed_version(executable, cwd)
-    if installed_version != target_version:
+    if compare_versions(installed_version, target_version) != 0:
         raise RuntimeError(
             f"Updated executable failed validation: {executable.name}: "
-            f"expected v{target_version}, got v{installed_version}"
+            f"expected v{display_version(target_version)}, got v{display_version(installed_version)}"
         )
 
 def installed_executable_satisfies_target(executable: Path, target_version: str, cwd: Path) -> str | None:
@@ -1368,24 +1539,25 @@ def run_update_installer(argv: list[str] | None = None) -> int:
                         )
                         if installed_version is None:
                             try:
-                                staged_version, _ = _parse_release_manifest(stage / RELEASE_MANIFEST_FILE)
-                                if staged_version != args.target_version:
-                                    raise RuntimeError(
-                                        "Staged release manifest version does not match the requested update version."
-                                    )
-                                transaction = install_staged_release(stage, install_dir)
+                                transaction = install_staged_release(
+                                    stage, install_dir, args.target_version, transaction_work=work
+                                )
                                 validate_installed_executable(executable, args.target_version, install_dir)
+                                mark_update_session_committed(work)
                             except Exception as exc:
                                 if transaction is not None:
                                     backup, changes = transaction
                                     try:
-                                        rollback_staged_release(changes, backup)
+                                        rollback_staged_release(changes, backup, work)
                                     except Exception as rollback_error:
                                         print_error(
                                             f"Ninja Patch Tool update failed and rollback was incomplete: {rollback_error}"
                                         )
                                         return 1
-                                elif _update_work_has_backup(work):
+                                elif (
+                                    _update_work_has_backup(work)
+                                    and not _update_session_backup_is_disposable(work)
+                                ):
                                     print_error(
                                         f"Ninja Patch Tool update failed and rollback was incomplete; "
                                         f"recovery data was retained: {exc}"
@@ -1434,14 +1606,14 @@ def run_update_installer(argv: list[str] | None = None) -> int:
         if installed_version is not None:
             if compare_versions(installed_version, args.target_version) > 0:
                 print(
-                    f"[Update] Ninja Patch Tool v{installed_version} is already installed; "
-                    f"skipping queued update to v{args.target_version}."
+                    f"[Update] Ninja Patch Tool v{display_version(installed_version)} is already installed; "
+                    f"skipping queued update to v{display_version(args.target_version)}."
                 )
             else:
-                print(f"[Update] Ninja Patch Tool v{args.target_version} was already installed by another updater.")
+                print(f"[Update] Ninja Patch Tool v{display_version(args.target_version)} was already installed by another updater.")
             return 0
         if update_installed:
-            print(f"[Update] Ninja Patch Tool updated successfully to v{args.target_version}.")
+            print(f"[Update] Ninja Patch Tool updated successfully to v{display_version(args.target_version)}.")
             return 0
         raise RuntimeError("Updater reached an unexpected state.")
     except Exception as exc:

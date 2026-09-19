@@ -5,6 +5,7 @@ import argparse
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -15,11 +16,27 @@ import sys
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import urlsplit
 
-VERSION = "1.4.10"
+VERSION = "1.5"
+
+def display_version(version: str = VERSION) -> str:
+    parts = version.split(".")
+    while len(parts) > 2 and parts[-1] == "0":
+        parts.pop()
+    return ".".join(parts)
+
+STEAM_CLIENT_VERSION = "1.8.2"
+WARFRAME_VERSION_URL = "https://conduit.browse.wf/current-version"
+WARFRAME_STEAM_APP_ID = 230410
+WARFRAME_STEAM_DEPOT_ID = 230411
+STEAM_MANIFEST_MIN_VALID_SIZE = 10 * 1024**3
+_WARFRAME_VERSION_RE = re.compile(r"^\d+(?:\.\d+){1,3}$")
 ENTRY_SCRIPTS = {
     "add_base.py": "Add Base - Ninja Patch Tool",
     "verify_base.py": "Verify Base - Ninja Patch Tool",
@@ -34,6 +51,11 @@ _OPERATION_ACTIVITY_SLOTS = 64
 
 _COLOR_SUPPORT_LOCK = threading.Lock()
 _COLOR_SUPPORT_CACHE: dict[int, bool] = {}
+_STEAM_APPINFO_CACHE_LOCK = threading.Lock()
+_STEAM_APPINFO_CACHE: dict[str, tuple[tuple[int, int], dict[str, object]]] = {}
+_STEAM_QUERY_WORKER_ARGUMENT = "--internal-steam-query-worker"
+STEAM_QUERY_WORKER_SMOKE_ARGUMENT = "--internal-steam-query-worker-smoke"
+STEAM_QUERY_RESULT_PREFIX = "__NINJA_STEAM_RESULT__:"
 _SEVERITY_TOKEN_RE = re.compile(r"(?m)^(ERROR:|WARNING:)")
 _TRANSIENT_PROGRESS_RE = re.compile(r"(?m)^(\[Update\] )(.+?)( \| )")
 
@@ -108,6 +130,682 @@ def print_error(message: object, *, flush: bool = False) -> None:
 
 def print_warning(message: object, *, flush: bool = False) -> None:
     print_console(f"WARNING: {message}", file=sys.stderr, flush=flush)
+
+def _read_steam_cstring(data: bytes, offset: int) -> tuple[str, int]:
+    end = data.find(b"\0", offset)
+    if end < 0:
+        raise ValueError("Unterminated Steam app-info string.")
+    try:
+        value = data[offset:end].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Steam app-info contains an invalid UTF-8 string.") from exc
+    return value, end + 1
+
+def _parse_steam_string_table(data: bytes, offset: int) -> list[str]:
+    if offset < 0 or offset + 4 > len(data):
+        raise ValueError("Steam app-info string table offset is invalid.")
+    count = int.from_bytes(data[offset:offset + 4], "little")
+    offset += 4
+    if count > 1_000_000:
+        raise ValueError("Steam app-info string table is implausibly large.")
+    result: list[str] = []
+    for _ in range(count):
+        value, offset = _read_steam_cstring(data, offset)
+        result.append(value)
+    return result
+
+def _parse_steam_binary_vdf(data: bytes, *, string_table: list[str] | None = None) -> dict[str, object]:
+    offset = 0
+
+    def read(size: int) -> bytes:
+        nonlocal offset
+        end = offset + size
+        if size < 0 or end > len(data):
+            raise ValueError("Steam app-info binary VDF is truncated.")
+        value = data[offset:end]
+        offset = end
+        return value
+
+    def read_key() -> str:
+        nonlocal offset
+        if string_table is None:
+            value, offset = _read_steam_cstring(data, offset)
+            return value
+        index = int.from_bytes(read(4), "little")
+        if index >= len(string_table):
+            raise ValueError("Steam app-info binary VDF references an invalid string-table key.")
+        return string_table[index]
+
+    def read_object() -> dict[str, object]:
+        nonlocal offset
+        result: dict[str, object] = {}
+        while True:
+            value_type = read(1)[0]
+            if value_type == 0x08:
+                return result
+            key = read_key()
+            if value_type == 0x00:
+                value: object = read_object()
+            elif value_type == 0x01:
+                value, offset = _read_steam_cstring(data, offset)
+            elif value_type == 0x02:
+                value = int.from_bytes(read(4), "little", signed=True)
+            elif value_type == 0x03:
+                import struct
+                value = struct.unpack("<f", read(4))[0]
+            elif value_type == 0x04:
+                value = int.from_bytes(read(4), "little")
+            elif value_type == 0x05:
+                raw = bytearray()
+                while True:
+                    unit = read(2)
+                    if unit == b"\0\0":
+                        break
+                    raw.extend(unit)
+                try:
+                    value = bytes(raw).decode("utf-16-le")
+                except UnicodeDecodeError as exc:
+                    raise ValueError("Steam app-info contains an invalid UTF-16 string.") from exc
+            elif value_type == 0x06:
+                value = int.from_bytes(read(4), "little")
+            elif value_type == 0x07:
+                value = int.from_bytes(read(8), "little")
+            elif value_type == 0x0A:
+                value = int.from_bytes(read(8), "little", signed=True)
+            elif value_type == 0x0B:
+                value = read(1)[0]
+            elif value_type == 0x0C:
+                value = 0
+            elif value_type == 0x0D:
+                value = 1
+            else:
+                raise ValueError(f"Unsupported Steam app-info binary VDF type 0x{value_type:02X}.")
+            result[key] = value
+
+    parsed = read_object()
+    if offset != len(data) and any(byte != 0 for byte in data[offset:]):
+        raise ValueError("Steam app-info binary VDF has unexpected trailing data.")
+    return parsed
+
+def _find_steam_appinfo_path() -> Path:
+    candidates: list[Path] = []
+    override = os.environ.get("STEAM_PATH")
+    if override:
+        candidates.append(Path(override).expanduser())
+
+    if sys.platform == "win32":
+        try:
+            import winreg
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                for key_name in (r"Software\Valve\Steam", r"Software\WOW6432Node\Valve\Steam"):
+                    try:
+                        with winreg.OpenKey(hive, key_name) as key:
+                            for value_name in ("SteamPath", "InstallPath", "SteamExe"):
+                                try:
+                                    raw, _ = winreg.QueryValueEx(key, value_name)
+                                except OSError:
+                                    continue
+                                if isinstance(raw, str) and raw.strip():
+                                    path = Path(raw.strip())
+                                    candidates.append(path.parent if path.suffix.casefold() == ".exe" else path)
+                    except OSError:
+                        continue
+        except ImportError:
+            pass
+        for variable in ("ProgramFiles(x86)", "ProgramFiles"):
+            root = os.environ.get(variable)
+            if root:
+                candidates.append(Path(root) / "Steam")
+    else:
+        home = Path.home()
+        candidates.extend((home / ".steam" / "steam", home / ".local" / "share" / "Steam"))
+
+    seen: set[str] = set()
+    for root in candidates:
+        key = str(root).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        path = root / "appcache" / "appinfo.vdf"
+        if path.is_file():
+            return path
+    raise RuntimeError("Steam app-info cache was not found.")
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+def _steam_numeric_field(mapping: dict[str, object], key: str, label: str) -> int | None:
+    if key not in mapping or mapping[key] is None:
+        return None
+    parsed = _optional_nonnegative_int(mapping[key])
+    if parsed is None:
+        raise RuntimeError(f"Steam app info contains an invalid {label}.")
+    return parsed
+
+def summarize_steam_live_query_error(error: str | None) -> str:
+    text = (error or "").strip()
+    lowered = text.casefold()
+    if "pysteam-client" in lowered or "no module named 'steam'" in lowered or 'no module named "steam"' in lowered:
+        return "Steam client dependency missing"
+    if "timed out" in lowered or "timeout" in lowered:
+        return "query timed out"
+    if "anonymous steam login failed" in lowered:
+        return "anonymous Steam login failed"
+    if "access token" in lowered:
+        return "Steam access token unavailable"
+    if "worker" in lowered and ("tagged result" in lowered or "invalid json" in lowered or "invalid result schema" in lowered):
+        return "Steam query worker failed"
+    return "query failed"
+
+def _steam_manifest_status(size: int | None, download_size: int | None) -> str:
+    # Never trust a changed GID by itself. Warframe depot 230411 briefly published
+    # the empty manifest 5112463999164762556 on 2026-02-11 before DE replaced it.
+    # A plausible Warframe base is far larger than 10 GiB, so anything below that
+    # threshold is invalid. An explicit zero download size is also invalid even if the
+    # reported installed size looks plausible.
+    if download_size == 0:
+        return "invalid"
+    if size is not None:
+        return "valid" if size >= STEAM_MANIFEST_MIN_VALID_SIZE else "invalid"
+    return "unvalidated"
+
+def _steam_manifest_from_app_data(
+    app_data: dict[str, object],
+    *,
+    source: str,
+    source_kind: str,
+    last_updated: int | None = None,
+    change_number: int | None = None,
+) -> dict[str, object]:
+    root = app_data.get("appinfo") if isinstance(app_data.get("appinfo"), dict) else app_data
+    depots = root.get("depots") if isinstance(root, dict) else None
+    depot = depots.get(str(WARFRAME_STEAM_DEPOT_ID)) if isinstance(depots, dict) else None
+    manifests = depot.get("manifests") if isinstance(depot, dict) else None
+    public = manifests.get("public") if isinstance(manifests, dict) else None
+    if isinstance(public, (str, int)):
+        public = {"gid": public}
+    if not isinstance(public, dict):
+        raise RuntimeError(f"Warframe depot {WARFRAME_STEAM_DEPOT_ID} has no public manifest in Steam app info.")
+
+    try:
+        manifest_id = int(str(public["gid"]).strip())
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError("Steam app info contains an invalid Warframe public manifest ID.") from None
+    if manifest_id <= 0 or manifest_id > 0xFFFFFFFFFFFFFFFF:
+        raise RuntimeError("Steam app info contains an out-of-range Warframe public manifest ID.")
+
+    size = _steam_numeric_field(public, "size", "Warframe public manifest size")
+    download_size = _steam_numeric_field(public, "download", "Warframe public manifest download size")
+    if change_number is None:
+        change_number = _steam_numeric_field(app_data, "_change_number", "Steam change number")
+    if last_updated is None:
+        last_updated = _steam_numeric_field(app_data, "_last_updated", "Steam last-updated value")
+    return {
+        "app_id": WARFRAME_STEAM_APP_ID,
+        "depot_id": WARFRAME_STEAM_DEPOT_ID,
+        "manifest_id": manifest_id,
+        "size": size,
+        "download_size": download_size,
+        "status": _steam_manifest_status(size, download_size),
+        "last_updated": last_updated,
+        "change_number": change_number,
+        "source": source,
+        "source_kind": source_kind,
+    }
+
+def read_steam_cached_public_manifest(appinfo_path: Path | None = None) -> dict[str, object]:
+    """Read Warframe's public depot manifest from Steam's local app-info cache."""
+    path = _find_steam_appinfo_path() if appinfo_path is None else appinfo_path
+    try:
+        stat_before = path.stat()
+    except OSError as exc:
+        raise RuntimeError(f"Could not stat Steam app-info cache {path}: {exc}") from exc
+    signature = (stat_before.st_size, stat_before.st_mtime_ns)
+    cache_key = str(path.resolve(strict=False))
+    with _STEAM_APPINFO_CACHE_LOCK:
+        cached = _STEAM_APPINFO_CACHE.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            return dict(cached[1])
+
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"Could not read Steam app-info cache {path}: {exc}") from exc
+    if len(data) < 8:
+        raise RuntimeError("Steam app-info cache is truncated.")
+
+    magic = int.from_bytes(data[0:4], "little")
+    if magic == 0x07564429:
+        if len(data) < 16:
+            raise RuntimeError("Steam app-info v41 header is truncated.")
+        string_table_offset = int.from_bytes(data[8:16], "little")
+        string_table = _parse_steam_string_table(data, string_table_offset)
+        offset = 16
+        entries_end = string_table_offset
+    elif magic == 0x07564428:
+        string_table = None
+        offset = 8
+        entries_end = len(data)
+    else:
+        raise RuntimeError(f"Unsupported Steam app-info format 0x{magic:08X}.")
+
+    while offset + 4 <= entries_end:
+        entry_start = offset
+        app_id = int.from_bytes(data[offset:offset + 4], "little")
+        offset += 4
+        if app_id == 0:
+            break
+        if offset + 4 > entries_end:
+            raise RuntimeError("Steam app-info entry header is truncated.")
+        entry_size = int.from_bytes(data[offset:offset + 4], "little")
+        entry_end = entry_start + 8 + entry_size
+        if entry_size < 60 or entry_end > entries_end:
+            raise RuntimeError("Steam app-info entry size is invalid.")
+        if app_id != WARFRAME_STEAM_APP_ID:
+            offset = entry_end
+            continue
+
+        header = data[entry_start:entry_start + 68]
+        last_updated = int.from_bytes(header[12:16], "little")
+        change_number = int.from_bytes(header[44:48], "little")
+        payload = data[entry_start + 68:entry_end]
+        try:
+            app_data = _parse_steam_binary_vdf(payload, string_table=string_table)
+        except ValueError as exc:
+            raise RuntimeError(f"Could not parse Warframe Steam app info: {exc}") from exc
+        result = _steam_manifest_from_app_data(
+            app_data,
+            source=str(path),
+            source_kind="cache",
+            last_updated=last_updated,
+            change_number=change_number,
+        )
+        # Cache only a stable snapshot. If Steam rewrote appinfo.vdf while it was
+        # being read, return what we parsed but force a fresh read next time.
+        try:
+            stat_after = path.stat()
+        except OSError:
+            stat_after = None
+        if stat_after is not None and (stat_after.st_size, stat_after.st_mtime_ns) == signature:
+            with _STEAM_APPINFO_CACHE_LOCK:
+                _STEAM_APPINFO_CACHE[cache_key] = (signature, dict(result))
+        return result
+
+    raise RuntimeError(f"Warframe app {WARFRAME_STEAM_APP_ID} was not found in Steam app info.")
+
+def query_steam_public_manifest(timeout: float = 8.0) -> dict[str, object]:
+    """Query Valve's Steam network directly through anonymous Steam product info (PICS)."""
+    try:
+        from steam.client import SteamClient
+    except ImportError as exc:
+        raise RuntimeError("pysteam-client[client] 1.8.2 is required for live Steam manifest queries") from exc
+
+    request_timeout = max(1, int(round(timeout)))
+
+    def app_data_from_product_info(product_info: object) -> dict[str, object]:
+        if not isinstance(product_info, dict):
+            raise RuntimeError("Steam live query returned no product information")
+        apps = product_info.get("apps")
+        app_data = apps.get(WARFRAME_STEAM_APP_ID) if isinstance(apps, dict) else None
+        if app_data is None and isinstance(apps, dict):
+            app_data = apps.get(str(WARFRAME_STEAM_APP_ID))
+        if not isinstance(app_data, dict):
+            raise RuntimeError(f"Steam live query returned no data for app {WARFRAME_STEAM_APP_ID}")
+        return app_data
+
+    client = SteamClient()
+    try:
+        result = client.anonymous_login()
+        try:
+            result_code = int(result)
+        except (TypeError, ValueError):
+            result_code = int(getattr(result, "value", 0))
+        if result_code != 1:
+            raise RuntimeError(f"anonymous Steam login failed ({result})")
+
+        # Warframe's public app info normally needs no access token. Avoid the
+        # extra PICS token request unless Valve explicitly marks the response as
+        # missing one; this keeps the common path faster and more predictable.
+        app_data = app_data_from_product_info(
+            client.get_product_info(
+                apps=[WARFRAME_STEAM_APP_ID],
+                auto_access_tokens=False,
+                timeout=request_timeout,
+            )
+        )
+        if app_data.get("_missing_token"):
+            app_data = app_data_from_product_info(
+                client.get_product_info(
+                    apps=[WARFRAME_STEAM_APP_ID],
+                    auto_access_tokens=True,
+                    timeout=request_timeout,
+                )
+            )
+            if app_data.get("_missing_token"):
+                raise RuntimeError(f"Steam live query requires an access token for app {WARFRAME_STEAM_APP_ID}")
+
+        return _steam_manifest_from_app_data(
+            app_data,
+            source="Steam live query",
+            source_kind="live",
+            change_number=_optional_nonnegative_int(app_data.get("_change_number")),
+        )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
+    finally:
+        try:
+            if getattr(client, "logged_on", False):
+                client.logout()
+        except Exception:
+            pass
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+def _steam_query_worker_timeout(argv: list[str] | None = None) -> float | None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] != _STEAM_QUERY_WORKER_ARGUMENT:
+        return None
+    if len(args) != 2:
+        raise ValueError("Steam query worker requires exactly one timeout argument")
+    try:
+        timeout = float(args[1])
+    except ValueError as exc:
+        raise ValueError("Steam query worker timeout must be numeric") from exc
+    if not math.isfinite(timeout) or not 1.0 <= timeout <= 60.0:
+        raise ValueError("Steam query worker timeout must be between 1 and 60 seconds")
+    return timeout
+
+def _validate_steam_worker_info(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("Steam query worker returned an invalid info object")
+
+    expected_keys = {
+        "app_id",
+        "depot_id",
+        "manifest_id",
+        "size",
+        "download_size",
+        "status",
+        "last_updated",
+        "change_number",
+        "source",
+        "source_kind",
+    }
+    if set(value) != expected_keys:
+        raise ValueError("Steam query worker returned an invalid info schema")
+
+    app_id = value.get("app_id")
+    depot_id = value.get("depot_id")
+    manifest_id = value.get("manifest_id")
+    if app_id != WARFRAME_STEAM_APP_ID or isinstance(app_id, bool):
+        raise ValueError("Steam query worker returned an unexpected app ID")
+    if depot_id != WARFRAME_STEAM_DEPOT_ID or isinstance(depot_id, bool):
+        raise ValueError("Steam query worker returned an unexpected depot ID")
+    if not isinstance(manifest_id, int) or isinstance(manifest_id, bool) or not (0 < manifest_id <= 0xFFFFFFFFFFFFFFFF):
+        raise ValueError("Steam query worker returned an invalid manifest ID")
+
+    normalized: dict[str, object] = dict(value)
+    for key in ("size", "download_size", "last_updated", "change_number"):
+        item = normalized.get(key)
+        if item is not None and (not isinstance(item, int) or isinstance(item, bool) or item < 0):
+            raise ValueError(f"Steam query worker returned an invalid {key}")
+
+    size = normalized.get("size") if isinstance(normalized.get("size"), int) else None
+    download_size = normalized.get("download_size") if isinstance(normalized.get("download_size"), int) else None
+    expected_status = _steam_manifest_status(size, download_size)
+    if normalized.get("status") != expected_status:
+        raise ValueError("Steam query worker returned inconsistent manifest status")
+    if normalized.get("source_kind") != "live":
+        raise ValueError("Steam query worker returned an unexpected source kind")
+    if normalized.get("source") != "Steam live query":
+        raise ValueError("Steam query worker returned an unexpected source")
+    return normalized
+
+def _emit_steam_query_worker_payload(payload: dict[str, object]) -> None:
+    sys.stdout.write(STEAM_QUERY_RESULT_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+def handle_steam_query_worker_request(argv: list[str] | None = None) -> int | None:
+    """Run a hidden Steam worker mode when this process was spawned internally."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] not in {_STEAM_QUERY_WORKER_ARGUMENT, STEAM_QUERY_WORKER_SMOKE_ARGUMENT}:
+        return None
+
+    if args[0] == STEAM_QUERY_WORKER_SMOKE_ARGUMENT:
+        if len(args) != 1:
+            _emit_steam_query_worker_payload({"ok": False, "error": "Steam worker smoke mode accepts no arguments"})
+            return 2
+        try:
+            from steam.client import SteamClient
+            if SteamClient is None:
+                raise ImportError("steam.client.SteamClient is unavailable")
+        except BaseException as exc:
+            _emit_steam_query_worker_payload({"ok": False, "error": str(exc) or exc.__class__.__name__})
+            return 1
+        _emit_steam_query_worker_payload({"ok": True, "smoke": "steam-import"})
+        return 0
+
+    try:
+        timeout = _steam_query_worker_timeout(args)
+    except ValueError as exc:
+        _emit_steam_query_worker_payload({"ok": False, "error": str(exc)})
+        return 2
+    assert timeout is not None
+    try:
+        payload = {"ok": True, "info": query_steam_public_manifest(timeout=timeout)}
+    except BaseException as exc:
+        payload = {"ok": False, "error": str(exc) or exc.__class__.__name__}
+    _emit_steam_query_worker_payload(payload)
+    return 0
+
+def _attach_steam_worker_kill_job(process: subprocess.Popen) -> None:
+    """Tie a Windows Steam worker to this parent with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class JobObjectBasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class JobObjectExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JobObjectBasicLimitInformation),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        info = JobObjectExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        process_handle = getattr(process, "_handle", None)
+        if process_handle is None:
+            raise RuntimeError("Steam query worker process handle is unavailable")
+        if not kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(int(process_handle))):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except Exception:
+        kernel32.CloseHandle(job)
+        raise
+    setattr(process, "_ninja_steam_job_handle", job)
+
+def _close_steam_worker_kill_job(process: subprocess.Popen) -> None:
+    if sys.platform != "win32":
+        return
+    handle = getattr(process, "_ninja_steam_job_handle", None)
+    if not handle:
+        return
+    setattr(process, "_ninja_steam_job_handle", None)
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+
+def start_steam_query_subprocess(timeout: float = 8.0, *, entry_script: Path | None = None) -> subprocess.Popen:
+    """Start a killable child process that performs only the direct Steam live query."""
+    worker_timeout = max(1.0, min(float(timeout), 60.0))
+    if getattr(sys, "frozen", False):
+        command = [sys.executable]
+    else:
+        script = (entry_script or Path(sys.argv[0])).resolve()
+        command = [sys.executable, str(script)]
+    command.extend((_STEAM_QUERY_WORKER_ARGUMENT, f"{worker_timeout:g}"))
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+    )
+    try:
+        _attach_steam_worker_kill_job(process)
+    except Exception:
+        # Parent-death cleanup is additional hardening, not a requirement for
+        # the live query. The normal deadline/termination path still owns the
+        # worker if Windows or a host Job Object policy rejects assignment.
+        pass
+    return process
+
+def collect_steam_query_subprocess(process: subprocess.Popen) -> tuple[dict[str, object] | None, str | None]:
+    """Collect and validate a completed Steam worker result."""
+    if process.poll() is None:
+        raise RuntimeError("Steam query worker is still running.")
+    try:
+        stdout, _ = process.communicate(timeout=0.25)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Steam query worker did not close its output pipe.") from exc
+    finally:
+        _close_steam_worker_kill_job(process)
+    tagged = [
+        line[len(STEAM_QUERY_RESULT_PREFIX):].strip()
+        for line in (stdout or "").splitlines()
+        if line.startswith(STEAM_QUERY_RESULT_PREFIX)
+    ]
+    if not tagged:
+        return None, f"Steam query worker exited with code {process.returncode} without returning a tagged result"
+    try:
+        payload = json.loads(tagged[-1])
+    except json.JSONDecodeError:
+        return None, "Steam query worker returned invalid JSON"
+    if not isinstance(payload, dict):
+        return None, "Steam query worker returned an invalid result schema"
+    if payload.get("ok") is True:
+        if set(payload) != {"ok", "info"}:
+            return None, "Steam query worker returned an invalid result schema"
+        try:
+            return _validate_steam_worker_info(payload.get("info")), None
+        except ValueError as exc:
+            return None, str(exc)
+    if payload.get("ok") is not False or set(payload) != {"ok", "error"}:
+        return None, "Steam query worker returned an invalid result schema"
+    error = payload.get("error")
+    if not isinstance(error, str) or not error.strip():
+        return None, "Steam query worker failed without a valid error message"
+    return None, error.strip()
+
+def terminate_steam_query_subprocess(process: subprocess.Popen, *, timeout: float = 1.0) -> None:
+    """Hard-stop an internal Steam worker and reap it."""
+    if process.poll() is not None:
+        try:
+            process.communicate(timeout=0.1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            _close_steam_worker_kill_job(process)
+        return
+    try:
+        process.terminate()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=max(0.0, timeout))
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=0.5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        process.communicate(timeout=0.1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        _close_steam_worker_kill_job(process)
+
+def steam_manifest_with_cache_fallback(
+    live_info: dict[str, object] | None,
+    live_error: str | None,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Use the local Steam cache only when the direct Steam worker failed."""
+    if live_info is not None:
+        return live_info, None
+    error = live_error or "unknown Steam query failure"
+    try:
+        cached = read_steam_cached_public_manifest()
+    except Exception as cache_exc:
+        return None, f"direct Steam live query failed: {error}; local Steam cache fallback failed: {cache_exc}"
+    cached = dict(cached)
+    cached["live_error"] = error
+    return cached, None
 
 class ActiveOperationError(RuntimeError):
     pass
@@ -545,7 +1243,7 @@ def validate_index(index: dict[str, Any]) -> None:
             raise ValueError(f'Index entry "{name}" has an invalid file_count.')
 
         if manifest_id in seen_manifest_ids:
-            raise ValueError(f'Bases "{seen_manifest_ids[manifest_id]}" and "{name}" have the same Steam manifest ID and appear to be duplicates.')
+            raise ValueError(f'[Steam] Bases "{seen_manifest_ids[manifest_id]}" and "{name}" have the same manifest ID and appear to be duplicates.')
         seen_manifest_ids[manifest_id] = name
 
         digest_lower = digest.lower()
@@ -624,24 +1322,56 @@ def console_title(title: str):
     import ctypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetConsoleTitleW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
-    kernel32.GetConsoleTitleW.restype = ctypes.c_uint32
-    kernel32.SetConsoleTitleW.argtypes = [ctypes.c_wchar_p]
-    kernel32.SetConsoleTitleW.restype = ctypes.c_int
+    quick_edit_state: tuple[object, int] | None = None
+    try:
+        kernel32.GetStdHandle.argtypes = [ctypes.c_int32]
+        kernel32.GetStdHandle.restype = ctypes.c_void_p
+        kernel32.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        kernel32.GetConsoleMode.restype = ctypes.c_int
+        kernel32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.SetConsoleMode.restype = ctypes.c_int
+        input_handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        invalid_handle = ctypes.c_void_p(-1).value
+        if input_handle not in (None, 0, invalid_handle):
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(input_handle, ctypes.byref(mode)):
+                previous_mode = int(mode.value)
+                quick_edit_mode = 0x0040
+                extended_flags = 0x0080
+                updated_mode = (previous_mode | extended_flags) & ~quick_edit_mode
+                if kernel32.SetConsoleMode(input_handle, updated_mode):
+                    quick_edit_state = (input_handle, previous_mode)
+    except (AttributeError, OSError, TypeError, ValueError):
+        quick_edit_state = None
 
-    buffer = ctypes.create_unicode_buffer(32768)
-    kernel32.GetConsoleTitleW(buffer, len(buffer))
-    previous = buffer.value
-
-    display_title = f"{title} (v{VERSION})"
-    if not kernel32.SetConsoleTitleW(display_title):
-        yield
-        return
+    title_changed = False
+    previous = ""
+    try:
+        kernel32.GetConsoleTitleW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        kernel32.GetConsoleTitleW.restype = ctypes.c_uint32
+        kernel32.SetConsoleTitleW.argtypes = [ctypes.c_wchar_p]
+        kernel32.SetConsoleTitleW.restype = ctypes.c_int
+        buffer = ctypes.create_unicode_buffer(32768)
+        kernel32.GetConsoleTitleW(buffer, len(buffer))
+        previous = buffer.value
+        title_changed = bool(kernel32.SetConsoleTitleW(f"{title} (v{display_version()})"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        title_changed = False
 
     try:
         yield
     finally:
-        kernel32.SetConsoleTitleW(previous)
+        if title_changed:
+            try:
+                kernel32.SetConsoleTitleW(previous)
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+        if quick_edit_state is not None:
+            input_handle, previous_mode = quick_edit_state
+            try:
+                kernel32.SetConsoleMode(input_handle, previous_mode)
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
 
 def run_child(command: list[str]) -> int:
     # Ensure an interrupted parent does not leave hdiffz/hpatchz running on its own.
@@ -872,6 +1602,106 @@ def format_bytes(size: int) -> str:
         value /= 1024
     raise AssertionError("unreachable")
 
+def fetch_current_warframe_version(timeout: float = 3.0) -> str:
+    request = urllib.request.Request(
+        WARFRAME_VERSION_URL,
+        headers={
+            "User-Agent": f"NinjaPatchTool/{VERSION}",
+            "Accept": "text/plain",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        method="GET",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            final = urlsplit(response.geturl())
+            if final.scheme.casefold() != "https" or (final.hostname or "").casefold() != "conduit.browse.wf":
+                raise RuntimeError("version endpoint redirected to an unexpected host")
+            payload = response.read(65)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        raise RuntimeError(str(reason)) from exc
+    except TimeoutError as exc:
+        raise RuntimeError("request timed out") from exc
+    if len(payload) > 64:
+        raise RuntimeError("response was unexpectedly large")
+    try:
+        version = payload.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("response was not ASCII text") from exc
+    if not _WARFRAME_VERSION_RE.fullmatch(version):
+        raise RuntimeError(f"invalid version string: {version!r}")
+    return version
+
+def live_status_lines(timeout: float = 10.0) -> list[str]:
+    lines: list[str] = []
+    deadline = time.monotonic() + max(0.1, timeout)
+    process: subprocess.Popen | None = None
+    try:
+        process = start_steam_query_subprocess(timeout=min(8.0, max(1.0, timeout)))
+    except Exception as exc:
+        steam_info, steam_error = steam_manifest_with_cache_fallback(None, str(exc))
+    else:
+        steam_info = None
+        steam_error = None
+
+    try:
+        version = fetch_current_warframe_version()
+    except Exception as exc:
+        lines.append(f"[Warframe] Live version unavailable: {exc}")
+    else:
+        lines.append(f"[Warframe] Live version: U{version}")
+
+    if process is not None:
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            terminate_steam_query_subprocess(process)
+            steam_info, steam_error = steam_manifest_with_cache_fallback(
+                None,
+                f"live status check timed out after {timeout:g} seconds",
+            )
+        else:
+            try:
+                direct_info, direct_error = collect_steam_query_subprocess(process)
+            except Exception as exc:
+                direct_info, direct_error = None, str(exc)
+            steam_info, steam_error = steam_manifest_with_cache_fallback(direct_info, direct_error)
+
+    if steam_info is None:
+        lines.append(f"[Steam] Live manifest unavailable ({summarize_steam_live_query_error(steam_error)}).")
+        return lines
+
+    manifest_id = int(steam_info["manifest_id"])
+    size = steam_info.get("size")
+    status = steam_info.get("status")
+    source_kind = steam_info.get("source_kind")
+    if source_kind not in {"live", "cache"}:
+        lines.append("[Steam] Live manifest unavailable (invalid Steam manifest source).")
+        return lines
+    live = source_kind == "live"
+    label = "Live manifest" if live else "Cached manifest"
+    fallback_reason = ""
+    if not live:
+        live_error = steam_info.get("live_error") if isinstance(steam_info.get("live_error"), str) else steam_error
+        fallback_reason = f" — live query unavailable ({summarize_steam_live_query_error(live_error)})."
+    if status == "invalid":
+        lines.append(f"[Steam] {label} candidate: {manifest_id} (invalid){fallback_reason}")
+    elif status == "valid" and isinstance(size, int):
+        lines.append(f"[Steam] {label}: {manifest_id} ({format_bytes(size)}){fallback_reason}")
+    else:
+        lines.append(f"[Steam] {label} candidate: {manifest_id} (size unavailable){fallback_reason}")
+    return lines
+
+def print_live_status_once() -> None:
+    for line in live_status_lines():
+        print_console(line, flush=True)
+
 def disk_usage_probe(path: Path) -> Path:
     probe = path.resolve()
     while not probe.exists() and probe != probe.parent:
@@ -973,13 +1803,15 @@ class ErrorArgumentParser(argparse.ArgumentParser):
         self.color = False
 
     def add_version_argument(self) -> None:
-        self.add_argument("-v", "--version", action="version", version=f"Ninja Patch Tool v{VERSION}", help="Shows the Ninja Patch Tool version")
+        self.add_argument("-v", "--version", action="version", version=f"Ninja Patch Tool v{display_version()}", help="Shows the Ninja Patch Tool version")
 
     def add_help_argument(self) -> None:
         self.add_argument("-h", "--help", action="help", help="Shows this help message")
 
     def error(self, message: str) -> None:
         self.print_usage(sys.stderr)
+        if message[:1].islower():
+            message = message[0].upper() + message[1:]
         print_error(message)
         self.exit(2)
 

@@ -4,11 +4,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import common
 from common import (
     print_error,
+    print_live_status_once,
+    handle_steam_query_worker_request,
     ENTRY_SCRIPTS,
     ErrorArgumentParser,
-    INDEX_FILE,
     console_title,
     install_termination_handlers,
     is_steam_manifest_id,
@@ -35,12 +37,15 @@ def _existing_base_conflict(index: dict, name: str, manifest_id: int) -> str | N
 
     for existing_name, entry in index.items():
         if entry["steam_manifest_id"] == manifest_id:
-            return f'Steam manifest ID {manifest_id} is already indexed as "{existing_name}".'
+            return f'[Steam] Manifest ID {manifest_id} is already indexed as "{existing_name}".'
     return None
 
 def main() -> int:
     install_termination_handlers()
     argv = sys.argv[1:]
+    steam_worker_result = handle_steam_query_worker_request(argv)
+    if steam_worker_result is not None:
+        return steam_worker_result
     early_update_result = handle_early_update_request(argv)
     if early_update_result is not None:
         return early_update_result
@@ -74,23 +79,25 @@ def main() -> int:
                 print_error("Base name cannot be empty.")
                 return 1
             if not is_steam_manifest_id(manifest_id):
-                print_error("Steam manifest ID must be a valid unsigned 64-bit integer.")
+                print_error("[Steam] Manifest ID must be a valid unsigned 64-bit integer.")
                 return 1
 
             # Reject conflicts that can be determined from the index before doing a potentially very expensive full-tree hash.
             # The same checks are repeated after hashing because another add_base process may update the index meanwhile.
-            with index_update_lock(INDEX_FILE):
+            with index_update_lock(common.INDEX_FILE):
                 conflict = _existing_base_conflict(load_index(), name, manifest_id)
             if conflict is not None:
                 print_error(f"{conflict}\nNo changes were made.")
                 return 1
+
+            print_live_status_once()
 
             with operation_lock("installation", base, "operation using this installation"):
                 print(f'Hashing base "{name}"...\n' "This may take a while for large installations.")
                 files, root_hash = scan_tree(base, "Hashing base")
 
                 # Keep the installation locked until its verified identity is committed to the index.
-                with index_update_lock(INDEX_FILE, timeout_seconds=5):
+                with index_update_lock(common.INDEX_FILE, timeout_seconds=5):
                     index = load_index()
                     conflict = _existing_base_conflict(index, name, manifest_id)
                     if conflict is not None:
@@ -105,7 +112,7 @@ def main() -> int:
                     index[name] = {"steam_manifest_id": manifest_id, "sha256": root_hash, "file_count": len(files)}
                     write_index(index)
 
-            print(f'\n[Added] Base "{name}"\nSteam manifest ID: {manifest_id}\nFiles: {len(files):,}\nSHA-256: {root_hash}\nIndex: {INDEX_FILE}')
+            print(f'\n[Added] Base "{name}"\n[Steam] Manifest ID: {manifest_id}\nFiles: {len(files):,}\nSHA-256: {root_hash}\nIndex: {common.INDEX_FILE}')
             return 0
     except KeyboardInterrupt:
         print("\nBase addition cancelled.", file=sys.stderr)

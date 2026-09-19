@@ -3,16 +3,26 @@
 Ninja Patch Tool creates and applies self-contained Ninja Patches (Diff Patches) using HDiffPatch. Use Ninja Capture Tool (not published yet) instead when a normal Update Patch can be created; Ninja Patch Tool is intended as a fallback.
 
 A ***base*** is a clean, unmodified Warframe installation from a known Steam manifest. Select the Warframe installation root, where at least `Cache.Windows`, `Tools`, and `Warframe.x64.exe` are directly located.
-Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/depot/230411/manifests/).
+Warframe Content depot manifests can be found on [SteamDB](https://steamdb.info/depot/230411/manifests/) for manual reference. NPT itself does not scrape SteamDB. Each normal operation performs one informational snapshot after cheap local argument/path/base checks have passed but before expensive hashing, copying, or diff work begins: `[Warframe]` reports the current live Warframe version and `[Steam]` reports the current public manifest by querying Valve's Steam network directly with an anonymous Steam product-info connection for app `230410`, depot `230411`. The desktop Steam client does not need to be running. Public app info is requested without an access-token lookup first; NPT only retries with token acquisition if Steam explicitly reports that a token is required. The Steam lookup runs in a separate internal child process and is hard-terminated when the snapshot's overall deadline expires, so a wedged Steam connection cannot leave an NPT command hung in the background. On Windows NPT also attempts to attach the child to a `KILL_ON_JOB_CLOSE` Job Object owned by the parent, so an NPT crash or forced termination normally cannot leave the Steam worker orphaned. If Windows or a host Job Object policy refuses the attachment, the direct Steam query still continues; the snapshot deadline and explicit cleanup remain active. If the direct query is temporarily unavailable, NPT may show the local `appcache/appinfo.vdf` value as a clearly labeled cached fallback. The fallback line includes a concise reason such as `Steam client dependency missing` or `query timed out` rather than only saying that the direct query is unavailable. The fallback parser reuses the parsed Warframe entry while the cache file's size and modification time stay unchanged. NPT does not keep polling after that one snapshot.
+
+The live snapshot is **not a compatibility gate for NPT bases**. An older registered, unmodified Steam base can legitimately be used to create a patch across a content-update boundary. For example, if `U43.5.1` is the last Steam base and the launcher updates that installation to `U44` before Steam later publishes a `U44.0.1` base, NPT can validly create a `U43.5.1 -> U44` patch. A newer live Steam manifest therefore never makes an older indexed NPT base stale or invalid by itself.
+
+Steam manifest IDs are also not trusted solely because they changed. A manifest whose reported installed depot size is below **10 GiB** is invalid, and an explicit zero download size is invalid even if the installed-size field looks plausible. If the installed size is genuinely unavailable, NPT reports the manifest as unvalidated rather than presenting it as a valid base; an explicitly present but malformed/negative numeric Steam metadata field is rejected instead of being silently treated as unavailable. The direct Steam lookup uses Steam product-info (PICS) internally, but NPT normalizes Steam's raw app-info field named `download` to the clearer internal `download_size`. Direct results use `source = "Steam live query"` with `source_kind = "live"`, while cached app-info results use `source_kind = "cache"`. The internal Steam worker uses a tagged JSON result whose `info` object must contain exactly `app_id`, `depot_id`, `manifest_id`, `size`, `download_size`, `status`, `last_updated`, `change_number`, `source`, and `source_kind`. The parent rejects extra or missing fields and validates the expected Warframe app/depot IDs, manifest ID, metadata types, status consistency, and explicit live provenance; missing or unknown provenance is never treated as authoritative live data. Unrelated child-process stdout is ignored. Hidden worker arguments are strict, so malformed timeout arguments fail rather than silently using a default. Release builds also run an offline worker smoke mode that imports the bundled Steam client and verifies tagged IPC without contacting Valve.
 
 ## Requirements
 
 - Windows 10 (64-bit) or newer
 - Python 3.14 (not required for release executables)
 
-Ninja Patch Tool targets Windows. On non-Windows systems, use the Windows release executables through Wine; native Linux/macOS source execution is not supported. Wine compatibility is not yet officially verified.
+Ninja Patch Tool targets Windows. On non-Windows systems, use the Windows release executables through Wine; native Linux/macOS source execution is not supported. Wine compatibility is not yet officially verified. On Windows, NPT temporarily disables classic console QuickEdit selection while a command is running and restores the previous console input mode when the command exits, preventing an accidental text selection from pausing the operation.
 
-No packages need to be installed to run the tool from source. Building a release additionally requires PyInstaller.
+Install the source dependency with:
+
+```text
+py -3.14 -m pip install -r requirements.txt
+```
+
+Building a release additionally requires PyInstaller.
 
 The commands below use the release executables. When running from source, prefix the corresponding `.py` script with `py -3.14`; for example, `py -3.14 add_base.py ...`.
 
@@ -109,7 +119,7 @@ In-place mode creates a recovery backup of only the files the patch may modify o
 Set `VERSION` in `common.py`, then run:
 
 ```bat
-py -3.14 -m pip install pyinstaller
+py -3.14 -m pip install -r requirements.txt pyinstaller
 py -3.14 build_release.py
 ```
 
@@ -125,5 +135,8 @@ Upload both generated files to the matching GitHub Release (`vVERSION`):
 NinjaPatchTool-vVERSION-Windows-x64.zip
 NinjaPatchTool-vVERSION-Windows-x64.zip.sha256
 ```
+
+The release builder also verifies that a packaged executable can import the bundled Steam client and emit the tagged internal-worker smoke result without contacting Valve.
+The builder rejects generated Python bytecode/cache artifacts in the source tree and runs its source tests with bytecode writes disabled, so a release build does not leave `__pycache__`, `.pyc`, or `.pyo` files behind.
 
 The updater requires both release assets.

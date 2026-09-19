@@ -1,0 +1,1 @@
+pysteam-client[client]==1.8.2

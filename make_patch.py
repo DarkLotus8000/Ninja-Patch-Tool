@@ -13,6 +13,8 @@ from pathlib import Path
 
 from common import (
     print_error,
+    print_live_status_once,
+    handle_steam_query_worker_request,
     print_warning,
     ENTRY_SCRIPTS,
     ByteProgress,
@@ -405,6 +407,8 @@ def _run_operation(args, argv: list[str]) -> int:
         print_error(f"{exc}")
         return 1
 
+    print_live_status_once()
+
     work = None
     locks = ExitStack()
     started = time.perf_counter()
@@ -569,7 +573,7 @@ def _run_operation(args, argv: list[str]) -> int:
             output.unlink(missing_ok=True)
             raise
         duration = format_duration(time.perf_counter() - started)
-        print(f"\n[Created] Patch completed successfully.\nBase: {canonical_name}\nSteam manifest ID: {indexed_base['steam_manifest_id']}\nDuration: {duration}\nPatch size: {format_bytes(output.stat().st_size)}")
+        print(f"\n[Created] Patch completed successfully.\nBase: {canonical_name}\n[Steam] Manifest ID: {indexed_base['steam_manifest_id']}\nDuration: {duration}\nPatch size: {format_bytes(output.stat().st_size)}")
         return 0
 
     except KeyError:
@@ -589,6 +593,9 @@ def _run_operation(args, argv: list[str]) -> int:
 def main() -> int:
     install_termination_handlers()
     argv = sys.argv[1:]
+    steam_worker_result = handle_steam_query_worker_request(argv)
+    if steam_worker_result is not None:
+        return steam_worker_result
     early_update_result = handle_early_update_request(argv)
     if early_update_result is not None:
         return early_update_result

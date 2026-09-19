@@ -1,6 +1,7 @@
 # Run from the project root with: py -m unittest discover -s tests
 from __future__ import annotations
 
+import ast
 import contextlib
 import errno
 import hashlib
@@ -15,7 +16,7 @@ import unittest
 import zipfile
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,73 @@ import common
 import make_patch
 import update
 import verify_base
+
+_LIVE_STATUS_PATCHES: list[object] = []
+
+class FakeSteamQueryProcess:
+    def __init__(self, *, running: bool = False, returncode: int = 0):
+        self.running = running
+        self.returncode = None if running else returncode
+
+    def poll(self):
+        return None if self.running else self.returncode
+
+    def wait(self, timeout=None):
+        if self.running:
+            raise subprocess.TimeoutExpired("steam-worker", timeout)
+        return self.returncode
+
+    def terminate(self):
+        self.running = False
+        self.returncode = -15
+
+    def kill(self):
+        self.running = False
+        self.returncode = -9
+
+    def communicate(self, timeout=None):
+        return "", None
+
+def setUpModule() -> None:
+    for module in (add_base, apply_patch, make_patch, verify_base):
+        patcher = mock.patch.object(module, "print_live_status_once")
+        patcher.start()
+        _LIVE_STATUS_PATCHES.append(patcher)
+
+def tearDownModule() -> None:
+    while _LIVE_STATUS_PATCHES:
+        _LIVE_STATUS_PATCHES.pop().stop()
+
+def make_steam_appinfo_v41(manifest_id: int, size: int, download: int = 1) -> bytes:
+    keys = ["appinfo", "depots", "230411", "manifests", "public", "gid", "size", "download"]
+    indexes = {key: index for index, key in enumerate(keys)}
+
+    def obj(key: str, content: bytes) -> bytes:
+        return b"\x00" + indexes[key].to_bytes(4, "little") + content + b"\x08"
+
+    def string(key: str, value: object) -> bytes:
+        return b"\x01" + indexes[key].to_bytes(4, "little") + str(value).encode("ascii") + b"\0"
+
+    public = string("gid", manifest_id) + string("size", size) + string("download", download)
+    payload = obj("appinfo", obj("depots", obj("230411", obj("manifests", obj("public", public))))) + b"\x08"
+    fixed_header = (
+        (1).to_bytes(4, "little")
+        + (123).to_bytes(4, "little")
+        + (456).to_bytes(8, "little")
+        + b"0" * 20
+        + (789).to_bytes(4, "little")
+        + b"1" * 20
+    )
+    entry_size = 60 + len(payload)
+    entry = (230410).to_bytes(4, "little") + entry_size.to_bytes(4, "little") + fixed_header + payload
+    string_table_offset = 16 + len(entry) + 4
+    header = (
+        (0x07564429).to_bytes(4, "little")
+        + (1).to_bytes(4, "little")
+        + string_table_offset.to_bytes(8, "little")
+    )
+    string_table = len(keys).to_bytes(4, "little") + b"".join(key.encode("utf-8") + b"\0" for key in keys)
+    return header + entry + b"\0" * 4 + string_table
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -98,6 +166,346 @@ def write_recovery(work: Path, state: dict, recovery_version: int | None = None)
     (work / apply_patch.RECOVERY_FILE).write_text(json.dumps(data), encoding="utf-8")
 
 class CommonTests(unittest.TestCase):
+    def test_display_version_hides_zero_patch_component(self) -> None:
+        self.assertEqual(common.display_version("1.0.0"), "1.0")
+        self.assertEqual(common.display_version("1.5.0"), "1.5")
+        self.assertEqual(common.display_version("1.5.1"), "1.5.1")
+        self.assertEqual(common.display_version("1.5"), "1.5")
+
+    def test_steam_appinfo_v41_reports_valid_and_empty_manifest_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "appinfo.vdf"
+            path.write_bytes(make_steam_appinfo_v41(4895911296145320793, 52 * 1024**3, 30 * 1024**3))
+            valid = common.read_steam_cached_public_manifest(path)
+            self.assertEqual(valid["manifest_id"], 4895911296145320793)
+            self.assertEqual(valid["status"], "valid")
+
+            path.write_bytes(make_steam_appinfo_v41(5112463999164762556, 0, 0))
+            empty = common.read_steam_cached_public_manifest(path)
+            self.assertEqual(empty["manifest_id"], 5112463999164762556)
+            self.assertEqual(empty["status"], "invalid")
+
+    def test_steam_manifest_zero_download_is_invalid_even_with_nonzero_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "appinfo.vdf"
+            path.write_bytes(make_steam_appinfo_v41(5112463999164762556, 52 * 1024**3, 0))
+            info = common.read_steam_cached_public_manifest(path)
+        self.assertEqual(info["status"], "invalid")
+
+    def test_steam_manifest_smaller_than_ten_gib_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "appinfo.vdf"
+            path.write_bytes(make_steam_appinfo_v41(123456789, 10 * 1024**3 - 1, 5 * 1024**3))
+            info = common.read_steam_cached_public_manifest(path)
+        self.assertEqual(info["status"], "invalid")
+
+    def test_direct_steam_live_query_does_not_require_desktop_client(self) -> None:
+        token_modes: list[bool] = []
+
+        class FakeSteamClient:
+            logged_on = False
+
+            def anonymous_login(self):
+                self.logged_on = True
+                return 1
+
+            def get_product_info(self, apps, timeout, auto_access_tokens=True):
+                token_modes.append(auto_access_tokens)
+                return {
+                    "apps": {
+                        common.WARFRAME_STEAM_APP_ID: {
+                            "depots": {
+                                str(common.WARFRAME_STEAM_DEPOT_ID): {
+                                    "manifests": {"public": {"gid": "123", "size": str(52 * 1024**3), "download": str(30 * 1024**3)}}
+                                }
+                            },
+                            "_missing_token": False,
+                        }
+                    }
+                }
+
+            def logout(self):
+                self.logged_on = False
+
+            def disconnect(self):
+                pass
+
+        steam_package = ModuleType("steam")
+        steam_package.__path__ = []
+        steam_client = ModuleType("steam.client")
+        steam_client.SteamClient = FakeSteamClient
+        with mock.patch.dict(sys.modules, {"steam": steam_package, "steam.client": steam_client}):
+            info = common.query_steam_public_manifest(timeout=4)
+        self.assertEqual(info["manifest_id"], 123)
+        self.assertEqual(info["status"], "valid")
+        self.assertEqual(info["download_size"], 30 * 1024**3)
+        self.assertNotIn("download", info)
+        self.assertEqual(info["source"], "Steam live query")
+        self.assertEqual(info["source_kind"], "live")
+        self.assertEqual(token_modes, [False])
+
+    def test_direct_steam_live_query_requests_access_token_only_when_required(self) -> None:
+        token_modes: list[bool] = []
+
+        class FakeSteamClient:
+            logged_on = False
+
+            def anonymous_login(self):
+                self.logged_on = True
+                return 1
+
+            def get_product_info(self, apps, timeout, auto_access_tokens=True):
+                token_modes.append(auto_access_tokens)
+                if not auto_access_tokens:
+                    return {"apps": {common.WARFRAME_STEAM_APP_ID: {"_missing_token": True}}}
+                return {
+                    "apps": {
+                        common.WARFRAME_STEAM_APP_ID: {
+                            "depots": {
+                                str(common.WARFRAME_STEAM_DEPOT_ID): {
+                                    "manifests": {"public": {"gid": "123", "size": str(52 * 1024**3), "download": str(30 * 1024**3)}}
+                                }
+                            },
+                            "_missing_token": False,
+                        }
+                    }
+                }
+
+            def logout(self):
+                self.logged_on = False
+
+            def disconnect(self):
+                pass
+
+        steam_package = ModuleType("steam")
+        steam_package.__path__ = []
+        steam_client = ModuleType("steam.client")
+        steam_client.SteamClient = FakeSteamClient
+        with mock.patch.dict(sys.modules, {"steam": steam_package, "steam.client": steam_client}):
+            info = common.query_steam_public_manifest(timeout=4)
+        self.assertEqual(info["manifest_id"], 123)
+        self.assertEqual(token_modes, [False, True])
+
+    def test_start_steam_query_subprocess_attaches_parent_death_job(self) -> None:
+        process = mock.Mock()
+        with (
+            mock.patch.object(subprocess, "Popen", return_value=process),
+            mock.patch.object(common, "_attach_steam_worker_kill_job") as attach,
+        ):
+            result = common.start_steam_query_subprocess(timeout=4, entry_script=Path(common.__file__))
+        self.assertIs(result, process)
+        attach.assert_called_once_with(process)
+
+    def test_start_steam_query_subprocess_continues_when_parent_death_job_is_unavailable(self) -> None:
+        process = mock.Mock()
+        with (
+            mock.patch.object(subprocess, "Popen", return_value=process),
+            mock.patch.object(common, "_attach_steam_worker_kill_job", side_effect=OSError(5, "job denied")),
+        ):
+            result = common.start_steam_query_subprocess(timeout=4, entry_script=Path(common.__file__))
+        self.assertIs(result, process)
+        process.kill.assert_not_called()
+
+    def test_hidden_steam_query_worker_rejects_malformed_internal_arguments(self) -> None:
+        for arguments in (
+            ["--internal-steam-query-worker"],
+            ["--internal-steam-query-worker", "not-a-number"],
+            ["--internal-steam-query-worker", "0"],
+            ["--internal-steam-query-worker", "61"],
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = common.handle_steam_query_worker_request(arguments)
+            self.assertEqual(result, 2)
+            line = output.getvalue().strip()
+            self.assertTrue(line.startswith(common.STEAM_QUERY_RESULT_PREFIX))
+            payload = json.loads(line[len(common.STEAM_QUERY_RESULT_PREFIX):])
+            self.assertFalse(payload["ok"])
+
+    def test_hidden_steam_query_worker_smoke_mode_imports_dependency_without_network(self) -> None:
+        steam_package = ModuleType("steam")
+        steam_package.__path__ = []
+        steam_client = ModuleType("steam.client")
+        steam_client.SteamClient = object
+        output = io.StringIO()
+        with (
+            mock.patch.dict(sys.modules, {"steam": steam_package, "steam.client": steam_client}),
+            contextlib.redirect_stdout(output),
+        ):
+            result = common.handle_steam_query_worker_request([common.STEAM_QUERY_WORKER_SMOKE_ARGUMENT])
+        self.assertEqual(result, 0)
+        line = output.getvalue().strip()
+        payload = json.loads(line[len(common.STEAM_QUERY_RESULT_PREFIX):])
+        self.assertEqual(payload, {"ok": True, "smoke": "steam-import"})
+
+    def test_hidden_steam_query_worker_returns_json_result(self) -> None:
+        info = {
+            "app_id": 230410,
+            "depot_id": 230411,
+            "manifest_id": 123,
+            "size": 52 * 1024**3,
+            "download_size": 30 * 1024**3,
+            "status": "valid",
+            "source": "Steam live query",
+            "source_kind": "live",
+        }
+        output = io.StringIO()
+        with (
+            mock.patch.object(common, "query_steam_public_manifest", return_value=info),
+            contextlib.redirect_stdout(output),
+        ):
+            result = common.handle_steam_query_worker_request(["--internal-steam-query-worker", "4"])
+        self.assertEqual(result, 0)
+        line = output.getvalue().strip()
+        self.assertTrue(line.startswith(common.STEAM_QUERY_RESULT_PREFIX))
+        payload = json.loads(line[len(common.STEAM_QUERY_RESULT_PREFIX):])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["info"]["manifest_id"], 123)
+
+    def test_steam_worker_collector_ignores_noise_and_validates_tagged_schema(self) -> None:
+        info = {
+            "app_id": 230410,
+            "depot_id": 230411,
+            "manifest_id": 123,
+            "size": 52 * 1024**3,
+            "download_size": 30 * 1024**3,
+            "status": "valid",
+            "source": "Steam live query",
+            "source_kind": "live",
+            "last_updated": 0,
+            "change_number": 1,
+        }
+
+        class Process:
+            returncode = 0
+            def poll(self):
+                return 0
+            def communicate(self, timeout=None):
+                payload = json.dumps({"ok": True, "info": info}, separators=(",", ":"))
+                return f"noise\n{common.STEAM_QUERY_RESULT_PREFIX}{payload}\n", None
+
+        result, error = common.collect_steam_query_subprocess(Process())
+        self.assertIsNone(error)
+        self.assertEqual(result["manifest_id"], 123)
+
+    def test_steam_worker_collector_rejects_inconsistent_status(self) -> None:
+        info = {
+            "app_id": 230410,
+            "depot_id": 230411,
+            "manifest_id": 123,
+            "size": 1024,
+            "download_size": 512,
+            "status": "valid",
+            "source": "Steam live query",
+            "source_kind": "live",
+            "last_updated": 0,
+            "change_number": 1,
+        }
+
+        class Process:
+            returncode = 0
+            def poll(self):
+                return 0
+            def communicate(self, timeout=None):
+                payload = json.dumps({"ok": True, "info": info}, separators=(",", ":"))
+                return common.STEAM_QUERY_RESULT_PREFIX + payload + "\n", None
+
+        result, error = common.collect_steam_query_subprocess(Process())
+        self.assertIsNone(result)
+        self.assertIn("inconsistent manifest status", error)
+
+    def test_steam_worker_collector_rejects_extra_info_fields_and_wrong_source(self) -> None:
+        base = {
+            "app_id": 230410,
+            "depot_id": 230411,
+            "manifest_id": 123,
+            "size": 52 * 1024**3,
+            "download_size": 30 * 1024**3,
+            "status": "valid",
+            "source": "Steam live query",
+            "source_kind": "live",
+            "last_updated": 0,
+            "change_number": 1,
+        }
+
+        class Process:
+            returncode = 0
+            def __init__(self, info):
+                self.info = info
+            def poll(self):
+                return 0
+            def communicate(self, timeout=None):
+                payload = json.dumps({"ok": True, "info": self.info}, separators=(",", ":"))
+                return common.STEAM_QUERY_RESULT_PREFIX + payload + "\n", None
+
+        result, error = common.collect_steam_query_subprocess(Process(dict(base, extra=True)))
+        self.assertIsNone(result)
+        self.assertIn("invalid info schema", error)
+
+        result, error = common.collect_steam_query_subprocess(Process(dict(base, source="unexpected")))
+        self.assertIsNone(result)
+        self.assertIn("unexpected source", error)
+
+    def test_live_status_snapshot_uses_warframe_and_steam_labels(self) -> None:
+        process = FakeSteamQueryProcess()
+        with (
+            mock.patch.object(common, "fetch_current_warframe_version", return_value="44.0"),
+            mock.patch.object(common, "start_steam_query_subprocess", return_value=process),
+            mock.patch.object(
+                common,
+                "collect_steam_query_subprocess",
+                return_value=({"manifest_id": 123, "size": 52 * 1024**3, "status": "valid", "source_kind": "live"}, None),
+            ),
+        ):
+            self.assertEqual(
+                common.live_status_lines(),
+                ["[Warframe] Live version: U44.0", "[Steam] Live manifest: 123 (52.0 GiB)"],
+            )
+
+    def test_live_status_missing_provenance_is_not_treated_as_live(self) -> None:
+        process = FakeSteamQueryProcess()
+        with (
+            mock.patch.object(common, "fetch_current_warframe_version", return_value="44.0"),
+            mock.patch.object(common, "start_steam_query_subprocess", return_value=process),
+            mock.patch.object(
+                common,
+                "collect_steam_query_subprocess",
+                return_value=({"manifest_id": 123, "size": 52 * 1024**3, "status": "valid"}, None),
+            ),
+        ):
+            lines = common.live_status_lines()
+        self.assertEqual(lines[0], "[Warframe] Live version: U44.0")
+        self.assertEqual(lines[1], "[Steam] Live manifest unavailable (invalid Steam manifest source).")
+
+    def test_live_status_snapshot_has_hard_overall_deadline(self) -> None:
+        process = FakeSteamQueryProcess(running=True)
+        with (
+            mock.patch.object(common, "fetch_current_warframe_version", return_value="44.0"),
+            mock.patch.object(common, "start_steam_query_subprocess", return_value=process),
+            mock.patch.object(common, "terminate_steam_query_subprocess") as terminate,
+            mock.patch.object(common, "steam_manifest_with_cache_fallback", return_value=(None, "live status check timed out after 0.05 seconds")),
+        ):
+            lines = common.live_status_lines(timeout=0.05)
+        terminate.assert_called_once_with(process)
+        self.assertEqual(lines[0], "[Warframe] Live version: U44.0")
+        self.assertEqual(lines[1], "[Steam] Live manifest unavailable (query timed out).")
+
+    def test_steam_appinfo_cache_reuses_unchanged_file_and_refreshes_after_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "appinfo.vdf"
+            path.write_bytes(make_steam_appinfo_v41(111, 1024, 512))
+            first = common.read_steam_cached_public_manifest(path)
+            with mock.patch.object(Path, "read_bytes", wraps=Path.read_bytes) as read_bytes:
+                second = common.read_steam_cached_public_manifest(path)
+                self.assertEqual(read_bytes.call_count, 0)
+            self.assertEqual(first["manifest_id"], second["manifest_id"])
+
+            path.write_bytes(make_steam_appinfo_v41(222, 2048, 1024))
+            stat = path.stat()
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+            refreshed = common.read_steam_cached_public_manifest(path)
+            self.assertEqual(refreshed["manifest_id"], 222)
+
     def test_console_severity_colors_are_restrained(self) -> None:
         stream = io.StringIO()
         message = "WARNING: warning\nERROR: error\n[Verified] stays plain"
@@ -151,8 +559,52 @@ class CommonTests(unittest.TestCase):
                     common.console_title(common.ENTRY_SCRIPTS[script]),
                 ):
                     pass
-                self.assertEqual(calls[0], f"{operation} - Ninja Patch Tool (v{common.VERSION})")
+                self.assertEqual(calls[0], f"{operation} - Ninja Patch Tool (v{common.display_version()})")
                 self.assertEqual(calls[-1], "Original Title")
+
+    def test_console_title_temporarily_disables_quick_edit_and_restores_input_mode(self) -> None:
+        modes: list[int] = []
+        original_mode = 0x0001 | 0x0040
+
+        class Function:
+            def __init__(self, callback):
+                self.callback = callback
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.callback(*args)
+
+        class Kernel32:
+            def __init__(self):
+                self.GetStdHandle = Function(lambda which: 123)
+                self.GetConsoleMode = Function(self.get_console_mode)
+                self.SetConsoleMode = Function(self.set_console_mode)
+                self.GetConsoleTitleW = Function(self.get_console_title)
+                self.SetConsoleTitleW = Function(lambda title: 1)
+
+            @staticmethod
+            def get_console_mode(handle, pointer):
+                pointer._obj.value = original_mode
+                return 1
+
+            @staticmethod
+            def set_console_mode(handle, mode):
+                modes.append(int(mode))
+                return 1
+
+            @staticmethod
+            def get_console_title(buffer, size):
+                buffer.value = "Original Title"
+                return len(buffer.value)
+
+        with (
+            mock.patch.object(common.sys, "platform", "win32"),
+            mock.patch("ctypes.WinDLL", return_value=Kernel32(), create=True),
+            common.console_title("Add Base - Ninja Patch Tool"),
+        ):
+            self.assertEqual(modes, [0x0081])
+        self.assertEqual(modes, [0x0081, original_mode])
 
     def test_update_progress_uses_capture_style_cyan_transfer_segment(self) -> None:
         stream = io.StringIO()
@@ -206,6 +658,23 @@ class CommonTests(unittest.TestCase):
         ):
             parser.parse_args(["--definitely-invalid"])
         self.assertIn("\x1b[31mERROR:\x1b[0m", stderr.getvalue())
+
+    def test_argument_parser_capitalizes_generated_error_message(self) -> None:
+        stderr = io.StringIO()
+        parser = common.ErrorArgumentParser()
+        parser.add_argument("--known")
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            parser.parse_args(["--definitely-invalid"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("ERROR: Unrecognized arguments: --definitely-invalid", stderr.getvalue())
+
+    def test_argument_parser_preserves_option_leading_error_message(self) -> None:
+        stderr = io.StringIO()
+        parser = common.ErrorArgumentParser()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            parser.error("--check-update must be used without operation arguments")
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("ERROR: --check-update must be used without operation arguments", stderr.getvalue())
 
     def test_duplicate_json_keys_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
@@ -387,7 +856,7 @@ class CommonTests(unittest.TestCase):
                 with mock.patch("sys.stdout", stdout), self.assertRaises(SystemExit) as raised:
                     parser.parse_args([option])
                 self.assertEqual(raised.exception.code, 0)
-                self.assertEqual(stdout.getvalue().strip(), f"Ninja Patch Tool v{common.VERSION}")
+                self.assertEqual(stdout.getvalue().strip(), f"Ninja Patch Tool v{common.display_version()}")
 
     def test_steam_manifest_id_range(self) -> None:
         self.assertTrue(common.is_steam_manifest_id(1))
@@ -494,6 +963,36 @@ class CommonTests(unittest.TestCase):
                 ["U41.9.9", "Pre-U42.0.0", "U42.0.0", "U42.0.1"],
             )
 
+    def test_add_base_uses_live_common_index_path_for_index_locking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            make_warframe_root(base)
+            index_file = Path(tmp) / "custom-index.json"
+            index_file.write_text("{}\n", encoding="utf-8")
+            observed: list[Path] = []
+
+            @contextmanager
+            def fake_index_lock(path: Path, timeout_seconds: int = 0):
+                observed.append(path)
+                yield
+
+            argv = ["add_base.py", str(base), "U43.5.1", "4895911296145320793"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(common, "INDEX_FILE", index_file),
+                mock.patch.object(add_base, "install_termination_handlers"),
+                mock.patch.object(add_base, "handle_early_update_request", return_value=None),
+                mock.patch.object(add_base, "handle_automatic_update", return_value=None),
+                mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
+                mock.patch.object(add_base, "index_update_lock", side_effect=fake_index_lock),
+                mock.patch.object(add_base, "validate_warframe_installation", return_value=True),
+                mock.patch.object(add_base, "print_live_status_once"),
+                mock.patch.object(add_base, "scan_tree", return_value=({}, "a" * 64)),
+            ):
+                self.assertEqual(add_base.main(), 0)
+            self.assertEqual(observed, [index_file, index_file])
+            self.assertIn("U43.5.1", json.loads(index_file.read_text(encoding="utf-8")))
+
     def test_add_base_keeps_installation_locked_until_index_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "base"
@@ -580,42 +1079,14 @@ This should not be included.
                 build_release.clean_stale_release_temp()
             self.assertFalse(release_temp.exists())
 
-    def test_release_builder_console_title_includes_version_and_restores_previous_title(self) -> None:
-        calls: list[str] = []
-
-        class Function:
-            def __init__(self, callback):
-                self.callback = callback
-                self.argtypes = None
-                self.restype = None
-
-            def __call__(self, *args):
-                return self.callback(*args)
-
-        class Kernel32:
-            def __init__(self):
-                self.GetConsoleTitleW = Function(self.get_console_title)
-                self.SetConsoleTitleW = Function(self.set_console_title)
-
-            @staticmethod
-            def get_console_title(buffer, size):
-                buffer.value = "Original Build Title"
-                return len(buffer.value)
-
-            @staticmethod
-            def set_console_title(title):
-                calls.append(title)
-                return 1
-
+    def test_release_builder_uses_common_console_lifecycle(self) -> None:
         with (
-            mock.patch.object(build_release.sys, "platform", "win32"),
-            mock.patch.object(build_release.ctypes, "WinDLL", return_value=Kernel32(), create=True),
+            mock.patch.object(build_release, "console_title", return_value=nullcontext()) as console_context,
             mock.patch.object(build_release, "main", return_value=0) as main,
         ):
             self.assertEqual(build_release.run_main_with_console_title(["--extract"]), 0)
+        console_context.assert_called_once_with("Building latest release... - Ninja Patch Tool")
         main.assert_called_once_with(["--extract"])
-        self.assertEqual(calls[0], f"Building latest release... - Ninja Patch Tool (v{common.VERSION})")
-        self.assertEqual(calls[-1], "Original Build Title")
 
     def test_release_console_close_event_cleans_all_temporary_outputs(self) -> None:
         with (
@@ -666,6 +1137,7 @@ This should not be included.
                 mock.patch.object(build_release, "DATA_DIR", data),
                 mock.patch.object(build_release, "LICENSES_DIR", licenses),
                 mock.patch.object(build_release, "ENTRY_SCRIPTS", ()),
+                mock.patch.object(build_release, "collect_steam_dependency_licenses"),
             ):
                 build_release.populate_release(stage, dist, [project_license])
 
@@ -675,6 +1147,40 @@ This should not be included.
                 json.loads((stage / "data" / "update.json").read_text(encoding="utf-8")),
                 {"auto_update": True},
             )
+
+    def test_gevent_eventemitter_fallback_license_is_tracked(self) -> None:
+        expected = build_release.LICENSES_DIR / "gevent_eventemitter_NOTICE.txt"
+        self.assertEqual(
+            build_release.VERSIONED_FALLBACK_STEAM_LICENSE_FILES,
+            {("gevent-eventemitter", "2.1"): expected},
+        )
+        self.assertTrue(expected.is_file())
+
+    def test_steam_license_collection_uses_gevent_eventemitter_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "licenses"
+            destination.mkdir()
+
+            distribution = mock.Mock()
+            distribution.metadata = {"Name": "gevent-eventemitter"}
+            distribution.version = "2.1"
+            distribution.files = []
+
+            with mock.patch.object(build_release, "dependency_closure", return_value=[distribution]):
+                build_release.collect_steam_dependency_licenses(destination)
+
+            fallback_copy = destination / "gevent-eventemitter-2.1-gevent_eventemitter_NOTICE.txt"
+            self.assertEqual(
+                fallback_copy.read_bytes(),
+                build_release.VERSIONED_FALLBACK_STEAM_LICENSE_FILES[("gevent-eventemitter", "2.1")].read_bytes(),
+            )
+
+    def test_gevent_eventemitter_fallback_is_version_specific(self) -> None:
+        distribution = mock.Mock()
+        distribution.metadata = {"Name": "gevent-eventemitter"}
+        distribution.version = "2.2"
+        distribution.files = []
+        self.assertEqual(build_release.fallback_steam_license_files(distribution), [])
 
     def test_release_manifest_tracks_managed_files_but_not_mutable_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -829,6 +1335,17 @@ This should not be included.
         self.assertTrue(build_release.parse_args(["--extract"]).extract)
         self.assertFalse(build_release.parse_args([]).extract)
 
+    def test_release_builder_argument_errors_use_styled_error_prefix(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                build_release.parse_args(["-x"])
+        self.assertEqual(raised.exception.code, 2)
+        output = stderr.getvalue()
+        self.assertIn("usage:", output)
+        self.assertIn("ERROR: Unrecognized arguments: -x", output)
+        self.assertNotIn("build_release.py: error:", output)
+
     def test_release_builder_extracts_archive_and_replaces_previous_extracted_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -852,6 +1369,95 @@ This should not be included.
             self.assertFalse((release_dir / f".{top_level}.extract.tmp").exists())
             self.assertFalse((release_dir / f"{top_level}.extract.backup").exists())
 
+    def test_release_extract_remove_retry_recovers_from_transient_windows_lock(self) -> None:
+        path = Path("locked")
+        remove = mock.Mock(side_effect=[PermissionError("busy"), PermissionError("busy"), None])
+        with (
+            mock.patch.object(build_release, "_remove_path", remove),
+            mock.patch.object(build_release.time, "sleep") as sleep,
+        ):
+            build_release._remove_path_with_retry(path, attempts=3, delay_seconds=0.01)
+        self.assertEqual(remove.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_release_extract_replace_retry_recovers_from_transient_windows_lock(self) -> None:
+        source = mock.Mock()
+        source.replace.side_effect = [PermissionError("busy"), None]
+        destination = Path("destination")
+        with mock.patch.object(build_release.time, "sleep") as sleep:
+            build_release._replace_path_with_retry(source, destination, attempts=2, delay_seconds=0.01)
+        self.assertEqual(source.replace.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+
+    def test_release_output_rollback_guard_removes_new_outputs_after_extract_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_dir = Path(tmp) / "release"
+            with mock.patch.object(build_release, "RELEASE_DIR", release_dir):
+                archive = build_release.release_archive_path()
+                checksum = build_release.release_checksum_path()
+                with self.assertRaisesRegex(PermissionError, "extract failed"):
+                    with build_release.release_output_rollback_guard(True):
+                        archive.write_bytes(b"new archive")
+                        checksum.write_text("new checksum", encoding="ascii")
+                        raise PermissionError("extract failed")
+                self.assertFalse(archive.exists())
+                self.assertFalse(checksum.exists())
+                self.assertEqual(list(release_dir.glob(".release-finalize-rollback-*")), [])
+
+    def test_release_output_rollback_guard_restores_previous_outputs_after_extract_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_dir = Path(tmp) / "release"
+            release_dir.mkdir()
+            with mock.patch.object(build_release, "RELEASE_DIR", release_dir):
+                archive = build_release.release_archive_path()
+                checksum = build_release.release_checksum_path()
+                archive.write_bytes(b"old archive")
+                checksum.write_text("old checksum", encoding="ascii")
+                with self.assertRaisesRegex(RuntimeError, "extract failed"):
+                    with build_release.release_output_rollback_guard(True):
+                        archive.write_bytes(b"new archive")
+                        checksum.write_text("new checksum", encoding="ascii")
+                        raise RuntimeError("extract failed")
+                self.assertEqual(archive.read_bytes(), b"old archive")
+                self.assertEqual(checksum.read_text(encoding="ascii"), "old checksum")
+                self.assertEqual(list(release_dir.glob(".release-finalize-rollback-*")), [])
+
+    def test_release_checksum_publication_failure_restores_output_pair(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                release_dir = root / "release"
+                stage = root / f"NinjaPatchTool-v{common.VERSION}"
+                stage.mkdir()
+                (stage / "NinjaPatchTool.exe").write_bytes(b"exe")
+                build_release.write_release_manifest(stage)
+                with mock.patch.object(build_release, "RELEASE_DIR", release_dir):
+                    archive = build_release.release_archive_path()
+                    checksum = build_release.release_checksum_path()
+                    if existing:
+                        build_release.create_release_outputs(stage)
+                        old_archive, old_checksum = archive.read_bytes(), checksum.read_bytes()
+                        (stage / "NinjaPatchTool.exe").write_bytes(b"updated-exe")
+                        build_release.write_release_manifest(stage)
+                    original_replace = Path.replace
+
+                    def fail_checksum(path, target):
+                        if path == checksum.with_name(checksum.name + ".tmp"):
+                            raise PermissionError("checksum is locked")
+                        return original_replace(path, target)
+
+                    with mock.patch.object(Path, "replace", fail_checksum):
+                        with self.assertRaisesRegex(PermissionError, "checksum is locked"):
+                            build_release.create_release_outputs(stage)
+                    if existing:
+                        self.assertEqual(archive.read_bytes(), old_archive)
+                        self.assertEqual(checksum.read_bytes(), old_checksum)
+                    else:
+                        self.assertFalse(archive.exists())
+                        self.assertFalse(checksum.exists())
+                    self.assertFalse(list(release_dir.glob("*.tmp")))
+                    self.assertFalse(list(release_dir.glob(".release-rollback-*")))
+
     def test_release_main_preserves_build_error_when_temp_cleanup_also_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -872,13 +1478,81 @@ This should not be included.
             self.assertIn("build failed", stderr.getvalue())
             self.assertIn("cleanup failed", stderr.getvalue())
 
+    def test_release_duration_uses_patch_summary_format(self) -> None:
+        self.assertEqual(common.format_duration(0), "00:00")
+        self.assertEqual(common.format_duration(65), "01:05")
+        self.assertEqual(common.format_duration(3599), "59:59")
+        self.assertEqual(common.format_duration(3600), "01:00:00")
+        self.assertEqual(common.format_duration(3661), "01:01:01")
+
     def test_pyinstaller_minimum_version_for_python_314(self) -> None:
         build_release.validate_pyinstaller_version("6.15.0")
         build_release.validate_pyinstaller_version("6.22.2")
         with self.assertRaisesRegex(RuntimeError, "6.15.0 or newer"):
             build_release.validate_pyinstaller_version("6.14.2")
 
-    def test_source_tree_cleanliness_detects_generated_artifacts_but_allows_runtime_lock(self) -> None:
+    def test_production_modules_do_not_redefine_top_level_functions_or_classes(self) -> None:
+        root = Path(build_release.__file__).resolve().parent
+        duplicates: list[str] = []
+
+        for path in sorted(root.glob("*.py"), key=lambda item: item.name.casefold()):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            definitions: dict[str, int] = {}
+            for node in tree.body:
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                previous = definitions.get(node.name)
+                if previous is None:
+                    definitions[node.name] = node.lineno
+                    continue
+                duplicates.append(f"{path.name}:{node.lineno}: {node.name} (first defined at line {previous})")
+
+        self.assertEqual(duplicates, [], "Duplicate top-level definitions found:\n" + "\n".join(duplicates))
+
+    def test_production_modules_do_not_reach_into_other_modules_private_api(self) -> None:
+        root = Path(build_release.__file__).resolve().parent
+        module_paths = tuple(sorted(root.glob("*.py"), key=lambda path: path.name.casefold()))
+        project_modules = {path.stem for path in module_paths}
+        violations: list[str] = []
+
+        for path in module_paths:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            module_aliases: dict[str, str] = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for imported in node.names:
+                        if imported.name in project_modules:
+                            module_aliases[imported.asname or imported.name] = imported.name
+                elif isinstance(node, ast.ImportFrom) and node.module in project_modules:
+                    for imported in node.names:
+                        if imported.name.startswith("_") and not imported.name.startswith("__"):
+                            violations.append(
+                                f"{path.name}:{node.lineno}: from {node.module} import {imported.name}"
+                            )
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+                    continue
+                owner = module_aliases.get(node.value.id)
+                if owner is None or not node.attr.startswith("_") or node.attr.startswith("__"):
+                    continue
+                violations.append(f"{path.name}:{node.lineno}: {node.value.id}.{node.attr}")
+
+        self.assertEqual(violations, [], "Cross-module private API access found:\n" + "\n".join(violations))
+
+    def test_release_source_files_cover_all_python_source_and_tests(self) -> None:
+        root = Path(build_release.__file__).resolve().parent
+        expected = {path.name for path in root.glob("*.py") if path.is_file()}
+        expected.update(
+            path.relative_to(root).as_posix()
+            for path in (root / "tests").glob("*.py")
+            if path.is_file()
+        )
+        declared = set(build_release.RELEASE_SOURCE_FILES)
+        missing = sorted(expected - declared, key=str.casefold)
+        self.assertEqual(missing, [], "Python release inputs missing from RELEASE_SOURCE_FILES:\n" + "\n".join(missing))
+
+    def test_source_tree_cleanliness_detects_generated_artifacts_and_runtime_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".pytest_cache").mkdir()
@@ -887,8 +1561,13 @@ This should not be included.
             (root / "htmlcov").mkdir()
             (root / ".coverage").write_text("coverage", encoding="ascii")
             (root / "coverage.xml").write_text("coverage", encoding="ascii")
+            (root / ".git").mkdir()
+            (root / ".git" / "index.lock").write_text("git index lock", encoding="ascii")
             (root / "nested").mkdir()
             (root / "nested" / "download.zip.part").write_bytes(b"partial")
+            (root / "nested" / "__pycache__").mkdir()
+            (root / "nested" / "module.pyc").write_bytes(b"bytecode")
+            (root / "nested" / "module.pyo").write_bytes(b"optimized bytecode")
             (root / "data").mkdir()
             (root / "data" / ".index.lock").write_text("1", encoding="ascii")
 
@@ -901,11 +1580,162 @@ This should not be included.
                     ".ruff_cache/",
                     "coverage.xml",
                     "htmlcov/",
+                    "nested/__pycache__/",
                     "nested/download.zip.part",
+                    "nested/module.pyc",
+                    "nested/module.pyo",
                 ],
             )
             with self.assertRaisesRegex(RuntimeError, "Generated/cache artifacts must be removed"):
                 build_release.validate_source_tree_cleanliness(root)
+
+    def test_release_cleanliness_allows_known_runtime_locks_and_rejects_unknown_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "data"
+            data.mkdir()
+            for relative in build_release.KNOWN_RUNTIME_LOCK_FILES:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("lock", encoding="utf-8")
+            (data / ".runtime.lock").write_text("lock", encoding="utf-8")
+            self.assertEqual(build_release.source_tree_artifacts(root), ["data/.runtime.lock"])
+            with self.assertRaisesRegex(RuntimeError, "Generated/cache artifacts"):
+                build_release.validate_source_tree_cleanliness(root)
+
+    def test_release_runtime_build_barrier_uses_exclusive_operation_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events: list[str] = []
+
+            @contextmanager
+            def activity_gate(install_dir: Path):
+                self.assertEqual(install_dir, root)
+                events.append("enter")
+                try:
+                    yield
+                finally:
+                    events.append("exit")
+
+            with mock.patch.object(build_release, "exclusive_operation_activity_lock", side_effect=activity_gate):
+                with build_release.runtime_build_barrier(root):
+                    events.append("build")
+
+            self.assertEqual(events, ["enter", "build", "exit"])
+
+    def test_release_runtime_build_barrier_reports_active_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            @contextmanager
+            def activity_gate(_install_dir: Path):
+                raise build_release.ActiveOperationError("active")
+                yield
+
+            with mock.patch.object(build_release, "exclusive_operation_activity_lock", side_effect=activity_gate):
+                with self.assertRaisesRegex(RuntimeError, "Close it before building a release"):
+                    with build_release.runtime_build_barrier(root):
+                        self.fail("busy runtime barrier unexpectedly entered")
+
+    def test_release_staging_removes_known_locks_and_rejects_unknown_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            for relative in build_release.KNOWN_RUNTIME_LOCK_FILES:
+                path = stage / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("lock", encoding="ascii")
+            unexpected = stage / "data" / ".unexpected.lock"
+            unexpected.write_text("lock", encoding="ascii")
+
+            with self.assertRaisesRegex(RuntimeError, "unexpected runtime lock files"):
+                build_release.sanitize_staged_runtime_locks(stage)
+            self.assertTrue(unexpected.exists())
+            self.assertTrue(all(not (stage / relative).exists() for relative in build_release.KNOWN_RUNTIME_LOCK_FILES))
+
+            unexpected.unlink()
+            build_release.sanitize_staged_runtime_locks(stage)
+
+    def test_release_main_revalidates_cleanliness_after_source_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_temp = Path(tmp) / "release_temp"
+            archive = Path(tmp) / "release.zip"
+            events: list[str] = []
+
+            def run_tests() -> None:
+                events.append("tests")
+
+            def validate_cleanliness() -> None:
+                events.append("cleanliness")
+
+            fingerprints = iter(("same", "same"))
+
+            def source_fingerprint(_project_licenses: list[Path]) -> str:
+                events.append("fingerprint")
+                return next(fingerprints)
+
+            @contextmanager
+            def runtime_barrier():
+                events.append("barrier-enter")
+                try:
+                    yield
+                finally:
+                    events.append("barrier-exit")
+
+            with (
+                mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp),
+                mock.patch.object(build_release, "validate_build_environment", return_value=[]),
+                mock.patch.object(build_release, "release_archive_path", return_value=archive),
+                mock.patch.object(build_release, "operation_lock", return_value=nullcontext()),
+                mock.patch.object(build_release, "release_temp_console_cleanup", return_value=nullcontext()),
+                mock.patch.object(build_release, "clean_stale_release_temp"),
+                mock.patch.object(build_release, "remove_release_output_temps"),
+                mock.patch.object(build_release, "runtime_build_barrier", side_effect=runtime_barrier),
+                mock.patch.object(build_release, "release_source_fingerprint", side_effect=source_fingerprint),
+                mock.patch.object(build_release, "run_source_tests", side_effect=run_tests),
+                mock.patch.object(build_release, "validate_source_tree_cleanliness", side_effect=validate_cleanliness),
+                mock.patch.object(build_release, "build_executable", side_effect=RuntimeError("stop after cleanliness")),
+                mock.patch.object(build_release, "remove_release_temp"),
+                mock.patch("sys.stderr", io.StringIO()),
+            ):
+                self.assertEqual(build_release.main([]), 1)
+            self.assertEqual(
+                events,
+                [
+                    "barrier-enter",
+                    "fingerprint",
+                    "barrier-exit",
+                    "tests",
+                    "barrier-enter",
+                    "cleanliness",
+                    "fingerprint",
+                    "barrier-exit",
+                ],
+            )
+
+    def test_release_main_rejects_source_change_during_source_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_temp = Path(tmp) / "release_temp"
+            archive = Path(tmp) / "release.zip"
+            build_executable = mock.Mock(side_effect=AssertionError("build must not start"))
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(build_release, "RELEASE_TEMP_DIR", release_temp),
+                mock.patch.object(build_release, "validate_build_environment", return_value=[]),
+                mock.patch.object(build_release, "release_archive_path", return_value=archive),
+                mock.patch.object(build_release, "operation_lock", return_value=nullcontext()),
+                mock.patch.object(build_release, "release_temp_console_cleanup", return_value=nullcontext()),
+                mock.patch.object(build_release, "clean_stale_release_temp"),
+                mock.patch.object(build_release, "remove_release_output_temps"),
+                mock.patch.object(build_release, "runtime_build_barrier", return_value=nullcontext()),
+                mock.patch.object(build_release, "release_source_fingerprint", side_effect=["before", "after"]),
+                mock.patch.object(build_release, "run_source_tests"),
+                mock.patch.object(build_release, "validate_source_tree_cleanliness"),
+                mock.patch.object(build_release, "build_executable", build_executable),
+                contextlib.redirect_stderr(stderr),
+            ):
+                self.assertEqual(build_release.main([]), 1)
+            build_executable.assert_not_called()
+            self.assertIn("Release source changed while the source test suite was running", stderr.getvalue())
 
     def test_release_builder_requires_python_314(self) -> None:
         for version in ((3, 13, 9), (3, 15, 0)):
@@ -952,6 +1782,13 @@ This should not be included.
             self.assertEqual(environments[0]["TEMP"], str(dist.parent))
             self.assertEqual(environments[0]["TMP"], str(dist.parent))
             self.assertEqual(environments[0]["PYINSTALLER_CONFIG_DIR"], str(dist.parent / "pyinstaller_config"))
+            pairs = list(zip(commands[0], commands[0][1:]))
+            self.assertIn(("--collect-all", "steam"), pairs)
+            self.assertIn(("--recursive-copy-metadata", "pysteam-client"), pairs)
+
+    def test_requirements_pin_steam_client_version(self) -> None:
+        text = (build_release.ROOT / "requirements.txt").read_text(encoding="utf-8").strip()
+        self.assertEqual(text, f"pysteam-client[client]=={common.STEAM_CLIENT_VERSION}")
 
     def test_release_builder_runs_source_tests_with_deprecation_warnings_as_errors(self) -> None:
         result = SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -962,6 +1799,8 @@ This should not be included.
         self.assertIn("error::DeprecationWarning", command)
         self.assertIn("error::RuntimeWarning", command)
         self.assertIn("error::ResourceWarning", command)
+        self.assertEqual(run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
         self.assertEqual(command[-5:], ["-m", "unittest", "discover", "-s", "tests"])
 
     def test_release_builder_stops_when_source_tests_fail(self) -> None:
@@ -980,13 +1819,16 @@ This should not be included.
             calls: list[list[str]] = []
             timeouts: list[int] = []
             child_creationflags: list[int] = []
-            def run(command, cwd, env, capture_output, text, creationflags, timeout):
+            def run(command, cwd, env, capture_output, text, errors, creationflags, timeout):
                 calls.append(command)
                 timeouts.append(timeout)
                 child_creationflags.append(creationflags)
                 if command[1:] == ["-h"]:
                     return SimpleNamespace(returncode=0, stdout="Shows this help message", stderr="")
-                return SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{build_release.VERSION}\n", stderr="")
+                if command[1:] == [common.STEAM_QUERY_WORKER_SMOKE_ARGUMENT]:
+                    payload = json.dumps({"ok": True, "smoke": "steam-import"})
+                    return SimpleNamespace(returncode=0, stdout=common.STEAM_QUERY_RESULT_PREFIX + payload + "\n", stderr="")
+                return SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{build_release.DISPLAY_VERSION}\n", stderr="")
 
             with mock.patch.object(build_release.subprocess, "run", side_effect=run):
                 build_release.smoke_test_executables(dist)
@@ -996,11 +1838,21 @@ This should not be included.
                 expected.append([f"{Path(script).stem}.exe", "-v"])
                 expected.append([f"{Path(script).stem}.exe", "--version"])
                 expected.append([f"{Path(script).stem}.exe", "--update-installer", "--version"])
+            expected.append(["add_base.exe", common.STEAM_QUERY_WORKER_SMOKE_ARGUMENT])
             self.assertEqual([[Path(command[0]).name, *command[1:]] for command in calls], expected)
-            self.assertEqual(timeouts, [120] * len(expected))
+            self.assertEqual(timeouts, [120] * (len(expected) - 1) + [30])
             self.assertEqual(
                 child_creationflags,
                 [getattr(build_release.subprocess, "CREATE_NO_WINDOW", 0)] * len(expected),
+            )
+
+    def test_release_workflow_capture_tolerates_non_utf8_native_child_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            build_release.run_release_workflow_command(
+                Path(sys.executable),
+                ["-c", "import os; os.write(1, bytes([0x97]) + b'native-output\\n')"],
+                cwd=Path(tmp),
+                environment=os.environ.copy(),
             )
 
     def test_release_round_trip_smoke_runs_full_cli_workflow(self) -> None:
@@ -1015,9 +1867,10 @@ This should not be included.
             environments: list[dict[str, str]] = []
             newer: Path | None = None
 
-            def run(command, cwd, env, capture_output, text, creationflags, timeout):
+            def run(command, cwd, env, capture_output, text, errors, creationflags, timeout):
                 nonlocal newer
                 self.assertEqual(creationflags, getattr(build_release.subprocess, "CREATE_NO_WINDOW", 0))
+                self.assertEqual(errors, "replace")
                 calls.append(command)
                 environments.append(env)
                 name = Path(command[0]).name
@@ -1056,8 +1909,9 @@ This should not be included.
             for script in build_release.ENTRY_SCRIPTS:
                 (stage / f"{Path(script).stem}.exe").write_bytes(b"exe")
 
-            def run(command, cwd, env, capture_output, text, creationflags, timeout):
+            def run(command, cwd, env, capture_output, text, errors, creationflags, timeout):
                 self.assertEqual(creationflags, getattr(build_release.subprocess, "CREATE_NO_WINDOW", 0))
+                self.assertEqual(errors, "replace")
                 name = Path(command[0]).name
                 if name == "make_patch.exe":
                     Path(command[3]).write_bytes(b"patch")
@@ -1123,7 +1977,7 @@ This should not be included.
         record.assert_called_once_with("success")
         self.assertEqual(
             stdout.getvalue(),
-            f"[Update] Local Ninja Patch Tool v{common.VERSION} is newer than the latest release v1.3.1.\n",
+            f"[Update] Local Ninja Patch Tool v{common.display_version()} is newer than the latest release v1.3.1.\n",
         )
 
     def test_check_update_reports_equal_version_as_up_to_date(self) -> None:
@@ -1136,7 +1990,7 @@ This should not be included.
         ):
             self.assertEqual(update.check_update_only(), 0)
         record.assert_called_once_with("success")
-        self.assertEqual(stdout.getvalue(), f"[Update] Ninja Patch Tool v{common.VERSION} is up to date.\n")
+        self.assertEqual(stdout.getvalue(), f"[Update] Ninja Patch Tool v{common.display_version()} is up to date.\n")
 
     def test_check_update_reports_newer_release(self) -> None:
         stdout = io.StringIO()
@@ -1151,7 +2005,7 @@ This should not be included.
         self.assertEqual(
             stdout.getvalue(),
             "[Update] Ninja Patch Tool v1.6 is available.\n"
-            f"Current version: v{common.VERSION}\n"
+            f"Current version: v{common.display_version()}\n"
             "Release: https://example.test/release\n",
         )
 
@@ -1407,7 +2261,7 @@ This should not be included.
 
     def test_temporary_self_updater_version_check_accepts_matching_version(self) -> None:
         updater_path = Path("NinjaPatchToolUpdater.exe")
-        result = SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{common.VERSION}\n", stderr="")
+        result = SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{common.display_version()}\n", stderr="")
         with mock.patch.object(update.subprocess, "run", return_value=result) as run:
             update._validate_temporary_updater(updater_path)
         run.assert_called_once_with(
@@ -1420,11 +2274,11 @@ This should not be included.
         )
 
     def test_installed_version_validation_allows_slow_onefile_startup(self) -> None:
-        result = SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{common.VERSION}\n", stderr="")
+        result = SimpleNamespace(returncode=0, stdout=f"Ninja Patch Tool v{common.display_version()}\n", stderr="")
         with mock.patch.object(update.subprocess, "run", return_value=result) as run:
             self.assertEqual(
                 update._read_installed_version(Path("make_patch.exe"), Path(".")),
-                common.VERSION,
+                common.display_version(),
             )
         self.assertEqual(run.call_args.kwargs["timeout"], 150)
 
@@ -1531,10 +2385,12 @@ This should not be included.
             base = Path(tmp) / "base"
             make_warframe_root(base)
             entry = {"steam_manifest_id": 123, "sha256": "a" * 64, "file_count": 1}
+            index_file = Path(tmp) / "index.json"
             argv = ["add_base.py", str(base), "U43.5.1", "456"]
             stderr = io.StringIO()
             with (
                 mock.patch.object(sys, "argv", argv),
+                mock.patch.object(common, "INDEX_FILE", index_file),
                 mock.patch.object(add_base, "install_termination_handlers"),
                 mock.patch.object(add_base, "handle_early_update_request", return_value=None),
                 mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
@@ -1553,10 +2409,12 @@ This should not be included.
             base = Path(tmp) / "base"
             make_warframe_root(base)
             entry = {"steam_manifest_id": 456, "sha256": "a" * 64, "file_count": 1}
+            index_file = Path(tmp) / "index.json"
             argv = ["add_base.py", str(base), "U43.5.2", "456"]
             stderr = io.StringIO()
             with (
                 mock.patch.object(sys, "argv", argv),
+                mock.patch.object(common, "INDEX_FILE", index_file),
                 mock.patch.object(add_base, "install_termination_handlers"),
                 mock.patch.object(add_base, "handle_early_update_request", return_value=None),
                 mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
@@ -1568,17 +2426,19 @@ This should not be included.
                 self.assertEqual(add_base.main(), 1)
             auto_update.assert_called_once()
             scan.assert_not_called()
-            self.assertIn('Steam manifest ID 456 is already indexed as "U43.5.1"', stderr.getvalue())
+            self.assertIn('[Steam] Manifest ID 456 is already indexed as "U43.5.1"', stderr.getvalue())
 
     def test_add_base_rechecks_index_after_hash_to_close_race(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "base"
             make_warframe_root(base)
             entry = {"steam_manifest_id": 999, "sha256": "b" * 64, "file_count": 1}
+            index_file = Path(tmp) / "index.json"
             argv = ["add_base.py", str(base), "U43.5.2", "456"]
             stderr = io.StringIO()
             with (
                 mock.patch.object(sys, "argv", argv),
+                mock.patch.object(common, "INDEX_FILE", index_file),
                 mock.patch.object(add_base, "install_termination_handlers"),
                 mock.patch.object(add_base, "handle_early_update_request", return_value=None),
                 mock.patch.object(add_base, "operation_lock", return_value=nullcontext()),
@@ -1833,7 +2693,7 @@ This should not be included.
             (stage / "data" / "hdiffz.exe").write_bytes(b"new hdiff")
             write_stage_release_manifest(stage)
 
-            backup, _ = update.install_staged_release(stage, install)
+            backup, _ = update.install_staged_release(stage, install, common.VERSION)
             self.assertTrue(backup.is_dir())
             self.assertEqual((install / "make_patch.exe").read_bytes(), b"new")
             self.assertEqual(
@@ -1862,7 +2722,7 @@ This should not be included.
             (stage / "data" / "index.json").write_text(json.dumps(release_index), encoding="utf-8")
             write_stage_release_manifest(stage)
 
-            update.install_staged_release(stage, install)
+            update.install_staged_release(stage, install, common.VERSION)
             merged = json.loads((install / "data" / "index.json").read_text(encoding="utf-8"))
             self.assertNotIn("CustomAlias", merged)
             self.assertEqual(merged["U44.1"], release_index["U44.1"])
@@ -1889,7 +2749,7 @@ This should not be included.
 
             with mock.patch.object(update, "_copy_item", side_effect=fail_on_b):
                 with self.assertRaisesRegex(OSError, "copy failed"):
-                    update.install_staged_release(stage, install)
+                    update.install_staged_release(stage, install, common.VERSION)
             self.assertEqual((install / "a.exe").read_bytes(), b"old a")
             self.assertEqual((install / "b.exe").read_bytes(), b"old b")
 
@@ -1920,7 +2780,7 @@ This should not be included.
 
             (stage / "new.exe").write_bytes(b"new")
             write_stage_release_manifest(stage, "1.4.5")
-            backup, changes = update.install_staged_release(stage, install)
+            backup, changes = update.install_staged_release(stage, install, "1.4.5")
 
             self.assertFalse(unchanged.exists())
             self.assertEqual(modified.read_bytes(), b"locally modified")
@@ -1941,8 +2801,8 @@ This should not be included.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             install = root / "install"
-            stage = root / "temp" / "update_deadbeef" / "stage"
-            backup = stage.parent / "backup_deadbeef"
+            stage = root / "temp" / "update_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / "stage"
+            backup = stage.parent / "backup_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             install.mkdir(parents=True)
             stage.mkdir(parents=True)
             backup.mkdir()
@@ -1954,7 +2814,6 @@ This should not be included.
                 mock.patch.object(update, "updater_install_lock", return_value=nullcontext()),
                 mock.patch.object(update, "exclusive_operation_activity_lock", return_value=nullcontext()),
                 mock.patch.object(update, "installed_executable_satisfies_target", return_value=None),
-                mock.patch.object(update, "_parse_release_manifest", return_value=("1.5.0", {})),
                 mock.patch.object(update, "install_staged_release", side_effect=RuntimeError("rollback incomplete")),
                 mock.patch.object(update, "relaunch") as relaunch,
             ):
@@ -1981,7 +2840,7 @@ This should not be included.
             (stage / "make_patch.exe").write_bytes(b"new")
             write_stage_release_manifest(stage)
 
-            backup, changes = update.install_staged_release(stage, install)
+            backup, changes = update.install_staged_release(stage, install, common.VERSION)
             self.assertEqual((install / "make_patch.exe").read_bytes(), b"new")
             update.rollback_staged_release(changes, backup)
             self.assertEqual((install / "make_patch.exe").read_bytes(), b"old")
@@ -2058,9 +2917,9 @@ This should not be included.
                 mock.patch.object(update, "updater_install_lock", side_effect=updater_lock),
                 mock.patch.object(update, "exclusive_operation_activity_lock", side_effect=activity_lock),
                 mock.patch.object(update, "installed_executable_satisfies_target", return_value=None),
-                mock.patch.object(update, "_parse_release_manifest", return_value=("1.5.0", {})),
-                mock.patch.object(update, "install_staged_release", side_effect=lambda *args: (events.append("install") or (backup, []))),
+                mock.patch.object(update, "install_staged_release", side_effect=lambda *args, **kwargs: (events.append("install") or (backup, []))),
                 mock.patch.object(update, "validate_installed_executable", side_effect=lambda *args: events.append("validate")),
+                mock.patch.object(update, "mark_update_session_committed", side_effect=lambda *args: events.append("commit")),
                 mock.patch.object(update, "relaunch", side_effect=lambda *args: events.append("relaunch")),
                 mock.patch("sys.stdout", io.StringIO()),
             ):
@@ -2135,22 +2994,95 @@ This should not be included.
         with mock.patch.object(update, "_read_installed_version", side_effect=RuntimeError("not runnable")):
             self.assertIsNone(update.installed_executable_satisfies_target(executable, "1.5", cwd))
 
-    def test_updater_post_install_validation_still_requires_exact_target_text(self) -> None:
+    def test_updater_rejects_staged_version_mismatch_before_backup_or_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            install.mkdir(parents=True)
+            stage.mkdir(parents=True)
+            installed = install / "make_patch.exe"
+            installed.write_bytes(b"old")
+            (stage / "make_patch.exe").write_bytes(b"unexpected-release")
+            write_stage_release_manifest(stage, "9.9.9")
+
+            with self.assertRaisesRegex(RuntimeError, "does not match the downloaded release"):
+                update.install_staged_release(stage, install, "1.5")
+
+            self.assertEqual(installed.read_bytes(), b"old")
+            self.assertEqual((stage / "make_patch.exe").read_bytes(), b"unexpected-release")
+            self.assertFalse(any(update._UPDATE_BACKUP_NAME_RE.fullmatch(path.name) for path in stage.parent.iterdir()))
+
+    def test_release_manifest_rejects_preserved_paths_case_insensitively(self) -> None:
+        for managed_path in (
+            "Data/Index.JSON",
+            "DATA/UPDATE.JSON",
+            "DATA/RELEASE_MANIFEST.JSON",
+        ):
+            with self.subTest(managed_path=managed_path), tempfile.TemporaryDirectory() as tmp:
+                manifest = Path(tmp) / "release_manifest.json"
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "format_version": common.RELEASE_MANIFEST_VERSION,
+                            "application_version": common.VERSION,
+                            "files": {managed_path: "0" * 64},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(RuntimeError, "invalid managed path"):
+                    update._parse_release_manifest(manifest)
+
+    def test_updater_rolls_back_when_installed_file_changes_before_post_install_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "install"
+            stage = root / "work" / "stage"
+            install.mkdir(parents=True)
+            stage.mkdir(parents=True)
+            (install / "make_patch.exe").write_bytes(b"old-exe")
+            (install / "README.txt").write_text("old readme", encoding="utf-8")
+            (stage / "make_patch.exe").write_bytes(b"new-exe")
+            (stage / "README.txt").write_text("new readme", encoding="utf-8")
+            write_stage_release_manifest(stage)
+            original_copy = update._copy_item
+
+            def copy_then_tamper(source: Path, destination: Path) -> None:
+                original_copy(source, destination)
+                if destination.name == "README.txt":
+                    destination.write_text("tampered after staged validation", encoding="utf-8")
+
+            with (
+                mock.patch.object(update, "_copy_item", side_effect=copy_then_tamper),
+                self.assertRaisesRegex(RuntimeError, "Installed release SHA-256 does not match 'README.txt'"),
+            ):
+                update.install_staged_release(stage, install, common.VERSION)
+
+            self.assertEqual((install / "make_patch.exe").read_bytes(), b"old-exe")
+            self.assertEqual((install / "README.txt").read_text(encoding="utf-8"), "old readme")
+            self.assertFalse((install / common.RELEASE_MANIFEST_FILE).exists())
+
+    def test_updater_post_install_validation_accepts_equivalent_version_text(self) -> None:
+        with mock.patch.object(update, "_read_installed_version", return_value="1.5"):
+            update.validate_installed_executable(Path("tool.exe"), "1.5.0", Path("."))
+
+    def test_updater_post_install_validation_rejects_different_version(self) -> None:
         with mock.patch.object(update, "_read_installed_version", return_value="1.6"):
             with self.assertRaisesRegex(RuntimeError, "expected v1.5, got v1.6"):
-                update.validate_installed_executable(Path("tool.exe"), "1.5", Path("."))
+                update.validate_installed_executable(Path("tool.exe"), "1.5.0", Path("."))
 
     def test_stale_update_work_cleanup_removes_only_safe_old_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp) / "temp"
             temp_root.mkdir()
-            old = temp_root / "update_old"
+            old = temp_root / "update_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             old.mkdir()
             (old / "stage").mkdir()
-            protected = temp_root / "update_protected"
+            protected = temp_root / "update_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             protected.mkdir()
-            (protected / "backup_deadbeef").mkdir()
-            recent = temp_root / "update_recent"
+            (protected / "backup_cccccccccccccccccccccccccccccccc").mkdir()
+            recent = temp_root / "update_dddddddddddddddddddddddddddddddd"
             recent.mkdir()
             unrelated = temp_root / "other_old"
             unrelated.mkdir()
@@ -2173,7 +3105,7 @@ This should not be included.
     def test_stale_update_work_preserves_active_self_updater_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp) / "temp"
-            work = temp_root / "update_active"
+            work = temp_root / "update_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
             work.mkdir(parents=True)
             (work / update.UPDATE_SESSION_FILE).write_text(
                 json.dumps({"pid": 123, "process_identity": "123:456"}), encoding="utf-8"
@@ -2196,7 +3128,7 @@ This should not be included.
     def test_stale_update_work_removes_inactive_self_updater_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp) / "temp"
-            work = temp_root / "update_inactive"
+            work = temp_root / "update_ffffffffffffffffffffffffffffffff"
             work.mkdir(parents=True)
             (work / update.UPDATE_SESSION_FILE).write_text(
                 json.dumps({"pid": 123, "process_identity": "123:456"}), encoding="utf-8"
@@ -2216,10 +3148,68 @@ This should not be included.
             self.assertFalse(work.exists())
             self.assertFalse(temp_root.exists())
 
+    def test_stale_update_work_removes_malformed_session_without_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp) / "temp"
+            work = temp_root / "update_55555555555555555555555555555555"
+            work.mkdir(parents=True)
+            (work / update.UPDATE_SESSION_FILE).write_text("{not-json", encoding="utf-8")
+            now = 2_000_000.0
+            old_time = now - update.STALE_UPDATE_AGE_SECONDS - 1
+            update.os.utime(work, (old_time, old_time))
+
+            with (
+                mock.patch.object(update, "TEMP_ROOT", temp_root),
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update.time, "time", return_value=now),
+            ):
+                update.cleanup_stale_update_work()
+
+            self.assertFalse(work.exists())
+
+    def test_malformed_update_session_never_makes_backup_disposable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp) / "temp"
+            work = temp_root / "update_66666666666666666666666666666666"
+            backup = work / "backup_77777777777777777777777777777777"
+            backup.mkdir(parents=True)
+            (work / update.UPDATE_SESSION_FILE).write_text("{not-json", encoding="utf-8")
+            now = 2_000_000.0
+            old_time = now - update.STALE_UPDATE_AGE_SECONDS - 1
+            update.os.utime(work, (old_time, old_time))
+
+            with (
+                mock.patch.object(update, "TEMP_ROOT", temp_root),
+                mock.patch.object(update.sys, "platform", "win32"),
+                mock.patch.object(update.time, "time", return_value=now),
+            ):
+                update.cleanup_stale_update_work()
+
+            self.assertTrue(work.is_dir())
+            self.assertTrue(backup.is_dir())
+
+    def test_stale_update_cleanup_ignores_non_owned_update_prefix_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp) / "temp"
+            work = temp_root / "update_notes"
+            work.mkdir(parents=True)
+            now = 2_000_000.0
+            old_time = now - update.STALE_UPDATE_AGE_SECONDS - 1
+            update.os.utime(work, (old_time, old_time))
+            with mock.patch.object(update, "TEMP_ROOT", temp_root), mock.patch.object(update.time, "time", return_value=now):
+                update.cleanup_stale_update_work()
+            self.assertTrue(work.is_dir())
+
+    def test_backup_prefix_without_owned_id_is_not_recovery_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "update_88888888888888888888888888888888"
+            (work / "backup_notes").mkdir(parents=True)
+            self.assertFalse(update._update_work_has_backup(work))
+
     def test_relaunched_tool_cleans_completed_update_work_inside_temp_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp) / "temp"
-            work = temp_root / "update_deadbeef"
+            work = temp_root / "update_11111111111111111111111111111111"
             work.mkdir(parents=True)
             (work / "NinjaPatchToolUpdater.exe").write_bytes(b"exe")
             with (
@@ -2233,8 +3223,18 @@ This should not be included.
     def test_relaunched_tool_cleans_transient_success_backup_with_update_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp) / "temp"
-            work = temp_root / "update_deadbeef"
-            (work / "backup_deadbeef").mkdir(parents=True)
+            work = temp_root / "update_22222222222222222222222222222222"
+            (work / "backup_33333333333333333333333333333333").mkdir(parents=True)
+            (work / update.UPDATE_SESSION_FILE).write_text(
+                json.dumps(
+                    {
+                        "pid": 123,
+                        "process_identity": "123:456",
+                        "transaction_state": "committed",
+                    }
+                ),
+                encoding="utf-8",
+            )
             with (
                 mock.patch.object(update, "TEMP_ROOT", temp_root),
                 mock.patch.dict(update.os.environ, {"NPT_UPDATE_WORK_CLEANUP": str(work)}, clear=True),
@@ -2325,13 +3325,35 @@ This should not be included.
 
     def test_updater_writes_active_session_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            work = Path(tmp) / "update_deadbeef"
+            work = Path(tmp) / "update_44444444444444444444444444444444"
             work.mkdir()
             with mock.patch.object(update, "process_identity", return_value="123:456"):
                 with mock.patch.object(update.os, "getpid", return_value=123):
                     update.write_update_session(work)
             state = json.loads((work / update.UPDATE_SESSION_FILE).read_text(encoding="utf-8"))
-            self.assertEqual(state, {"pid": 123, "process_identity": "123:456"})
+            self.assertEqual(state, {"pid": 123, "process_identity": "123:456", "transaction_state": "active"})
+
+    def test_updater_session_terminal_states_preserve_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            session = work / update.UPDATE_SESSION_FILE
+            session.write_text(
+                json.dumps(
+                    {
+                        "pid": 123,
+                        "process_identity": "123:456",
+                        "transaction_state": "active",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            update.mark_update_session_committed(work)
+            self.assertEqual(json.loads(session.read_text(encoding="utf-8"))["transaction_state"], "committed")
+            update.mark_update_session_rolled_back(work)
+            state = json.loads(session.read_text(encoding="utf-8"))
+            self.assertEqual(state["transaction_state"], "rolled_back")
+            self.assertEqual(state["pid"], 123)
+            self.assertEqual(state["process_identity"], "123:456")
 
     def test_updater_relaunch_uses_internal_one_shot_skip_without_changing_args(self) -> None:
         captured = {}
@@ -2427,6 +3449,26 @@ This should not be included.
             ):
                 self.assertEqual(apply_patch.main(), 0)
             self.assertEqual(locks, [("installation", base.resolve()), ("installation", output.resolve())])
+
+    def test_obvious_missing_paths_fail_before_live_status_snapshot(self) -> None:
+        cases = (
+            (add_base, ["add_base.py", "missing-base", "U44.0", "123"]),
+            (verify_base, ["verify_base.py", "missing-base", "U44.0"]),
+            (make_patch, ["make_patch.py", "missing-base", "missing-new", "out.patch", "U44.0"]),
+            (apply_patch, ["apply_patch.py", "missing-base", "missing.patch"]),
+        )
+        for module, argv in cases:
+            with self.subTest(module=module.__name__):
+                status = mock.Mock()
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(module, "print_live_status_once", status),
+                    mock.patch.object(module, "install_termination_handlers"),
+                    mock.patch.object(module, "handle_automatic_update", return_value=None),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    self.assertEqual(module.main(), 1)
+                status.assert_not_called()
 
     def test_scan_tree_detects_file_changes_during_hashing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3770,8 +4812,50 @@ class ApplyPatchTests(unittest.TestCase):
             except OSError as exc:
                 self.skipTest(f"Directory symlink creation is unavailable: {exc}")
             with self.assertRaisesRegex(RuntimeError, "symlink, junction, or reparse point"):
-                update.install_staged_release(stage, install)
+                update.install_staged_release(stage, install, common.VERSION)
             self.assertEqual(list(external.iterdir()), [])
+
+    def test_cached_live_status_reports_concise_dependency_failure_reason(self) -> None:
+        cached = {
+            "app_id": 230410,
+            "depot_id": 230411,
+            "manifest_id": 4895911296145320793,
+            "size": 52 * 1024**3,
+            "download_size": 30 * 1024**3,
+            "status": "valid",
+            "last_updated": 0,
+            "change_number": 0,
+            "source": "appinfo.vdf",
+            "source_kind": "cache",
+            "live_error": "pysteam-client[client] 1.8.2 is required for live Steam manifest queries",
+        }
+        with (
+            mock.patch.object(common, "start_steam_query_subprocess", side_effect=RuntimeError("worker failed")),
+            mock.patch.object(common, "steam_manifest_with_cache_fallback", return_value=(cached, None)),
+            mock.patch.object(common, "fetch_current_warframe_version", return_value="43.5.4"),
+        ):
+            lines = common.live_status_lines(timeout=0.1)
+        self.assertEqual(lines[0], "[Warframe] Live version: U43.5.4")
+        self.assertEqual(
+            lines[1],
+            "[Steam] Cached manifest: 4895911296145320793 (52.0 GiB) — live query unavailable (Steam client dependency missing).",
+        )
+
+    def test_steam_app_info_rejects_present_but_malformed_numeric_metadata(self) -> None:
+        def app_data(size: object, download: object) -> dict[str, object]:
+            return {
+                "depots": {
+                    "230411": {
+                        "manifests": {
+                            "public": {"gid": "123", "size": size, "download": download}
+                        }
+                    }
+                }
+            }
+        with self.assertRaisesRegex(RuntimeError, "manifest size"):
+            common._steam_manifest_from_app_data(app_data("broken", 1), source="test", source_kind="live")
+        with self.assertRaisesRegex(RuntimeError, "download size"):
+            common._steam_manifest_from_app_data(app_data(52 * 1024**3, -1), source="test", source_kind="live")
 
 if __name__ == "__main__":
     unittest.main()

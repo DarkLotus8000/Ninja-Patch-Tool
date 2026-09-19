@@ -15,6 +15,8 @@ from pathlib import Path
 
 from common import (
     print_error,
+    print_live_status_once,
+    handle_steam_query_worker_request,
     print_warning,
     print_console,
     ENTRY_SCRIPTS,
@@ -108,7 +110,7 @@ def validate_manifest(manifest: object, members: dict[str, zipfile.ZipInfo]) -> 
     if not isinstance(manifest["base"], str) or not manifest["base"].strip():
         raise RuntimeError("Patch manifest has an invalid base name.")
     if not is_steam_manifest_id(manifest["base_steam_manifest_id"]):
-        raise RuntimeError("Patch manifest has an invalid base Steam manifest ID.")
+        raise RuntimeError("[Steam] Patch manifest has an invalid base manifest ID.")
     if not is_sha256(manifest["old_root_sha256"]) or not is_sha256(manifest["new_root_sha256"]):
         raise RuntimeError("Patch manifest contains an invalid root SHA-256.")
     if not is_nonnegative_int(manifest["old_file_count"]) or not is_nonnegative_int(manifest["new_file_count"]):
@@ -907,6 +909,8 @@ def run_locked_apply(
         print_error(f"Patch file does not exist: {patch}")
         return 1
 
+    print_live_status_once()
+
     if completed_state is not None:
         try:
             with zipfile.ZipFile(patch, "r") as archive:
@@ -946,7 +950,7 @@ def run_locked_apply(
         with zipfile.ZipFile(patch, "r") as archive:
             members = read_archive_members(archive)
             manifest = read_manifest(archive, members)
-            print(f"Patch base: {manifest['base']}\nSteam manifest ID: {manifest['base_steam_manifest_id']}")
+            print(f"Patch base: {manifest['base']}\n[Steam] Manifest ID: {manifest['base_steam_manifest_id']}")
 
             if in_place:
                 print("Verifying current base installation...")
@@ -1134,6 +1138,9 @@ def _run_operation(args, argv: list[str]) -> int:
 def main() -> int:
     install_termination_handlers()
     argv = sys.argv[1:]
+    steam_worker_result = handle_steam_query_worker_request(argv)
+    if steam_worker_result is not None:
+        return steam_worker_result
     early_update_result = handle_early_update_request(argv)
     if early_update_result is not None:
         return early_update_result

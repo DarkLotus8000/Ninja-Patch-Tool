@@ -6,6 +6,8 @@ from pathlib import Path
 
 from common import (
     print_error,
+    print_live_status_once,
+    handle_steam_query_worker_request,
     ENTRY_SCRIPTS,
     ErrorArgumentParser,
     console_title,
@@ -23,6 +25,9 @@ from update import add_update_arguments, handle_automatic_update, handle_early_u
 def main() -> int:
     install_termination_handlers()
     argv = sys.argv[1:]
+    steam_worker_result = handle_steam_query_worker_request(argv)
+    if steam_worker_result is not None:
+        return steam_worker_result
     early_update_result = handle_early_update_request(argv)
     if early_update_result is not None:
         return early_update_result
@@ -53,6 +58,8 @@ def main() -> int:
             canonical_name = resolve_base_name(index, args.name)
             expected = index[canonical_name]
 
+            print_live_status_once()
+
             print(f'Verifying base "{canonical_name}"...\n' "Calculating installation SHA-256...")
 
             with operation_lock("installation", base, "operation using this installation"):
@@ -62,7 +69,7 @@ def main() -> int:
                 print_error(f"Base verification failed.\nExpected files: {expected['file_count']:,}\nActual files: {len(files):,}\nExpected SHA-256: {expected['sha256']}\nActual SHA-256: {actual_hash}")
                 return 1
 
-            print(f'\n[Verified] Base "{canonical_name}" is valid and unmodified.\nSteam manifest ID: {expected["steam_manifest_id"]}\nFiles: {len(files):,}\nSHA-256: {actual_hash}')
+            print(f'\n[Verified] Base "{canonical_name}" is valid and unmodified.\n[Steam] Manifest ID: {expected["steam_manifest_id"]}\nFiles: {len(files):,}\nSHA-256: {actual_hash}')
             return 0
 
     except KeyError:
