@@ -683,6 +683,10 @@ class CommonTests(unittest.TestCase):
         self.assertTrue(all(line == line.lstrip() for line in usage_lines[1:] if line))
         help_text = parser.format_help()
         lines = help_text.splitlines()
+        normalized_help = " ".join(line.strip() for line in lines)
+        self.assertIn("Shows the Ninja Patch Tool version", normalized_help)
+        self.assertIn("Shows this help message", normalized_help)
+        self.assertNotIn("NPT", normalized_help)
         option_lines = [line.strip() for line in lines if line.startswith("  -")]
         option_index = lambda prefix: next(index for index, line in enumerate(option_lines) if line.startswith(prefix))
         self.assertLess(option_index("-u, --check-update"), option_index("-v, --version"))
@@ -1110,14 +1114,15 @@ This should not be included.
         main.assert_called_once_with(["--extract"])
 
     def test_release_console_close_event_cleans_all_temporary_outputs(self) -> None:
+        events: list[str] = []
         with (
-            mock.patch.object(build_release, "remove_release_temp") as cleanup_temp,
-            mock.patch.object(build_release, "remove_release_output_temps") as cleanup_outputs,
+            mock.patch.object(build_release, "_terminate_active_compile_process", side_effect=lambda: events.append("terminate")),
+            mock.patch.object(build_release, "remove_release_temp", side_effect=lambda: events.append("temp")),
+            mock.patch.object(build_release, "remove_release_output_temps", side_effect=lambda: events.append("outputs")),
         ):
             self.assertFalse(build_release._release_console_control_handler(2))
             self.assertFalse(build_release._release_console_control_handler(0))
-        cleanup_temp.assert_called_once_with()
-        cleanup_outputs.assert_called_once_with()
+        self.assertEqual(events, ["terminate", "temp", "outputs"])
 
     def test_release_data_is_allowlisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1783,15 +1788,14 @@ This should not be included.
             commands: list[list[str]] = []
             environments: list[dict[str, str]] = []
 
-            def run(command, cwd, env):
-                commands.append(command)
-                environments.append(env)
-                (dist / "add_base.exe").write_bytes(b"exe")
-                return SimpleNamespace(returncode=0)
+            process = mock.Mock()
+            process.wait.side_effect = lambda: ((dist / "add_base.exe").write_bytes(b"exe"), 0)[1]
 
-            with mock.patch.object(build_release.subprocess, "run", side_effect=run):
+            with mock.patch.object(build_release.subprocess, "Popen", return_value=process) as popen:
                 build_release.build_executable(script, dist, work, specs)
 
+            commands.append(popen.call_args.args[0])
+            environments.append(popen.call_args.kwargs["env"])
             self.assertEqual(len(commands), 1)
             icon_index = commands[0].index("--icon")
             version_index = commands[0].index("--version-file")

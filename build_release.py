@@ -59,6 +59,7 @@ VERSIONED_FALLBACK_STEAM_LICENSE_FILES = {
     ("gevent-eventemitter", "2.1"): LICENSES_DIR / "gevent_eventemitter_LICENSE.txt",
 }
 MIN_PYINSTALLER_VERSION = (6, 15, 0)
+_ACTIVE_COMPILE_PROCESS: subprocess.Popen | None = None
 KNOWN_RUNTIME_LOCK_FILES = {
     "data/.index.lock",
     "data/.operation.lock",
@@ -347,11 +348,34 @@ def remove_release_output_temps() -> None:
             pass
     _remove_path_with_retry(release_extract_temp_path())
 
+def _terminate_active_compile_process() -> None:
+    process = _ACTIVE_COMPILE_PROCESS
+    if process is None or process.poll() is not None:
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=0.5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
 def _release_console_control_handler(control_type: int) -> bool:
     # Ctrl+C follows Python's normal KeyboardInterrupt path. Window close, logoff,
     # and shutdown events may terminate the process without unwinding finally blocks.
     if control_type not in {2, 5, 6}:
         return False
+    _terminate_active_compile_process()
     for cleanup in (remove_release_temp, remove_release_output_temps):
         try:
             cleanup()
@@ -585,9 +609,19 @@ def build_executable(script: Path, dist: Path, work: Path, specs: Path) -> Path:
         "pysteam-client",
         str(script),
     ]
-    result = subprocess.run(command, cwd=ROOT, env=build_environment(dist.parent))
-    if result.returncode != 0:
-        raise RuntimeError(f"PyInstaller failed for {name}.exe with exit code {result.returncode}.")
+    global _ACTIVE_COMPILE_PROCESS
+    process = subprocess.Popen(command, cwd=ROOT, env=build_environment(dist.parent))
+    _ACTIVE_COMPILE_PROCESS = process
+    try:
+        returncode = process.wait()
+    except BaseException:
+        _terminate_active_compile_process()
+        raise
+    finally:
+        if _ACTIVE_COMPILE_PROCESS is process:
+            _ACTIVE_COMPILE_PROCESS = None
+    if returncode != 0:
+        raise RuntimeError(f"PyInstaller failed for {name}.exe with exit code {returncode}.")
     executable = dist / f"{name}.exe"
     if not executable.is_file():
         raise RuntimeError(f"PyInstaller did not create the expected executable: {executable}")
