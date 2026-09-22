@@ -23,7 +23,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
 
-VERSION = "1.5"
+VERSION = "1.5.1"
 
 def display_version(version: str = VERSION) -> str:
     parts = version.split(".")
@@ -802,7 +802,7 @@ def _unlock_activity_range(file, offset: int, length: int) -> None:
 
 @contextmanager
 def operation_activity_lock(install_dir: Path | None = None):
-    # The updater needs an installation-wide exclusive gate, while normal NPT operations must still be allowed to run
+    # The updater needs an installation-wide exclusive gate, while normal Ninja Patch Tool operations must still be allowed to run
     # concurrently. Windows byte-range locks provide exactly that: every operation owns one byte and the updater locks
     # the whole range. The OS releases these locks automatically if a process crashes or is forcibly terminated.
     if sys.platform != "win32":
@@ -923,9 +923,11 @@ IGNORED_FILENAMES = {"launcher.zip", "launcher.exe", "remotecrashsender.exe"}
 IGNORED_ROOT_FILENAMES = {
     "bootstrapper setup.exe",
     "dwmapi.dll",
-    "wtsapi32.dll",
-    "version.dll",
     "launch with openwf.bat",
+    "sideloadify-cli.exe",
+    "sideloadify.exe",
+    "version.dll",
+    "wtsapi32.dll",
 }
 IGNORED_ROOT_DIRECTORIES = {"openwf"}
 _PROCESS_LOCKS_GUARD = threading.Lock()
@@ -1404,7 +1406,7 @@ def index_update_lock_path(index_file: Path) -> Path:
 @contextmanager
 def index_update_lock(index_file: Path, timeout_seconds: int = 0):
     # data/index.json is shared by every copy of add_base.py in this installation. A filesystem byte-range lock keeps
-    # its read-modify-write transaction serialized across Windows users/UAC tokens without preventing unrelated NPT
+    # its read-modify-write transaction serialized across Windows users/UAC tokens without preventing unrelated Ninja Patch Tool
     # operations from running concurrently. The OS releases the byte-range lock if the process exits unexpectedly.
     lock_path = index_update_lock_path(index_file)
     resolved = str(lock_path.resolve()).casefold()

@@ -898,8 +898,17 @@ class CommonTests(unittest.TestCase):
             make_warframe_root(root)
             (root / "OpenWF" / "config").mkdir(parents=True)
             (root / "OpenWF" / "config" / "client.json").write_text("ignored", encoding="utf-8")
-            for name in ("Bootstrapper Setup.exe", "dwmapi.dll", "wtsapi32.dll", "version.dll", "Launch with OpenWF.bat"):
+            for name in (
+                "Bootstrapper Setup.exe",
+                "dwmapi.dll",
+                "Launch with OpenWF.bat",
+                "sideloadify-cli.exe",
+                "sideloadify.exe",
+                "version.dll",
+                "wtsapi32.dll",
+            ):
                 (root / name).write_bytes(b"ignored")
+            (root / "Tools" / "sideloadify.exe").write_bytes(b"tracked")
             (root / "Tools" / "version.dll").write_bytes(b"tracked")
             (root / "Cache.Windows" / "OpenWF").mkdir()
             (root / "Cache.Windows" / "OpenWF" / "nested.bin").write_bytes(b"tracked")
@@ -907,8 +916,17 @@ class CommonTests(unittest.TestCase):
             files, _ = common.scan_tree(root)
 
             self.assertNotIn("OpenWF/config/client.json", files)
-            for name in ("Bootstrapper Setup.exe", "dwmapi.dll", "wtsapi32.dll", "version.dll", "Launch with OpenWF.bat"):
+            for name in (
+                "Bootstrapper Setup.exe",
+                "dwmapi.dll",
+                "Launch with OpenWF.bat",
+                "sideloadify-cli.exe",
+                "sideloadify.exe",
+                "version.dll",
+                "wtsapi32.dll",
+            ):
                 self.assertNotIn(name, files)
+            self.assertIn("Tools/sideloadify.exe", files)
             self.assertIn("Tools/version.dll", files)
             self.assertIn("Cache.Windows/OpenWF/nested.bin", files)
 

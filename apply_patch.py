@@ -329,7 +329,7 @@ def prune_empty_parents(path: Path, root: Path) -> None:
 
 def temporary_output(target: Path, token: str | None) -> Path:
     if token is None:
-        # Recovery compatibility with NPT versions that used predictable <target>.tmp files.
+        # Recovery compatibility with Ninja Patch Tool versions that used predictable <target>.tmp files.
         return target.with_name(target.name + ".tmp")
     return target.with_name(f".{target.name}.npt-{token}.tmp")
 

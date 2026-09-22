@@ -1200,7 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
             with release_temp_console_cleanup():
                 clean_stale_release_temp()
                 remove_release_output_temps()
-                # Snapshot the tested release inputs while normal NPT operations are excluded, then release
+                # Snapshot the tested release inputs while normal Ninja Patch Tool operations are excluded, then release
                 # the activity gate while the source tests run. Windows tests intentionally exercise the same
                 # operation gate. Reacquiring it and comparing the snapshot guarantees that the exact source
                 # that passed tests is the source that is compiled and archived.

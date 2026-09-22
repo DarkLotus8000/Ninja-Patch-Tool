@@ -386,7 +386,7 @@ def cleanup_legacy_updater_executable() -> None:
             return
         legacy_updater.unlink()
     except OSError:
-        # Migration cleanup is best-effort. A locked or otherwise undeletable legacy helper must never block NPT.
+        # Migration cleanup is best-effort. A locked or otherwise undeletable legacy helper must never block Ninja Patch Tool.
         pass
 
 def handle_early_update_request(argv: list[str]) -> int | None:
@@ -909,7 +909,7 @@ def _update_session_backup_is_disposable(work: Path) -> bool:
     return _update_session_transaction_state(work) in {"committed", "rolled_back"}
 
 def _update_work_backup_state(work: Path) -> bool | None:
-    """Return True for a real NPT backup, False for none, None when inspection is unsafe."""
+    """Return True for a real Ninja Patch Tool backup, False for none, None when inspection is unsafe."""
     try:
         work_stat = work.lstat()
         if stat.S_ISLNK(work_stat.st_mode) or is_reparse_stat(work_stat) or not stat.S_ISDIR(work_stat.st_mode):
@@ -1586,7 +1586,7 @@ def run_update_installer(argv: list[str] | None = None) -> int:
                 "[Update] Installation deferred because another Ninja Patch Tool operation is active. "
                 "The requested command will continue on the current version; the update will be checked again next run."
             )
-        # Release update coordination before starting any NPT process; the relaunched process may need the same locks.
+        # Release update coordination before starting any Ninja Patch Tool process; the relaunched process may need the same locks.
         try:
             relaunch(executable, relaunch_args, relaunch_cwd, work)
         except Exception as relaunch_error:

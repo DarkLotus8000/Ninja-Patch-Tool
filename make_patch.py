@@ -184,7 +184,7 @@ def cleanup_stale_make_patch_work(output: Path) -> None:
                     if process_matches_identity(folder_pid, None):
                         continue
                 else:
-                    # Compatibility for work created by older NPT versions that did not put the PID in the folder name.
+                    # Compatibility for work created by older Ninja Patch Tool versions that did not put the PID in the folder name.
                     try:
                         if time.time() - work.stat().st_mtime < 10:
                             continue
