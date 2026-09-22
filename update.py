@@ -1149,7 +1149,7 @@ def wait_for_process_exit(pid: int, timeout_seconds: int = 30) -> None:
 
 def _write_update_session_state(work: Path, state: dict[str, Any]) -> None:
     session = work / UPDATE_SESSION_FILE
-    temporary = session.with_name(f"{session.name}.{uuid.uuid4().hex}.tmp")
+    temporary = session.with_name(f"{session.name}.tmp")
     try:
         temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
         temporary.replace(session)
